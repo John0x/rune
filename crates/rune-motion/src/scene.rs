@@ -10,6 +10,7 @@ use crate::trace::{Intent, MotionTrace, flags};
 use crate::transition::{Effect, Reveal, Transition};
 use crate::value::{Animatable, Color, Corners, MAX_LANES, Rect, Sides, Transform, Vec2, lanes};
 
+mod trailing;
 mod travel;
 
 const NONE: u32 = u32::MAX;
@@ -250,6 +251,8 @@ struct Node {
     anchor: Vec2,
     reveal: Option<Reveal>,
     path: Option<Path>,
+    /// `set_ride_trailing`: x is kept against the parent's trailing edge while its width moves.
+    ride_trailing: bool,
     tracks: [Option<TrackId>; B],
     dirty: bool,
     /// Root-space layout rect this frame (unsnapped) and the origin children ride (with offsets).
@@ -490,6 +493,7 @@ impl Scene {
             anchor: ins.anchor,
             reveal: ins.reveal,
             path: None,
+            ride_trailing: false,
             tracks: [None; B],
             dirty: true,
             world: Rect::ZERO,
@@ -640,6 +644,9 @@ impl Scene {
         let Some(i) = self.slot(id) else { return };
         let anim = anim.into();
         let old = self.nodes[i].frame;
+        if frame.w != old.w {
+            self.rebase_trailing(i, frame.w - old.w);
+        }
         let had_path = self.nodes[i].path.is_some();
         // An explicit landing also cancels motion toward an unchanged target. Comparing only
         // target frames here used to leave a spring running after Runtime::settle_all().
@@ -670,7 +677,10 @@ impl Scene {
         if had_path {
             // Leave screen travel: continue in parent space from the exact current place.
             let (w, wv) = self.exact_world(i);
-            let (po, pv) = self.parent_origin_exact(i);
+            let (mut po, mut pv) = self.parent_origin_exact(i);
+            let trail = self.trail_dual(i);
+            po.x += trail.x;
+            pv.x += trail.v;
             let local = Rect::from_edges(w[0] - po.x, w[1] - po.y, w[2] - po.x, w[3] - po.y);
             let lv = [wv[0] - pv.x, wv[1] - pv.y, wv[2] - pv.x, wv[3] - pv.y];
             self.end_path(i);
@@ -780,7 +790,8 @@ impl Scene {
         if n.parent == NONE {
             return local;
         }
-        let o = self.origin_dual(n.parent as usize);
+        let mut o = self.origin_dual(n.parent as usize);
+        o[0] = o[0].add(self.trail_dual(i));
         core::array::from_fn(|k| local[k].add(o[k % 2]))
     }
 
@@ -1062,7 +1073,12 @@ impl Scene {
             }
             None => {
                 let local = self.values(i, prop::FRAME.id).map_or(n.frame, Rect::read_lanes);
-                local.translated(parent_origin)
+                let mut world = local.translated(parent_origin);
+                if n.ride_trailing && parent != NONE {
+                    let p = &self.nodes[parent as usize];
+                    world.x += p.world.w - p.frame.w;
+                }
+                world
             }
         };
         let p = self.values(i, prop::PRESENCE.id).map_or(1.0, |v| v[0]);

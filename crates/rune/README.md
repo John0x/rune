@@ -36,6 +36,9 @@ Rune's core crate: views, layout, animation, rendering, text and the native shel
   - Layout animates per edge, so stationary edges never move.
   - `.lead(lead, trail)` makes the edge in the direction of travel lead; `.width_leads()` speeds up X
     by `0.78×`.
+  - Children ride their parent's left edge. `.ride_trailing()` keeps an element against its parent's
+    right edge instead while the parent's width animates, so right-aligned content holds still
+    whatever springs the rows around it use (a trailing `RollingText` does this).
   - Presence (`Transition`): elements added or removed after the first frame animate in and stay drawn
     until their exit settles at opacity 0 (including `.transition(Transition::blur_replace())` and
     mid-flight revival).

@@ -629,6 +629,8 @@ pub struct Visual {
     pub(crate) rotate_motion: Option<Box<Anim>>,
     /// `El::child_exit`: how children removed in a commit leave, in place of their own.
     pub(crate) child_exit: Option<Transition>,
+    /// `El::ride_trailing`: x holds against the parent's trailing edge while its width moves.
+    pub(crate) ride_trailing: bool,
 }
 
 impl Default for Visual {
@@ -681,6 +683,7 @@ impl Default for Visual {
             rotate: 0.0,
             rotate_motion: None,
             child_exit: None,
+            ride_trailing: false,
         }
     }
 }

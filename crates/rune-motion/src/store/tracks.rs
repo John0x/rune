@@ -24,3 +24,25 @@ impl AnimationStore {
         })
     }
 }
+
+impl AnimationStore {
+    /// Moves track `t`'s lanes by `d` (value, target and anything scheduled) and leaves the motion
+    /// on them as it is: the same motion in coordinates shifted under it.
+    pub(crate) fn translate(&mut self, t: usize, d: &[f32]) {
+        let l0 = self.t_lane0[t] as usize;
+        for (i, &d) in d.iter().enumerate().take(self.t_n[t] as usize) {
+            if d == 0.0 {
+                continue;
+            }
+            let l = l0 + i;
+            self.l_target[l] += d;
+            self.l_value[l] += d;
+            let mut p = self.l_pending[l];
+            while p != super::NONE {
+                self.pending[p as usize].target += d;
+                p = self.pending[p as usize].next;
+            }
+        }
+        self.set_touched.push(TrackId { index: t as u32, generation: self.t_meta[t].generation });
+    }
+}

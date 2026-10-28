@@ -27,7 +27,7 @@ run settings-slider   3.0 $B/settings --script examples/settings/scripts/slider.
 run settings-hover    3.0 $B/settings --script examples/settings/scripts/hover.json
 run gallery-combobox  3.0 $B/kit-gallery --scene rune-combobox--searchable --script examples/kit-gallery/scripts/combobox.json
 run gallery-modal     5.5 $B/kit-gallery --scene motion-focus-modal --script examples/kit-gallery/scripts/motion-focus-modal.json
-run odometer          3.4 $B/odometer --script $S/odometer.json
+run odometer          5.4 $B/odometer --script $S/odometer.json
 run shell-idle        2.0 $SH
 run shell-toggle      3.0 $SH --script $S/shell-toggle.json
 run shell-peek        5.0 $SH --script $S/shell-peek.json

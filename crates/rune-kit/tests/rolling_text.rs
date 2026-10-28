@@ -530,3 +530,93 @@ fn a_trailing_label_holds_leaving_and_entering_glyphs_in_their_columns() {
     let c = run("19s", "100s", &["1", "9"], &[]);
     assert!(c < 0.75, "19s → 100s: {c} pt off");
 }
+
+/// A header: a long title that truncates, a spacer, and a usage group (a ring, the context and
+/// the cost as trailing labels) that slides on a width-leading spring or on the labels' own.
+struct Usage {
+    cents: i64,
+    tokens: u64,
+    leads: bool,
+}
+
+fn usage_view(s: &Usage, _: &mut Cx<Usage>) -> El {
+    let k = Kit::neutral(true);
+    let spring = rune::Spring::new(0.3, 0.0);
+    let font = TextStyle::new(12.0, 440.0).lh(16.0).features("'tnum' 1");
+    let label = |key: &str, t: String, v: f64| RollingText::new(key, t).value(v).font(font).spring(spring).trailing().build(&k);
+    let tokens = if s.tokens >= 1_000 { format!("{:.1}K", s.tokens as f64 / 1e3) } else { s.tokens.to_string() };
+    let mut usage = rune::row().key("usage").gap(6.0).center_y().motion(spring);
+    if s.leads {
+        usage = usage.width_leads();
+    }
+    rune::row()
+        .key("header")
+        .w(300.0)
+        .h(32.0)
+        .px(10.0)
+        .gap(8.0)
+        .center_y()
+        .child(rune::row().center_y().shrink().child(rune::text("Refactor the session list so pinned rows keep their place").font(TextStyle::new(13.0, 530.0)).truncate()))
+        .child(rune::spacer())
+        .child(
+            usage
+                .child(rune::el().key("ring").size(14.0, 14.0))
+                .child(label("ctx", tokens, s.tokens as f64))
+                .child(label("cost", format!("${}.{:02}", s.cents / 100, s.cents % 100), s.cents as f64)),
+        )
+}
+
+/// Each glyph's drawn x per frame over `seconds` (leaving glyphs included), by key.
+fn glyph_paths(rt: &mut Runtime<Usage>, seconds: f64) -> Vec<(String, String, Vec<f32>)> {
+    let mut paths: Vec<(String, String, Vec<f32>)> = Vec::new();
+    for _ in 0..(seconds * 120.0) as usize {
+        rt.frame(1.0 / 120.0);
+        for e in rt.elements() {
+            let Some(key) = e.key.filter(|k| k.starts_with("cost.") || k.starts_with("ctx.")) else { continue };
+            match paths.iter_mut().find(|p| p.0 == key) {
+                Some(p) => p.2.push(e.rect[0]),
+                None => paths.push((key, e.text.unwrap_or_default(), vec![e.rect[0]])),
+            }
+        }
+    }
+    paths
+}
+
+/// How far a path goes the wrong way: against its net travel, or out and back if it has none.
+fn wrong_way(xs: &[f32]) -> f32 {
+    let (first, last) = (xs[0], xs[xs.len() - 1]);
+    let net = last - first;
+    if net.abs() < 0.25 {
+        return xs.iter().map(|x| (x - first).abs()).fold(0.0, f32::max);
+    }
+    let dir = net.signum();
+    let back = xs.iter().map(|x| (first - x) * dir).fold(0.0, f32::max);
+    let past = xs.iter().map(|x| (x - last) * dir).fold(0.0, f32::max);
+    back.max(past)
+}
+
+/// The header's context and cost rise as a step finishes ($0.42 → $0.49), then past a round
+/// number ($0.49 → $10.45, 13.7K → 111.7K), in a usage group that slides on a width-leading
+/// spring and in one that slides on the labels' own. Every glyph, leaving ones included, holds
+/// its column or moves one way: none drifts out and back against the group's slide.
+#[test]
+fn trailing_labels_in_a_sliding_row_never_reverse() {
+    for leads in [true, false] {
+        let mut rt = Runtime::new(Usage { cents: 42, tokens: 12_345, leads }, usage_view, (400.0, 80.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+        let cost_left = |rt: &Runtime<Usage>| rt.presented("cost").unwrap().0[0];
+        let before = cost_left(&rt);
+        for (step, (cents, tokens, secs)) in [(7, 1_400, 0.8), (996, 98_000, 1.0)].into_iter().enumerate() {
+            rt.update(|s, _| {
+                s.cents += cents;
+                s.tokens += tokens;
+            });
+            for (key, text, xs) in glyph_paths(&mut rt, secs) {
+                let w = wrong_way(&xs);
+                assert!(w < 0.5, "leads {leads}, step {step}: {key} ({text:?}) goes {w:.2} pt the wrong way: {:?}", &xs[..xs.len().min(40)]);
+            }
+        }
+        let after = cost_left(&rt);
+        assert!(after < before - 5.0, "leads {leads}: the cost widens to the left by a digit: {before} → {after}");
+    }
+}

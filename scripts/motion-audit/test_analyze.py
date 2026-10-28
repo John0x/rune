@@ -116,6 +116,9 @@ def main():
     assert not {"reversal", "dog-leg", "overshoot"} & set(kinds(straight)), "a straight eased move"
     ell = hold(at(100, 100), 5) + [at(x, 100) for x in ease(100, 200, 10)] + [at(200, y) for y in ease(100, 200, 10)] + hold(at(200, 200), 10)
     assert "dog-leg" in kinds(ell), "across, then down"
+    # a drift out and back that rests a frame where it turns is still one motion.
+    drift = hold(at(100, 100), 5) + [at(x, 100) for x in ease(100, 97.5, 6)] + hold(at(97.5, 100), 2) + [at(x, 100) for x in ease(97.5, 100, 12)] + hold(at(100, 100), 10)
+    assert "reversal" in kinds(drift), "out and back with a rest at the turn"
 
     # nothing unmounts above opacity 0.
     half = hold({**still, "root/chip": (10, 10, 50, 20, 1)}, 5) + [{**still, "root/chip": (10, 10, 50, 20, op)} for op in ease(1, 0.4, 6)] + hold(still, 10)

@@ -35,7 +35,6 @@ struct Memory {
     clusters: Vec<(String, u64)>,
     next: u64,
     value: Option<f64>,
-    width: Option<f32>,
 }
 
 thread_local! {
@@ -105,9 +104,11 @@ impl RollingText {
         self.value = Some(value);
         self
     }
-    /// The label sits against its trailing edge (right-aligned), so it widens to the left. New
-    /// glyphs then roll in where they come to rest, rather than riding in from the right with
-    /// the label's slide: "9s" → "10s" rolls "10" in beside the "s", not over it.
+    /// The label sits against its trailing edge (right-aligned), so it widens to the left. The
+    /// label and its glyphs ride their parent's trailing edge ([`El::ride_trailing`]), so new
+    /// glyphs roll in where they come to rest and the glyphs that stay or leave hold their
+    /// columns, whatever spring the row around it slides on: "9s" → "10s" rolls "10" in beside
+    /// the "s", not over it.
     pub fn trailing(mut self) -> Self {
         self.trailing = true;
         self
@@ -116,24 +117,20 @@ impl RollingText {
     pub fn build(self, k: &Kit) -> El {
         let font = self.font.unwrap_or(k.ty.ui);
         let color = self.color.unwrap_or(k.c.text_base);
-        let width = if self.trailing { rune::text::advance(&self.text, font) } else { 0.0 };
-        let (glyphs, falling, was) = keys(&self.key, &self.text, self.value, width, self.trailing);
+        let (glyphs, falling) = keys(&self.key, &self.text, self.value, self.trailing);
         let from = if falling { self.from.opposite() } else { self.from };
         let edge = (font.line_px() * 0.12).max(1.0);
-        // How far a trailing label's leading edge moves left as it widens (negative as it narrows).
-        let grow = was.map(|w| width - w).filter(|d| self.trailing && d.abs() > 0.01).unwrap_or(0.0);
-        // Glyphs leave the way this build rolls, whichever way they last did. A trailing label's
-        // leaving glyph stays where it was drawn while its row's edge moves under it, and an
-        // entering one starts where it will rest; both cancel the row's slide on its own spring.
+        // Glyphs leave the way this build rolls, whichever way they last did.
         let push = Transition::push(from);
-        let exit = push.combined(Transition::offset(grow, 0.0)).springs(SpringPair::new(self.spring, self.spring));
+        let exit = push.springs(SpringPair::new(self.spring, self.spring));
         // The fades sit in padding that negative margins take back out of layout, so the resting
         // glyphs (descenders included) are never faded but rolling glyphs and a growing or
-        // shrinking edge stay soft. Glyphs slide on the row's own X spring: width-leading, or for
-        // a trailing label the plain spring its entering glyphs roll on, so the glyphs that stay
-        // hold still against the edge that doesn't move.
+        // shrinking edge stay soft. Glyphs slide on the row's own width-leading X spring. A
+        // trailing label and its glyphs instead ride their parent's trailing edge: as the label
+        // widens to the left, the glyphs that stay, the ones leaving and the ones entering all
+        // hold their columns, whatever springs the rows around them slide on.
         let side = (font.size * 0.3).max(2.0);
-        let lead = |e: El| if self.trailing { e } else { e.width_leads() };
+        let lead = |e: El| if self.trailing { e.ride_trailing() } else { e.width_leads() };
         let mut e = lead(row()
             .key(self.key.clone())
             .role("text")
@@ -161,7 +158,7 @@ impl RollingText {
                 self.spring
             };
             let tr = if g.entered {
-                Transition::asymmetric(push.combined(Transition::offset(-grow, 0.0)), push).springs(SpringPair::new(spring, self.spring))
+                push.springs(SpringPair::new(spring, self.spring))
             } else {
                 Transition::asymmetric(Transition::identity(), push)
             };
@@ -188,8 +185,8 @@ struct Glyph {
 
 /// Assigns each cluster of `text` a stable id: clusters matched to the previous text under `key`
 /// keep theirs, the rest get fresh ones. Also whether `value` fell below the last finite value
-/// one, and the label's last `width`.
-fn keys(key: &str, text: &str, value: Option<f64>, width: f32, trailing: bool) -> (Vec<Glyph>, bool, Option<f32>) {
+/// one.
+fn keys(key: &str, text: &str, value: Option<f64>, trailing: bool) -> (Vec<Glyph>, bool) {
     MEMORY.with(|m| {
         let mut m = m.borrow_mut();
         let mem = m.entry(key.to_owned()).or_default();
@@ -213,8 +210,7 @@ fn keys(key: &str, text: &str, value: Option<f64>, width: f32, trailing: bool) -
         if let Some(v) = value.filter(|v| v.is_finite()) {
             mem.value = Some(v);
         }
-        let was = mem.width.replace(width);
-        (glyphs, falling, was)
+        (glyphs, falling)
     })
 }
 
@@ -342,10 +338,10 @@ mod tests {
 
     #[test]
     fn rebuilding_the_same_text_keeps_every_key() {
-        let a: Vec<u64> = keys("same", "0:30", None, 0.0, false).0.iter().map(|g| g.id).collect();
-        let b: Vec<u64> = keys("same", "0:30", None, 0.0, false).0.iter().map(|g| g.id).collect();
+        let a: Vec<u64> = keys("same", "0:30", None, false).0.iter().map(|g| g.id).collect();
+        let b: Vec<u64> = keys("same", "0:30", None, false).0.iter().map(|g| g.id).collect();
         assert_eq!(a, b);
-        let c = keys("same", "0:29", None, 0.0, false).0;
+        let c = keys("same", "0:29", None, false).0;
         assert_eq!((c[0].id, c[1].id), (a[0], a[1]));
         assert!(c[2].entered && c[3].entered && !c[0].entered);
         assert!(c[2].id > a[3] && c[3].id > a[3], "new glyphs never reuse an exiting key");
@@ -353,7 +349,7 @@ mod tests {
 
     #[test]
     fn a_value_rolls_the_way_it_moves() {
-        let falls = |text: &str, v: Option<f64>| keys("dir", text, v, 0.0, false).1;
+        let falls = |text: &str, v: Option<f64>| keys("dir", text, v, false).1;
         assert!(!falls("9s", Some(9.0)), "the first build rolls nowhere, as counting up");
         assert!(!falls("10s", Some(10.0)), "rising");
         assert!(falls("8s", Some(8.0)), "falling");

@@ -4088,6 +4088,7 @@ impl<S: 'static> Runtime<S> {
                 let mount = if instant || nodes[i].virtual_mount || quiet_row { Mount::Initial } else { Mount::Animated };
                 self.scene.insert(id, spec, mount);
             }
+            self.scene.set_ride_trailing(id, nodes[i].vis.ride_trailing);
             // How far a growth or virtual row's place jumps in this commit (drawn minus new).
             let mut row_jump = 0.0;
             if was_present {

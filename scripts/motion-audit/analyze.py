@@ -42,6 +42,8 @@ from collections import defaultdict
 VISIBLE_OPACITY = 0.01
 POP_OPACITY = 0.5
 JUMP_PT = 12.0
+# Frames at rest a motion segment bridges (see the segments in `analyze`).
+SEG_GAP = 2
 MIN_AREA = 1.0
 BLANK = 64  # flags: draws nothing and holds nothing (a hit or hover zone, a spacer)
 SETTLE_TAIL_MS = 250.0  # a motion's own sub-visible tail after it hides what it moves
@@ -407,12 +409,15 @@ def analyze(path, script=None):
                         continue  # rides its parent; the parent reports it
                 findings.append(dict(kind=kind, element=e.name, frames=1, longest=1, at=str(k),
                                      detail=f"{label} {h[i - 1][edge]:.1f} → {st[edge]:.1f} ({step:+.1f}pt) in one frame; neighbours {before:+.1f}/{after:+.1f}"))
-            # motion segments
+            # motion segments. A motion may rest a frame or two where it turns (an out-and-back
+            # through its start), so up to SEG_GAP frames at rest don't end one.
             seg = []
             for i in range(1, len(h)):
-                moving = abs(d[i - 1]) > 0.01
+                moving = h[i][0] - h[i - 1][0] <= SEG_GAP + 1 and abs(h[i][edge] - h[i - 1][edge]) > 0.01
                 if moving:
                     seg.append(i)
+                elif seg and h[i][0] - h[seg[-1]][0] <= SEG_GAP and i < len(h) - 1:
+                    continue
                 if (not moving or i == len(h) - 1) and len(seg) >= 4:
                     vals = [h[seg[0] - 1][edge]] + [h[j][edge] for j in seg]
                     if all(h[j][5] <= 0.05 or not h[j][8] for j in seg):

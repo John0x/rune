@@ -68,6 +68,7 @@ let x = store.get(id, X);
 - Blur is limited to 4 px and only applies to things entering or leaving in place. A transition that travels drops its blur. Scale stays within [0.9, 1.1] and never goes to 0; `Transition::allow_small_scale()` lowers the floor to 0.5 for small glyphs. A removed node always fades out (`Effect::kit_rules`).
 - Width leads: `.width_leads()` runs the X spring at 0.78× the duration (taken from a launcher app).
 - A stationary edge gets no motion at all.
+- A node given `Scene::set_ride_trailing` keeps its place against its parent's trailing edge while the parent's width animates; its frame is still given in parent space.
 
 ## Design
 

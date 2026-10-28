@@ -102,6 +102,7 @@ mod el_child_exit;
 mod el_drop;
 mod el_effect;
 mod el_pills;
+mod el_ride_trailing;
 mod el_sticky;
 mod el_tx;
 mod input_time;
