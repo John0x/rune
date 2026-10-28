@@ -55,8 +55,11 @@ pub struct Args {
     pub(crate) playground: Option<Option<String>>,
     /// `--variant N|NAME`: the variant `--playground` opens its story on.
     pub(crate) variant: Option<String>,
-    /// `--crop KEY`: crop `--snap` to the element with this key or path, in the stage first.
+    /// `--crop KEY`: crop `--snap` to the element with this key or path; with `--playground`,
+    /// on the stage unless `whole_window`.
     pub(crate) crop_key: Option<String>,
+    /// `--whole-window`: `--snap` with `--playground` takes the whole window, not just the stage.
+    pub(crate) whole_window: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -104,6 +107,7 @@ impl Args {
                 "--scene" => a.scene = Some(val(&mut i)),
                 "--playground" => a.playground = Some(crate::playground::arg(&argv, &mut i)),
                 "--variant" => a.variant = Some(val(&mut i)),
+                "--whole-window" => a.whole_window = true,
                 "--at" => {
                     let v = val(&mut i);
                     a.at_mark = mark_time(&v);
@@ -168,6 +172,7 @@ impl Args {
         let _ = EXTRA.set(extra);
         if a.variant.is_some() && a.playground.is_none() { die("--variant needs --playground"); }
         if a.crop_key.is_some() && a.snap.is_none() { die("--crop KEY needs --snap"); }
+        if a.whole_window && (a.playground.is_none() || a.snap.is_none()) { die("--whole-window needs --playground and --snap"); }
         a
     }
 
@@ -191,7 +196,11 @@ pub(crate) const HELP: &str = "usage: <app> [window]
   --scene NAME          start from a named scene (--list-scenes)
   --playground [NAME]   open App::playground at launch, at a story; headless too
   --variant N|NAME      open --playground's story on a variant (1 is the first)
-  --crop KEY            crop --snap to the element with that key or path, the stage's first
+                        (--snap with --playground takes only the story's stage by default;
+                        --out, --video and --strip frames are the whole window)
+  --whole-window        --snap with --playground takes the whole window: list, stage and side
+  --crop KEY            crop --snap to the element with that key or path (with --playground,
+                        one on the stage, or anywhere in the window with --whole-window)
   --at SECONDS          virtual time of the snapshot/tree (default: end of frames or script);
                         mark:NAME or mark:NAME+0.5 for a script mark's time (also --start)
   --size WxH            viewport in points      --scale N   device scale (default 2)

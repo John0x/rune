@@ -2322,8 +2322,12 @@ App::new(spec).playground(
   turns it off. `.bar(false)` drops the bar, so the app lays out as if there were no
   playground. Snapshots, `--scene` renders and goldens leave it out; `--playground [story]`
   opens it at launch, headless too, and `--variant N|name` opens that story on a variant.
-  `--crop KEY` crops a `--snap` to an element's laid-out rect, by key or path, the stage's
-  first. Each `WindowSpec` can have its own.
+  A `--snap` with `--playground` is the story's stage only, by default; `--whole-window` snaps
+  the whole window, list, stage and side column (`--out`, `--video` and `--strip` frames are
+  always the whole window). `--crop KEY` crops a `--snap` to an element's laid-out rect, by
+  key or path: one on the stage, or with `--whole-window` anywhere in the window, say
+  `--crop playground-list`, `playground-side` or `playground-group-N` (the header of the group
+  whose first story is `playground-item-N`). Each `WindowSpec` can have its own.
 
 ### Testing stories
 

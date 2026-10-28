@@ -1199,7 +1199,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
             video: in_range && has_video,
             snap: k == snap_frame && args.snap.is_some(),
         };
-        if shot.snap && let Some(key) = &args.crop_key { snap_crop.set(Some(crop::element_rect(&rt, key, scale, (wp, hp)))); }
+        if shot.snap { snap_crop.set(crop::snap_rect(&rt, &args, scale, (wp, hp))); }
         let first_pixels = args.first_pixels && k == 0;
         let want_pixels = shot.dump || shot.video || shot.snap || first_pixels;
         if want_pixels {

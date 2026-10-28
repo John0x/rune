@@ -92,3 +92,29 @@ fn variant_and_crop_pick_a_storys_variant_and_crop_the_snap_to_an_element() {
     assert!(bytes(&big) == bytes(&again), "the same every run");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn whole_window_snaps_the_list_and_side_column_and_crops_to_their_keys() {
+    let _turn = HEADLESS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("rune-playground-whole-{}", std::process::id()));
+    let stage = run(&dir, "stage", &["--at", "0"]);
+    let whole = run(&dir, "whole", &["--at", "0", "--whole-window"]);
+    let again = run(&dir, "again", &["--at", "0", "--whole-window"]);
+    let group = run(&dir, "group", &["--at", "0", "--whole-window", "--crop", "playground-group-0"]);
+    let side = run(&dir, "side", &["--at", "0", "--whole-window", "--crop", "playground-side"]);
+    let rgba = |d: &std::path::Path| image::open(d.join("snap.png")).unwrap().to_rgba8();
+    let (stage_px, whole_px) = (rgba(&stage), rgba(&whole));
+    assert_eq!(stage_px.dimensions(), (988, 480), "by default the stage only: 960 - 200 - 264 - 2 pt, at 2x");
+    assert_eq!(whole_px.dimensions(), (1920, 480), "--whole-window: the whole window");
+    // The stage sits after the 200 pt list and its 1 pt separator.
+    assert!(image::imageops::crop_imm(&whole_px, 402, 0, 988, 480).to_image() == stage_px, "the same stage inside the whole window");
+    let varied = |x: u32, w: u32| {
+        let region = image::imageops::crop_imm(&whole_px, x, 0, w, 480).to_image();
+        region.pixels().any(|p| p != region.get_pixel(0, 0))
+    };
+    assert!(varied(0, 400) && varied(1392, 528), "the list and the side column are drawn");
+    assert!(bytes(&whole) == bytes(&again), "the same every run");
+    assert_eq!(png_size(&group.join("snap.png")), (368, 48), "a group header: the list's 184 pt by 24 pt, at 2x");
+    assert_eq!(png_size(&side.join("snap.png")), (528, 480), "the side column's 264 pt");
+    std::fs::remove_dir_all(dir).unwrap();
+}
