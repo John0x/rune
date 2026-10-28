@@ -9,7 +9,8 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MotionElement {
     pub id: NodeId,
-    /// Index of its parent in the same list.
+    /// Index into the same list (`out`) of its nearest presented ancestor, as
+    /// [`ElementInfo::parent`] is into [`Runtime::elements`]. Always less than its own index.
     pub parent: Option<u32>,
     /// Drawn `[x, y, w, h]` in points, as [`ElementInfo::rect`].
     pub rect: [f32; 4],
@@ -42,7 +43,8 @@ impl MotionElement {
     /// It has a visible fill or words.
     pub const PAINTS: u16 = 128;
 
-    pub fn has(&self, flag: u16) -> bool {
+    /// Whether it has `flag`, one of the consts above.
+    pub fn is(&self, flag: u16) -> bool {
         self.flags & flag != 0
     }
 }
@@ -64,6 +66,11 @@ fn text_hash(text: &str) -> u64 {
     h.max(1)
 }
 
+thread_local! {
+    /// [`Runtime::motion_elements`]'s per-node scratch, kept so a frame doesn't allocate.
+    static DOWN: std::cell::RefCell<Vec<(u32, u16, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn intent(n: &Node) -> bool {
     n.live.iter().any(|b| b.spring.is_none() && !matches!(b.property, crate::live::Property::Fill | crate::live::Property::Blur))
 }
@@ -72,11 +79,16 @@ impl<S: 'static> Runtime<S> {
     /// Clears `out` and fills it with the presented elements of the last frame, in tree order,
     /// as [`Self::elements`] lists them but without flight sources, links and highlights, and
     /// without the instant-hover-group rule that marks a group-opacity swap as live.
+    /// `out` keeps its capacity, so a caller that reuses it allocates nothing per frame.
     pub fn motion_elements(&self, out: &mut Vec<MotionElement>) {
+        DOWN.with_borrow_mut(|down| self.motion_elements_into(out, down));
+    }
+
+    fn motion_elements_into(&self, out: &mut Vec<MotionElement>, down: &mut Vec<(u32, u16, bool)>) {
         out.clear();
+        down.clear();
         // Per node: its index in `out` (or its nearest listed ancestor's), the flags it passes
         // to what's under it, and whether it or an ancestor is leaving.
-        let mut down: Vec<(u32, u16, bool)> = Vec::with_capacity(self.nodes.len());
         let s = self.env.scale;
         for (i, node) in self.nodes.iter().enumerate() {
             // `elements` steps up to an `El::above` target before the parent.

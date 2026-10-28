@@ -6,6 +6,10 @@ struct S {
     words: bool,
 }
 
+fn secret(_: &S, _: &mut Cx<S>) -> El {
+    col().child(text("hunter2").key("plain")).child(text("hunter2").key("secret").secure())
+}
+
 fn view(s: &S, _: &mut Cx<S>) -> El {
     let rows = (0..30).fold(col().w_full(), |c, i| c.child(el().key(format!("row{i}")).w_full().h(40.0).child(text(format!("row {i}")))));
     col().w_full().h_full()
@@ -32,7 +36,7 @@ fn agree(rt: &Runtime<S>, out: &mut Vec<MotionElement>) {
             (MotionElement::PAINTS, e.fill.a > 0.01 || e.text.as_deref().is_some_and(|t| !t.is_empty())),
         ];
         for (flag, want) in flags {
-            assert_eq!(m.has(flag), want, "{} flag {flag}", e.path);
+            assert_eq!(m.is(flag), want, "{} flag {flag}", e.path);
         }
         assert_eq!(m.text_hash != 0, e.text.as_deref().is_some_and(|t| !t.is_empty()), "{}", e.path);
     }
@@ -49,7 +53,7 @@ fn motion_elements_match_elements_through_a_scroll() {
     for _ in 0..30 {
         rt.frame(1.0 / 60.0);
         agree(&rt, &mut out);
-        scrolled |= out.iter().any(|m| m.has(MotionElement::SCROLLING));
+        scrolled |= out.iter().any(|m| m.is(MotionElement::SCROLLING));
     }
     assert!(scrolled, "the rows were marked scrolling while the wheel moved them");
     let row = |rt: &Runtime<S>, out: &[MotionElement], k: &str| *out.iter().find(|m| rt.element_path(m.id).and_then(|p| p.1) == Some(k)).unwrap();
@@ -61,5 +65,16 @@ fn motion_elements_match_elements_through_a_scroll() {
     }
     let after = row(&rt, &out, "words");
     assert_ne!(before.text_hash, after.text_hash);
-    assert!(out.iter().filter(|m| m.has(MotionElement::TEXT)).all(|m| m.text_hash != 0));
+    assert!(out.iter().filter(|m| m.is(MotionElement::TEXT)).all(|m| m.text_hash != 0));
+}
+
+#[test]
+fn secure_text_hashes_to_zero() {
+    let mut rt = Runtime::new(S { words: false }, secret, (300.0, 200.0), Env::new(true, 2.0));
+    rt.frame(0.0);
+    let mut out = Vec::new();
+    rt.motion_elements(&mut out);
+    let hash = |k: &str| out.iter().find(|m| rt.element_path(m.id).and_then(|p| p.1) == Some(k)).unwrap().text_hash;
+    assert_ne!(hash("plain"), 0);
+    assert_eq!(hash("secret"), 0);
 }
