@@ -80,10 +80,15 @@ typography and motion; override individual tokens as needed. The default glyph s
 Popover, TextInput and virtual rows. Options carry stable ids, labels, details and disabled
 state; `.current(..).on_choose(..)` binds selection. It filters case-insensitively, loops
 ArrowUp/Down and Ctrl-N/P across enabled rows, scrolls keyboard choices into view, and ignores
-selection keys during IME composition. Escape closes it. The contract follows OpenCode's
+selection keys during IME composition. Escape closes it. A keystroke's rows and the popover's
+height land in its frame; `.animate_filtering(true)` crossfades the rows and springs the
+height instead. `PopupList`, the list it shares with `@`-mention and `/`-command popovers,
+takes the same switch, so rows an app's commit changes land at once even when the field it
+follows animates its layout. The contract follows OpenCode's
 `components/list` and `use-filtered-list`; Rune's fuzzy ranking
 is its own, not bit-identical to fuzzysort. `rune-combobox--searchable` is its 200-row gallery
-scene; there is no matching combobox Storybook story to diff.
+scene, and `rune-combobox--animated-filter` the same with the crossfade; there is no matching
+combobox Storybook story to diff.
 
 `TextInput::on_key` intercepts a focused field's keys before editing; `on_change` runs after
 text changes and receives a `Tx`, for filtering and exact debounce wakes. `TextInput`, `TextArea`

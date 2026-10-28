@@ -9,6 +9,7 @@ struct State {
     active: Option<usize>,
     hovered: Vec<usize>,
     chosen: Vec<String>,
+    animate: bool,
 }
 
 fn item_for(k: &Kit, i: usize) -> PopupItem {
@@ -47,6 +48,7 @@ fn view(s: &State, _: &mut Cx<State>) -> El {
     PopupList::new("commands", "composer")
         .anchored("composer", Side::Bottom, Align::Start, 4.0)
         .open(s.open)
+        .animate_filtering(s.animate)
         .items(items)
         .active(s.active)
         .empty_message("No matching commands")
@@ -80,6 +82,7 @@ fn runtime(count: usize) -> Runtime<State> {
 #[test]
 fn option_changes_5_2_0_3_spring_height_fade_rows_and_toggle_empty_state() {
     let mut rt = runtime(5);
+    rt.update(|s, _| s.animate = true);
     for _ in 0..60 {
         rt.frame(1.0 / 60.0);
     }
@@ -135,6 +138,53 @@ fn option_changes_5_2_0_3_spring_height_fade_rows_and_toggle_empty_state() {
     let h3 = find(&rt, "commands-content").unwrap().rect[3];
     assert!((h3 - 92.0).abs() < 1.0, "settled 3-item height {h3}");
     assert_eq!(find(&rt, "empty").unwrap().opacity, 0.0);
+}
+
+/// By default a change to the rows lands in its frame, though the composer's edits animate the
+/// layout, while opening, closing and the hover highlight keep their motion.
+#[test]
+fn option_changes_land_at_once_by_default() {
+    let find = |rt: &Runtime<State>, key: &str| rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key));
+    let mut rt = runtime(5);
+    rt.update(|s, _| s.open = false);
+    rt.frame(1.0 / 60.0);
+    rt.update(|s, _| s.open = true);
+    rt.frame(1.0 / 60.0);
+    let opening = find(&rt, "commands-content").unwrap();
+    assert!(opening.opacity < 1.0 || opening.scale < 1.0, "the popover enters: {} at {}", opening.opacity, opening.scale);
+    for _ in 0..60 { rt.frame(1.0 / 60.0); }
+
+    for (count, height) in [(2, 64.0), (0, 36.0), (3, 92.0)] {
+        // The composer's text changes too, in a commit that animates its layout.
+        rt.key(KeyEvent { key: Key::Text("x".into()), mods: Mods::default() });
+        rt.update(|s, _| {
+            s.count = count;
+            s.active = (count > 0).then_some(0);
+        });
+        rt.frame(1.0 / 60.0);
+        let h = find(&rt, "commands-content").unwrap().rect[3];
+        assert!((h - height).abs() < 0.05, "{count} rows: {h}");
+        assert!(rt.elements().iter().all(|e| !e.exiting), "{count} rows: nothing is left fading out");
+        for i in 0..count {
+            assert_eq!(find(&rt, &format!("commands-option-cmd-{i}")).unwrap().opacity, 1.0, "row {i} is whole");
+        }
+        let empty = find(&rt, "empty").unwrap();
+        assert_eq!(empty.opacity, if count == 0 { 1.0 } else { 0.0 });
+    }
+
+    let row = find(&rt, "commands-option-cmd-2").unwrap().rect;
+    let fill = |rt: &Runtime<State>| find(rt, "commands-option-cmd-2").unwrap().fill.a;
+    rt.pointer_move(row[0] + 10.0, row[1] + 10.0);
+    rt.frame(1.0 / 60.0);
+    assert_eq!(rt.state.active, Some(2));
+    let hovered = fill(&rt);
+    rt.frame(1.0 / 60.0);
+    assert!(fill(&rt) > hovered, "the highlight still eases in: {hovered} → {}", fill(&rt));
+
+    rt.update(|s, _| s.open = false);
+    rt.frame(1.0 / 60.0);
+    let closing = find(&rt, "commands-content").expect("the popover is still closing");
+    assert!(closing.exiting && (closing.opacity < 1.0 || closing.scale < 1.0), "it leaves: {} at {}", closing.opacity, closing.scale);
 }
 
 #[test]

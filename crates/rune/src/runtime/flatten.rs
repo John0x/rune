@@ -85,6 +85,7 @@ pub(super) fn flatten(
         in_row
     };
     let virtual_mount = el.virtual_mount;
+    let instant_changes = el.instant_changes || parent.is_some_and(|p| nodes[p].instant_changes);
     #[cfg(debug_assertions)]
     let scroll_source = el.scroll_source;
     let trace_namespace = el.trace_namespace.or_else(|| parent.and_then(|p| nodes[p].trace_namespace));
@@ -257,6 +258,7 @@ pub(super) fn flatten(
         opacity_motion,
         lead,
         width_leads,
+        instant_changes,
         transition,
         matched: matched.map(|id| (id, own_motion)),
         scroll,

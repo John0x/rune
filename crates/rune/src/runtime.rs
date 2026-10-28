@@ -426,6 +426,8 @@ pub(crate) struct Node {
     opacity_motion: Option<rune_motion::Anim>,
     lead: Option<(Spring, Spring)>,
     width_leads: bool,
+    /// Inside an `El::instant_changes` element, or one itself.
+    instant_changes: bool,
     transition: Option<Transition>,
     /// `El::matched` id, with the element's own (not inherited) layout spring.
     matched: Option<(Rc<str>, Option<Spring>)>,
@@ -2207,7 +2209,7 @@ impl<S: 'static> Runtime<S> {
                     self.keeps.clear();
                     self.scroll_reveals.clear();
                     for (scope, key) in std::mem::take(&mut tx.scroll_to) {
-                        self.reveal_row(scope.as_deref(), &key);
+                        self.reveal_row(scope.as_deref(), &key, tx.instant);
                     }
                 }
             }
@@ -2298,7 +2300,7 @@ impl<S: 'static> Runtime<S> {
             self.keeps.clear();
             self.scroll_reveals.clear();
         }
-        for (scope, key) in scroll_to { self.reveal_row(scope.as_deref(), &key); }
+        for (scope, key) in scroll_to { self.reveal_row(scope.as_deref(), &key, tx.instant); }
         if !scroll_bottom.is_empty() || !scroll_pages.is_empty() || !scroll_offsets.is_empty() || follow {
             self.step_scroll(0.0);
         }
@@ -3884,6 +3886,7 @@ impl<S: 'static> Runtime<S> {
         for c in 0..nodes.len() {
             let Some(_spec) = nodes[c].growth else { continue };
             let cid = nodes[c].id;
+            let instant = instant || nodes[c].instant_changes;
             // A reader away from the tail is anchored using measured row heights. Land those
             // heights with the anchor correction, unless `keep_on_screen` or `scroll_into_view`
             // is driving this viewport across the commit. A reveal left from an earlier commit
@@ -4054,7 +4057,11 @@ impl<S: 'static> Runtime<S> {
             // Text leads its background so theme crossfades never dip through zero contrast.
             let spring_tc = Spring::new((spring_c.duration * 0.5).max(0.1), spring_c.bounce);
             let row_like = nodes[i].in_row == RowLayout::Snaps || nodes[i].parent.is_some_and(|p| nodes[p].growth.is_some());
-            let layout_instant = instant || row_like || tx.relayout || self.virtuals.contains_key(&nodes[i].path)
+            // An `El::instant_changes` element lands its changes, and those of what it holds;
+            // its own entrance and exit, and colours, stay with the commit.
+            let enters_at_once = instant || nodes[i].parent.is_some_and(|p| nodes[p].instant_changes);
+            let lands = instant || nodes[i].instant_changes;
+            let layout_instant = lands || row_like || tx.relayout || self.virtuals.contains_key(&nodes[i].path)
                 || self.aspect_snap.contains(&id);
             let mut scene_rect = nodes[i].local;
             if let Some(v) = nodes[i].parent.and_then(|p| self.virtuals.get(&nodes[p].path)) {
@@ -4063,7 +4070,7 @@ impl<S: 'static> Runtime<S> {
 
             let was_present = self.scene.contains(id);
             let was_exiting = self.is_exiting(id);
-            if was_present && !was_exiting && !instant && !unseen_ids.is_empty() { self.reenter_unseen_row(&nodes, i, &unseen_ids); }
+            if was_present && !was_exiting && !enters_at_once && !unseen_ids.is_empty() { self.reenter_unseen_row(&nodes, i, &unseen_ids); }
             if let Some((key, _)) = &nodes[i].matched {
                 arrivals.push((key.clone(), i, !was_present || was_exiting));
             }
@@ -4092,7 +4099,7 @@ impl<S: 'static> Runtime<S> {
                     && nodes[i].transition.is_none_or(|t| t.insertion == rune_motion::Effect::IDENTITY)
                     && !was_exiting
                     && !self.reduced_motion;
-                let mount = if instant || nodes[i].virtual_mount || quiet_row { Mount::Initial } else { Mount::Animated };
+                let mount = if enters_at_once || nodes[i].virtual_mount || quiet_row { Mount::Initial } else { Mount::Animated };
                 self.scene.insert(id, spec, mount);
             }
             self.scene.set_ride_trailing(id, nodes[i].vis.ride_trailing);
@@ -4114,7 +4121,7 @@ impl<S: 'static> Runtime<S> {
                     && !self.flying.iter().any(|f| f.0 == id);
                 let layout_anim = if out_of_sight {
                     LayoutAnim::INSTANT
-                } else if stack_row && !instant && !tx.relayout && !follows_window {
+                } else if stack_row && !lands && !tx.relayout && !follows_window {
                     // Growth and virtual windows own a row's vertical place; its horizontal place
                     // still springs, or a re-centred column jumps against its moving parent. So
                     // do `animate_layout` contents inside the row.
@@ -4137,7 +4144,7 @@ impl<S: 'static> Runtime<S> {
                     }
                     la
                 };
-                let flying = if self.flying.is_empty() || instant { None }
+                let flying = if self.flying.is_empty() || lands { None }
                     else { self.flying.iter().position(|f| f.0 == id) };
                 if let Some(f) = flying {
                     // Keep a matched flight on its one screen path, even where a growth row
@@ -4153,7 +4160,7 @@ impl<S: 'static> Runtime<S> {
                 } else if !nodes[i].live.iter().any(|b| b.property == crate::live::Property::Rect) {
                     self.scene.set_frame(id, scene_rect, layout_anim);
                 }
-                let quiet = instant || out_of_sight;
+                let quiet = lands || out_of_sight;
                 self.set_or_anim(id, prop::RADIUS, Corners(nodes[i].vis.radius), spring_l, quiet);
                 if nodes[i].live.iter().any(|b| b.property == crate::live::Property::Opacity) {
                     // The live source owns this property, including across unrelated commits.
@@ -4173,7 +4180,7 @@ impl<S: 'static> Runtime<S> {
                 && (shift != [0.0; 2] || self.scene.store().has(id, prop::OFFSET))
             {
                 let to = rune_motion::Vec2::new(shift[0], shift[1]);
-                if instant || !was_present || was_exiting || self.reduced_motion {
+                if lands || !was_present || was_exiting || self.reduced_motion {
                     self.scene.set(id, prop::OFFSET, to);
                 } else if self.scene.store().target(id, prop::OFFSET) != Some(to) {
                     if row_jump != 0.0 {
@@ -4188,12 +4195,12 @@ impl<S: 'static> Runtime<S> {
                     }
                 }
             }
-            let rest_quiet = instant || !was_present || was_exiting || self.reduced_motion;
+            let rest_quiet = lands || !was_present || was_exiting || self.reduced_motion;
             nodes[i].group_fade = self.set_group_rest(id, nodes[i].vis.group_opacity, nodes[i].opacity_motion, spring_l, rest_quiet);
             let k = nodes[i].static_scale;
             nodes[i].scale_track = k != 1.0 || self.scene.store().has(id, P_SCALE);
             if nodes[i].scale_track {
-                if instant || !was_present || was_exiting || self.reduced_motion {
+                if lands || !was_present || was_exiting || self.reduced_motion {
                     self.scene.set(id, P_SCALE, k);
                 } else if self.scene.store().target(id, P_SCALE) != Some(k) {
                     if !self.scene.store().has(id, P_SCALE) { self.scene.set(id, P_SCALE, 1.0); }
@@ -4205,7 +4212,7 @@ impl<S: 'static> Runtime<S> {
             }
             let turn = nodes[i].vis.rotate;
             if turn != 0.0 || self.scene.store().has(id, prop::ROTATION) {
-                if instant || !was_present || was_exiting || self.reduced_motion {
+                if lands || !was_present || was_exiting || self.reduced_motion {
                     self.scene.set(id, prop::ROTATION, turn);
                 } else if self.scene.store().target(id, prop::ROTATION) != Some(turn) {
                     if !self.scene.store().has(id, prop::ROTATION) { self.scene.set(id, prop::ROTATION, 0.0); }
@@ -4407,6 +4414,7 @@ impl<S: 'static> Runtime<S> {
             let parent_remained_present =
                 old_parent_id.is_none_or(|pid| self.node_index.get(&pid).is_some_and(|&i| i < present_len));
             if parent_remained_present {
+                let instant = instant || old_parent_id.and_then(|pid| self.node_index.get(&pid)).is_some_and(|&p| nodes[p].instant_changes);
                 if tx.settle || (instant && !self.is_exiting(old.id)) || drew_nothing.get(oi).copied().unwrap_or(false) {
                     self.scene.unmount(old.id);
                 } else {
@@ -5223,11 +5231,11 @@ impl<S: 'static> Runtime<S> {
 
     /// Scrolls so row `key` shows. A virtual row placed by estimates may measure differently
     /// once mounted, along with the rows around it, so this places it again from what the
-    /// commit measured until it stays put.
-    fn reveal_row(&mut self, scope: Option<&str>, key: &str) {
-        if self.reveal_row_once(scope, key, true) {
+    /// commit measured until it stays put. Those commits are `instant` when the request's was.
+    fn reveal_row(&mut self, scope: Option<&str>, key: &str, instant: bool) {
+        if self.reveal_row_once(scope, key, true, instant) {
             for _ in 0..8 {
-                if !self.reveal_row_once(scope, key, false) { break; }
+                if !self.reveal_row_once(scope, key, false, instant) { break; }
             }
         }
         self.reveal_row_x(scope, key);
@@ -5235,7 +5243,7 @@ impl<S: 'static> Runtime<S> {
 
     /// One placement of [`Self::reveal_row`]: whether it committed. After the first, it moves
     /// only when the row would land somewhere else.
-    fn reveal_row_once(&mut self, scope: Option<&str>, key: &str, first: bool) -> bool {
+    fn reveal_row_once(&mut self, scope: Option<&str>, key: &str, first: bool, instant: bool) -> bool {
         let target_node = self.nodes.iter().enumerate().find_map(|(i, row)| {
             if !row.named(key) || self.subtree_exiting(i) || !row.parent.is_none_or(|p| in_scope(&self.nodes[p].path, scope)) {
                 return None;
@@ -5335,7 +5343,7 @@ impl<S: 'static> Runtime<S> {
         scroll.direct = true;
         let window = self.virtual_window_changed();
         if window {
-            self.commit(&Tx::default());
+            self.commit(&Tx { instant, ..Tx::default() });
             // The commit measured rows that were estimates: the next placement clamps to the end
             // they make.
             if let Some(i) = self.nodes.iter().position(|n| n.id == id) {

@@ -10,4 +10,4 @@ crates/rune/src/overlay.rs 1963
 crates/rune/src/runtime.rs 8191
 crates/rune/src/text.rs 3151
 crates/rune/src/window.rs 3401
-examples/kit-gallery/src/stories.rs 1618
+examples/kit-gallery/src/stories.rs 1613

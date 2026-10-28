@@ -17,7 +17,7 @@ macro_rules! stories {
         pub const SCENES: &[(&str, fn(&mut G))] = &[$(($id, |s: &mut G| {
             s.story = $id;
             s.combo = ComboboxState::default();
-            if $id == "rune-combobox--searchable" { s.combo.open = true; s.combo.search.focused = true; }
+            if $id.starts_with("rune-combobox--") { s.combo.open = true; s.combo.search.focused = true; }
             if $id == "rune-popup-list--composer" {
                 s.edits[7] = TextEdit::new("/");
                 s.edits[7].focused = true;
@@ -65,6 +65,7 @@ fn close(s: &mut G) {
 
 stories! {
     "rune-combobox--searchable" => combobox::searchable,
+    "rune-combobox--animated-filter" => combobox::animated_filter,
     "ui-dialog--basic" => dialog_basic,
     "motion-focus-modal" => motion_focus_modal,
     "ui-button--playground" => button_playground,

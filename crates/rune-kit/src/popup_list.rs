@@ -101,6 +101,7 @@ pub struct PopupList<S> {
     padding: f32,
     row_radius: f32,
     items: Vec<PopupItem>,
+    animate_filtering: bool,
     active: Option<usize>,
     empty: String,
     label: Option<String>,
@@ -123,6 +124,7 @@ impl<S: 'static> PopupList<S> {
             padding: 4.0,
             row_radius: 4.0,
             items: Vec::new(),
+            animate_filtering: false,
             active: None,
             empty: "No results".into(),
             label: None,
@@ -187,11 +189,19 @@ impl<S: 'static> PopupList<S> {
         self.row_radius = radius;
         self
     }
-    /// The rows. A change springs the popover to its new height while removed rows fade and
-    /// collapse. To swap the rows and the height at once, as a filter that follows each
-    /// keystroke may want, make the change in a commit that calls [`Tx::instant`].
+    /// The rows. A change lands at once: the popover takes its new height and rows appear and
+    /// go in the same frame, even in a commit that animates the field the list follows (one
+    /// with `animate_edit_layout`). [`Self::animate_filtering`] animates it instead.
     pub fn items(mut self, items: impl IntoIterator<Item = impl Into<PopupItem>>) -> Self {
         self.items = items.into_iter().map(Into::into).collect();
+        self
+    }
+    /// Animate a change to the rows: the popover springs to its new height, and the rows it
+    /// drops fade out where they stood (a 0.24 s spring) as the new ones fade in (0.3 s).
+    /// Off by default, so a list that follows each keystroke swaps at once. Opening, closing
+    /// and the hover highlight animate either way.
+    pub fn animate_filtering(mut self, animate: bool) -> Self {
+        self.animate_filtering = animate;
         self
     }
     pub fn item(mut self, item: impl Into<PopupItem>) -> Self {
@@ -322,14 +332,18 @@ impl<S: 'static> PopupList<S> {
         let gutter = self.gutter;
         let width = self.width;
         let padding = self.padding;
+        let instant = !self.animate_filtering;
         let list = self.build_list(k);
-        let content = col()
+        let mut content = col()
             .key(key)
             .preserve_focus_on_press(true)
             .w(width)
             .padding(padding)
             .on_press(|_: &mut S| {})
             .child(list);
+        if instant {
+            content = content.instant_changes();
+        }
         layer.push(anchor_at(k, raised(k, content, k.radius.md), &anchor, side, align, gutter));
     }
 }

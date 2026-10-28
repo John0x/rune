@@ -88,6 +88,7 @@ pub struct Combobox<S> {
     placement: Placement,
     trigger: Option<El>,
     disabled: bool,
+    animate_filtering: bool,
 }
 impl<S: 'static> Combobox<S> {
     pub fn new(key: impl Into<String>, state: &ComboboxState, options: &[ComboboxOption],
@@ -95,7 +96,7 @@ impl<S: 'static> Combobox<S> {
         Self { key: key.into(), state: state.clone(), options: Rc::new(options.to_vec()), access: Rc::new(access),
             choose: None, current: None, placeholder: String::new(), search_placeholder: "Search".into(),
             empty: "No results".into(), width: 280.0, max_height: 192.0, placement: Placement::BottomStart,
-            trigger: None, disabled: false }
+            trigger: None, disabled: false, animate_filtering: false }
     }
     pub fn current(mut self, id: Option<&str>) -> Self { self.current = id.map(str::to_owned); self }
     pub fn placeholder(mut self, text: impl Into<String>) -> Self { self.placeholder = text.into(); self }
@@ -111,6 +112,10 @@ impl<S: 'static> Combobox<S> {
     /// pressing it opens and closes the popover.
     pub fn trigger(mut self, trigger: El) -> Self { self.trigger = Some(trigger); self }
     pub fn disabled(mut self, disabled: bool) -> Self { self.disabled = disabled; self }
+    /// Animate each keystroke's filtering: the popover springs to its new height and the
+    /// rows crossfade, as [`PopupList::animate_filtering`]. Off by default, so the rows and
+    /// the height a keystroke changes land in the same frame.
+    pub fn animate_filtering(mut self, animate: bool) -> Self { self.animate_filtering = animate; self }
     pub fn on_choose(mut self, choose: impl Fn(&mut S, &str, &mut Tx) + 'static) -> Self {
         self.choose = Some(Rc::new(choose)); self
     }
@@ -154,9 +159,11 @@ impl<S: 'static> Combobox<S> {
         let change_key = self.key.clone();
         // The search field sits borderless over a divider: the open popover is its frame, and the
         // caret shows its focus.
-        let field = TextInput::new(&self.state.search).plain().leading_icon(k.glyph.search).height(36.0)
-            .width(None).placeholder(self.search_placeholder)
-            .animate_edit_layout()
+        let mut field = TextInput::new(&self.state.search).plain().leading_icon(k.glyph.search).height(36.0)
+            .width(None).placeholder(self.search_placeholder);
+        // Without it, an edit's commit is instant: the filtered rows and the height land with the text.
+        if self.animate_filtering { field = field.animate_edit_layout(); }
+        let field = field
             .on_edit(move |s: &mut S| &mut access(s).search)
             .on_change(move |s: &mut S, tx| {
                 let state = change_access(s);

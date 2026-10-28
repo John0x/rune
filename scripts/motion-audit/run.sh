@@ -26,6 +26,7 @@ run settings-segmented-retarget 1.5 $B/settings --script examples/settings/scrip
 run settings-slider   3.0 $B/settings --script examples/settings/scripts/slider.json
 run settings-hover    3.0 $B/settings --script examples/settings/scripts/hover.json
 run gallery-combobox  3.0 $B/kit-gallery --scene rune-combobox--searchable --script examples/kit-gallery/scripts/combobox.json
+run gallery-combobox-animated 3.0 $B/kit-gallery --scene rune-combobox--animated-filter --script examples/kit-gallery/scripts/combobox-animated-filter.json
 run gallery-modal     5.5 $B/kit-gallery --scene motion-focus-modal --script examples/kit-gallery/scripts/motion-focus-modal.json
 run odometer          5.4 $B/odometer --script $S/odometer.json
 run shell-idle        2.0 $SH

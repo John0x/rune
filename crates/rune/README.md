@@ -46,6 +46,8 @@ Rune's core crate: views, layout, animation, rendering, text and the native shel
     theme switches keep label contrast through the transition.
   - Nothing animates on the first frame.
   - `Tx::instant()` applies a change with no animation (drag moves are instant by default).
+  - `El::instant_changes()` does the same for one subtree in any commit (a popup of search results),
+    while the element's own entrance and exit and its colours keep their motion.
   - `Tx::color_motion(spring)` sets the spring for that change's colours (the theme switch uses calm).
   - In reduced motion, spatial travel snaps while opacity, presence and colour take `REDUCED_FADE`
     (`0.15 s`). Growth-stack rows also keep this fade on insertion/removal; closing gaps land after

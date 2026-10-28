@@ -8,6 +8,7 @@ struct S {
     ids: Vec<String>,
     padding: Option<f32>,
     row_radius: Option<f32>,
+    animate: bool,
 }
 
 fn ids(v: &[&str]) -> Vec<String> {
@@ -24,6 +25,7 @@ fn view(s: &S, _: &mut Cx<S>) -> El {
         .anchored("field", Side::Top, Align::Start, 8.0)
         .max_height(300.0)
         .items(s.ids.iter().map(|i| PopupItem::new(i.clone(), i.clone())))
+        .animate_filtering(s.animate)
         .active(Some(0));
     if let Some(p) = s.padding {
         list = list.padding(p);
@@ -36,7 +38,11 @@ fn view(s: &S, _: &mut Cx<S>) -> El {
 }
 
 fn settled(items: &[&str]) -> Runtime<S> {
-    let mut rt = Runtime::new(S { ids: ids(items), padding: None, row_radius: None }, view, (600.0, 600.0), Env::new(true, 1.0));
+    settled_with(items, true)
+}
+
+fn settled_with(items: &[&str], animate: bool) -> Runtime<S> {
+    let mut rt = Runtime::new(S { ids: ids(items), padding: None, row_radius: None, animate }, view, (600.0, 600.0), Env::new(true, 1.0));
     rt.frame(0.0);
     for _ in 0..60 {
         rt.frame(1.0 / 120.0);
@@ -103,10 +109,20 @@ fn rows_rise_to_their_slots_when_nothing_is_leaving() {
 
 #[test]
 fn an_instant_commit_swaps_rows_and_height_at_once() {
-    let mut rt = settled(&SIX);
+    swaps_rows_and_height_at_once(true);
+}
+
+#[test]
+fn by_default_any_commit_swaps_rows_and_height_at_once() {
+    swaps_rows_and_height_at_once(false);
+}
+
+/// An animated list in `Tx::instant` commits, or a default one in commits that animate.
+fn swaps_rows_and_height_at_once(animate: bool) {
+    let mut rt = settled_with(&SIX, animate);
     rt.update(|s, tx| {
         s.ids = ids(&["a1"]);
-        tx.instant();
+        if animate { tx.instant(); }
     });
     rt.frame(1.0 / 120.0);
     for id in ["a0", "a2", "a3", "a4", "a5"] {
@@ -118,7 +134,7 @@ fn an_instant_commit_swaps_rows_and_height_at_once() {
 
     rt.update(|s, tx| {
         s.ids = ids(&TEN);
-        tx.instant();
+        if animate { tx.instant(); }
     });
     rt.frame(1.0 / 120.0);
     assert!((y(&rt, "p-content") - 104.0).abs() < 0.05, "popover top {}", y(&rt, "p-content"));
@@ -138,7 +154,7 @@ fn padding_and_row_radius_default_to_4_and_follow_their_builders() {
     assert!((r.rect[0] - c[0] - 4.0).abs() < 0.05 && (r.rect[1] - c[1] - 4.0).abs() < 0.05);
     assert!((c[3] - (6.0 * 28.0 + 8.0)).abs() < 0.05);
 
-    let mut rt = Runtime::new(S { ids: ids(&SIX), padding: Some(6.0), row_radius: Some(6.0) }, view, (600.0, 600.0), Env::new(true, 1.0));
+    let mut rt = Runtime::new(S { ids: ids(&SIX), padding: Some(6.0), row_radius: Some(6.0), animate: false }, view, (600.0, 600.0), Env::new(true, 1.0));
     rt.frame(0.0);
     let (c, r) = (content(&rt), row(&rt));
     assert_eq!(r.radius, 6.0);
@@ -152,7 +168,7 @@ fn padding_and_row_radius_default_to_4_and_follow_their_builders() {
 /// clipped away.
 fn settled_long() -> Runtime<S> {
     let ids = (0..60).map(|i| format!("a{i}")).collect();
-    let mut rt = Runtime::new(S { ids, padding: None, row_radius: None }, view, (600.0, 600.0), Env::new(true, 1.0));
+    let mut rt = Runtime::new(S { ids, padding: None, row_radius: None, animate: true }, view, (600.0, 600.0), Env::new(true, 1.0));
     rt.frame(0.0);
     for _ in 0..60 {
         rt.frame(1.0 / 120.0);

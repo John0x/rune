@@ -2,7 +2,7 @@ use rune::{Cx, El, Env, Ime, Key, KeyEvent, Mods, Runtime};
 use rune_kit::{Combobox, ComboboxOption, ComboboxState, Kit};
 
 #[derive(Default)]
-struct State { combo: ComboboxState, chosen: Option<String>, chooses: usize, other: rune::TextEdit, app_keys: usize }
+struct State { combo: ComboboxState, chosen: Option<String>, chooses: usize, other: rune::TextEdit, app_keys: usize, animate: bool }
 fn view(s: &State, _: &mut Cx<State>) -> El {
     let options: Vec<_> = (0..200).map(|i| {
         let mut o = ComboboxOption::new(format!("item-{i}"), format!("Model {i:03}"));
@@ -12,13 +12,19 @@ fn view(s: &State, _: &mut Cx<State>) -> El {
     let mut layer = Vec::new();
     let body = Combobox::new("models", &s.combo, &options, |s: &mut State| &mut s.combo)
         .current(s.chosen.as_deref())
+        .animate_filtering(s.animate)
         .on_choose(|s, id, _| { s.chosen = Some(id.into()); s.chooses += 1; }).build(&Kit::neutral(true), &mut layer);
     let body = rune::col().child(rune_kit::TextInput::new(&s.other)
         .on_edit(|s: &mut State| &mut s.other).build(&Kit::neutral(true)).key("other")).child(body);
     rune_kit::root(body, layer)
 }
 fn runtime() -> Runtime<State> {
-    let mut s = State::default();
+    open(State::default())
+}
+fn animated_runtime() -> Runtime<State> {
+    open(State { animate: true, ..State::default() })
+}
+fn open(mut s: State) -> Runtime<State> {
     s.combo.open = true;
     s.combo.search.focused = true;
     let mut rt = Runtime::new(s, view, (400.0, 400.0), Env::new(true, 1.0));
@@ -160,8 +166,43 @@ fn repeats_after_an_ime_composition_neither_choose_nor_close() {
 }
 
 #[test]
-fn filtering_springs_the_popup_height_and_fades_rows() {
+fn a_keystroke_lands_its_rows_and_height_in_one_frame() {
     let mut rt = runtime();
+    for _ in 0..60 { rt.frame(1.0 / 60.0); }
+    key(&mut rt, Key::Up, Mods::default());
+    for _ in 0..60 { rt.frame(1.0 / 60.0); }
+    let find = |rt: &Runtime<State>, key: &str| rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key));
+    let open = find(&rt, "models-content").unwrap().rect;
+    let top = |rt: &Runtime<State>, id: &str| {
+        let vp = find(rt, "viewport").unwrap().rect;
+        find(rt, &format!("models-option-{id}")).map(|e| (e.rect[1] - vp[1], e.opacity))
+    };
+    key(&mut rt, Key::Text("0".into()), Mods::default());
+    rt.frame(1.0 / 120.0);
+    assert!(rt.elements().iter().all(|e| !e.exiting), "nothing is left fading out");
+    assert!(top(&rt, "item-199").is_none(), "the rows the filter drops are gone");
+    assert_eq!(top(&rt, "item-0"), Some((0.0, 1.0)), "the first match is whole at the top");
+    assert_eq!(find(&rt, "models-content").unwrap().rect, open, "a full list keeps its size");
+
+    key(&mut rt, Key::Text("zz".into()), Mods::default());
+    rt.frame(1.0 / 120.0);
+    let empty = find(&rt, "models-content").unwrap().rect;
+    assert!(empty[3] < open[3] - 100.0, "it takes the empty state's height: {open:?} → {empty:?}");
+    assert!(top(&rt, "item-0").is_none());
+    assert_eq!(find(&rt, "empty").unwrap().opacity, 1.0);
+    for _ in 0..60 { rt.frame(1.0 / 120.0); }
+    assert_eq!(find(&rt, "models-content").unwrap().rect, empty, "and holds it");
+
+    key(&mut rt, Key::Backspace, Mods::default());
+    key(&mut rt, Key::Backspace, Mods::default());
+    rt.frame(1.0 / 120.0);
+    assert_eq!(find(&rt, "models-content").unwrap().rect, open, "deleting lands back at once");
+    assert_eq!(top(&rt, "item-0"), Some((0.0, 1.0)));
+}
+
+#[test]
+fn filtering_springs_the_popup_height_and_fades_rows() {
+    let mut rt = animated_runtime();
     for _ in 0..60 { rt.frame(1.0 / 60.0); }
     let find = |rt: &Runtime<State>, key: &str| rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key));
     let open = find(&rt, "models-content").unwrap().rect[3];
@@ -215,9 +256,10 @@ fn a_custom_trigger_opens_a_list_that_fits_the_window_under_a_search_header() {
 
 /// Typing while the list sits scrolled to its end: what the reader saw fades out where it stood,
 /// the matches fade in from the top, and matches that land out of view skip their fade.
+/// (`animate_filtering`)
 #[test]
 fn typing_crossfades_the_rows_in_view() {
-    let mut rt = runtime();
+    let mut rt = animated_runtime();
     for _ in 0..60 { rt.frame(1.0 / 60.0); }
     key(&mut rt, Key::Up, Mods::default());
     for _ in 0..60 { rt.frame(1.0 / 60.0); }
@@ -245,3 +287,4 @@ fn typing_crossfades_the_rows_in_view() {
     let (top, opacity, _) = row(&rt, "item-99").expect("a match mounted out of view");
     assert!(top.abs() < 0.5 && opacity < 0.05, "it fades in rather than appearing whole: {top} at {opacity}");
 }
+

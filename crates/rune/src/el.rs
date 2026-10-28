@@ -831,6 +831,7 @@ pub struct El {
     pub(crate) lead: Option<(Spring, Spring)>,
     pub(crate) width_leads: bool,
     pub(crate) animate_layout: bool,
+    pub(crate) instant_changes: bool,
     pub(crate) transition: Option<Transition>,
     pub(crate) matched: Option<Rc<str>>,
     pub(crate) scroll: Option<ScrollSpec>,
@@ -922,6 +923,7 @@ fn base(dir: FlexDirection) -> El {
         lead: None,
         width_leads: false,
         animate_layout: false,
+        instant_changes: false,
         transition: None,
         matched: None,
         scroll: None,
@@ -3033,6 +3035,15 @@ impl El {
     /// its neighbours. Vertical place stays with the row's growth.
     pub fn animate_layout(mut self) -> Self {
         self.animate_layout = true;
+        self
+    }
+    /// Land every change inside this element at once, as a [`Tx::instant`] commit would, even
+    /// in a commit that animates the rest of the window: its own and its subtree's layout,
+    /// opacity and transforms, the elements it gains or loses, and growth rows. Its own entrance
+    /// and exit keep their transition, and colours (a hover highlight) keep their springs. A
+    /// popup of search results under a field whose edits animate the layout around it.
+    pub fn instant_changes(mut self) -> Self {
+        self.instant_changes = true;
         self
     }
     /// How this element enters and exits when mounted or removed after the first frame
