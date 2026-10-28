@@ -66,11 +66,6 @@ fn text_hash(text: &str) -> u64 {
     h.max(1)
 }
 
-thread_local! {
-    /// [`Runtime::motion_elements`]'s per-node scratch, kept so a frame doesn't allocate.
-    static DOWN: std::cell::RefCell<Vec<(u32, u16, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
 fn intent(n: &Node) -> bool {
     n.live.iter().any(|b| b.spring.is_none() && !matches!(b.property, crate::live::Property::Fill | crate::live::Property::Blur))
 }
@@ -81,7 +76,7 @@ impl<S: 'static> Runtime<S> {
     /// without the instant-hover-group rule that marks a group-opacity swap as live.
     /// `out` keeps its capacity, so a caller that reuses it allocates nothing per frame.
     pub fn motion_elements(&self, out: &mut Vec<MotionElement>) {
-        DOWN.with_borrow_mut(|down| self.motion_elements_into(out, down));
+        self.motion_elements_into(out, &mut self.motion_scratch.borrow_mut());
     }
 
     fn motion_elements_into(&self, out: &mut Vec<MotionElement>, down: &mut Vec<(u32, u16, bool)>) {
@@ -115,6 +110,7 @@ impl<S: 'static> Runtime<S> {
                 let (zx, zy) = (c.w / d.w.max(1e-3), c.h / d.h.max(1e-3));
                 [c.x + (drawn[0] - d.x) * zx, c.y + (drawn[1] - d.y) * zy, drawn[2] * zx, drawn[3] * zy]
             });
+            // O(1): the parent's clip and turn were worked out when the frame drew.
             let clip = if self.launches.flying(node.id) { NO_CLIP } else {
                 flight.map_or_else(|| self.screen_clip_of_parent(node.parent), |f| f.clip.map(|v| v * s))
             };

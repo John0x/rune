@@ -1031,6 +1031,8 @@ pub struct Runtime<S: 'static> {
     glyph_scratch: Vec<GlyphQuad>,
     deco_scratch: Vec<PaintedDeco>,
     inh_scratch: Vec<Inh>,
+    /// `motion_elements`' per-node scratch, kept so a frame doesn't allocate.
+    motion_scratch: std::cell::RefCell<Vec<(u32, u16, bool)>>,
     /// The composed turns `Inh::turn` points into, rebuilt each paint.
     turn_scratch: Vec<Turn>,
     /// For nodes inside a turned layer: `(unturned_rect_pt, unturned_clip_px)`. Empty unless a
@@ -1449,6 +1451,7 @@ impl<S: 'static> Runtime<S> {
             glyph_scratch: Vec::new(),
             deco_scratch: Vec::new(),
             inh_scratch: Vec::new(),
+            motion_scratch: Default::default(),
             turn_scratch: Vec::new(),
             unturned_drawn: Vec::new(),
             layer_paint_order: Vec::new(),
