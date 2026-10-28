@@ -39,7 +39,7 @@ pub(crate) fn with_scene_clock<T>(clock: SceneClock, f: impl FnOnce() -> T) -> T
 }
 
 pub mod playground;
-pub use playground::{Play, Playground, Step, Story};
+pub use playground::{Play, Playground, Stage, Step, Story};
 mod states;
 mod shortcuts;
 pub use shortcuts::{PhysicalKeyCode, Shortcut, ShortcutError, ShortcutId, modifier_keycaps};

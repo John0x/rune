@@ -27,9 +27,11 @@ impl<S: 'static> Runtime<S> {
 
     pub(super) fn find_app_root(&mut self) {
         let Some(playground) = &mut self.playground else { return };
-        let wraps = |k: &str| k == "playground-closed" || crate::playground::is_stage(k);
+        // A scrolling stage holds the root in a margin.
+        let margin = |k: Option<&str>| k == Some("playground-margin");
+        let wraps = |k: &str| k == "playground-closed" || margin(Some(k)) || crate::playground::is_stage(k);
         let nodes = &self.nodes;
-        playground.root = nodes.iter().position(|n| n.parent.is_some_and(|p| nodes[p].key.as_deref().is_some_and(wraps))).unwrap_or(0);
+        playground.root = nodes.iter().position(|n| !margin(n.key.as_deref()) && n.parent.is_some_and(|p| nodes[p].key.as_deref().is_some_and(wraps))).unwrap_or(0);
     }
 
     /// Moves a Tx's playground requests to the runtime, for the next commit to apply before its

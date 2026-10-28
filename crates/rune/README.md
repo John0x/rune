@@ -2311,6 +2311,13 @@ App::new(spec).playground(
   change, so a bookmarked link keeps working while the story keeps its path.
 - **Overlays.** `Story::overlay` draws an overlay's view in a dashed frame of its size, so it
   shows in the window and in headless renders.
+- **Stage layout.** A story sits in the stage's middle, sized as a window sizes its root: to the
+  stage, or to the size picked beside it. `Story::stage(Stage::Scroll)` (or
+  `Playground::stage(scene, Stage::Scroll)`) makes it a page: laid out at the stage's width
+  inside a 24 pt margin, at its own height, from the top, and the stage scrolls.
+  `Stage::Fill` puts it edge to edge across the whole stage, whatever size is picked.
+- **The list.** Each group's header shows how many stories it holds, folded or not, and a
+  story or scene with triggers has a small motion mark at the end of its row.
 - **Off.** It's on in debug builds; `.enabled(bool)` overrides that and `RUNE_PLAYGROUND=0`
   turns it off. `.bar(false)` drops the bar, so the app lays out as if there were no
   playground. Snapshots, `--scene` renders and goldens leave it out; `--playground [story]`
@@ -2366,10 +2373,8 @@ grouped list, and a knobs column) maps onto `App::playground` like this:
 | open, leave, Esc, ⌘⇧D                       | built in: ⌘⇧D, Esc, Back, and `tx.open_playground()`                   |
 | a link to a story                           | `rune::playground::slug(path)`, and `tx.open_playground_at(slug, variant)` from `App::on_open_url` |
 | a background poll                           | `Story::poll`                                                          |
-
-What it doesn't do yet, if the app's storybook relies on it: show counts beside the headers,
-mark stories that have motion, or give a story a scrolling page stage that bleeds to the edges.
-Keep those in the app until they land here.
+| a tall page, or a window-sized story        | `Story::stage(Stage::Scroll)` or `Stage::Fill`                         |
+| counts beside the headers, motion marks    | built in                                                               |
 
 ## Live Rust editing (desktop development)
 

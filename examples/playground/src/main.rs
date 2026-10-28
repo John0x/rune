@@ -1,6 +1,7 @@
 //! A small preferences window with a playground (⌘⇧D): its scenes, a live page, a story with its
 //! own state and timer, and an overlay, grouped by type, with triggers, variants (1–9) and a
-//! side-column control. A click on a group's header folds it.
+//! side-column control. A click on a group's header folds it. "Every device" scrolls its stage,
+//! and "Windows/Preferences" fills it edge to edge.
 //!
 //! `cargo run -p playground` shows the bar along the bottom; `-- --playground "Upload"` opens
 //! the playground at that story, and `-- --snap out.png --playground` renders it headless;
@@ -9,7 +10,7 @@
 use std::time::Duration;
 
 use rune::tok::{self, Theme, motion, radius, type_};
-use rune::{Align, App, AppSpec, Color, Cx, El, OverlaySpec, Play, Playground, ScreenEdge, Story, Tx, col, el, row, text};
+use rune::{Align, App, AppSpec, Color, Cx, El, OverlaySpec, Play, Playground, ScreenEdge, Stage, Story, Tx, col, el, row, text};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -78,6 +79,18 @@ fn view(s: &Prefs, cx: &mut Cx<Prefs>) -> El {
 fn devices_page(s: &Prefs, cx: &mut Cx<Prefs>) -> El {
     col().w_full().h_full().padding(24.0).child(devices(s, cx))
 }
+
+/// The "Every device" story: more devices than the stage is tall, on a scrolling stage.
+fn every_device() -> Prefs {
+    Prefs { devices: EVERY_DEVICE.to_vec(), ..init() }
+}
+
+const EVERY_DEVICE: [&str; 24] = [
+    "Studio desk", "Travel laptop", "Kitchen tablet", "Spare phone", "Lab machine", "Old desktop",
+    "Living room TV", "Garage Pi", "Work phone", "Reading tablet", "Build server", "Test phone",
+    "Backup drive", "Guest laptop", "Car display", "Watch", "Office printer", "Media box",
+    "Shared iPad", "Loaner laptop", "Render node", "Home server", "Second monitor hub", "Field kit",
+];
 
 fn devices(s: &Prefs, cx: &mut Cx<Prefs>) -> El {
     let t = tok::theme(cx.system_dark());
@@ -216,6 +229,8 @@ fn main() {
                 .variant("Lists/Many devices", "Long names", |s| {
                     s.devices = vec!["Studio desk in the back office", "Travel laptop (borrowed for the conference)", "Kitchen tablet"];
                 })
+                .story(Story::new("Lists/Every device", every_device, devices).stage(Stage::Scroll))
+                .story(Story::new("Windows/Preferences", init, view).stage(Stage::Fill))
                 .story(
                     Story::new("Progress/Upload", upload_init, upload_view)
                         .poll(upload_poll)

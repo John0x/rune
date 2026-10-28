@@ -8,6 +8,7 @@ pub(crate) struct Live<S: 'static> {
     /// By the scene they're for.
     pub(super) triggers: Vec<(usize, Trigger<S>)>,
     pub(super) sides: Vec<(usize, Side<S>)>,
+    pub(super) stages: Vec<(usize, Stage)>,
     pub(super) variants: Vec<(usize, &'static str, Variant<S>)>,
     /// Each story's variant, by its index into scenes then pages, until the playground closes.
     pub(super) variant: Vec<usize>,
@@ -37,7 +38,7 @@ pub(crate) struct Live<S: 'static> {
     pub(super) folds: Folds,
     /// The keyboard is on the open story's side controls, which take keys.
     pub(super) side_active: bool,
-    pub(super) scene: Option<Box<Stage<S>>>,
+    pub(super) scene: Option<Box<Staged<S>>>,
     pub(super) owned: Vec<Option<Box<dyn Any>>>,
     pub(super) controls: Controls,
     pub(super) dark: Option<bool>,
@@ -58,12 +59,13 @@ pub(crate) struct Live<S: 'static> {
 
 impl<S: 'static> Live<S> {
     pub(super) fn new(playground: Playground<S>, spec: &crate::AppSpec<S>, menu: bool) -> Self {
-        let Playground { pages, triggers, sides, sizes, shortcut, bar, enabled: _, scenes: show, fresh, keep, variants, typing, dark: app_dark, folds } = playground;
+        let Playground { pages, triggers, sides, stages, sizes, shortcut, bar, enabled: _, scenes: show, fresh, keep, variants, typing, dark: app_dark, folds } = playground;
         let mut live = Live {
             owned: pages.iter().map(|_| None).collect(),
             pages,
             triggers: Vec::new(),
             sides: Vec::new(),
+            stages: Vec::new(),
             variants: Vec::new(),
             variant: Vec::new(),
             sizes,
@@ -98,11 +100,12 @@ impl<S: 'static> Live<S> {
         // Scene names as `find` takes them: a path or a name, matching case if it can.
         let scene = |live: &Self, name: &str| {
             let at = live.find_in(name, &(0..live.scenes.len()).collect::<Vec<_>>());
-            if at.is_none() { eprintln!("rune: the playground has a trigger or side column for {name:?}, which isn't one of AppSpec::scenes"); }
+            if at.is_none() { eprintln!("rune: the playground has a trigger, side column or stage for {name:?}, which isn't one of AppSpec::scenes"); }
             at
         };
         live.triggers = triggers.into_iter().filter_map(|(name, t)| Some((scene(&live, name)?, t))).collect();
         live.sides = sides.into_iter().filter_map(|(name, view)| Some((scene(&live, name)?, view))).collect();
+        live.stages = stages.into_iter().filter_map(|(name, stage)| Some((scene(&live, name)?, stage))).collect();
         live.variants = variants.into_iter().filter_map(|(name, variant, apply)| Some((scene(&live, name)?, variant, apply))).collect();
         live.variant = vec![0; live.count()];
         let listed: Vec<usize> = (0..live.count()).filter(|&i| live.scenes.get(i).is_none_or(|(name, _)| show.is_none_or(|show| show(name)))).collect();
@@ -152,6 +155,25 @@ impl<S: 'static> Live<S> {
 
     pub(super) fn is_live_page(&self) -> bool {
         matches!(self.page(), Some((_, Page { kind: Kind::Live(_), .. })))
+    }
+
+    /// How the stage lays out the open story.
+    pub(super) fn layout(&self) -> Stage {
+        if self.selected < self.scenes.len() {
+            return self.stages.iter().rev().find(|(s, _)| *s == self.selected).map_or(Stage::Center, |(_, stage)| *stage);
+        }
+        match self.page() {
+            Some((_, Page { kind: Kind::Own(own), .. })) => own.layout(),
+            _ => Stage::Center,
+        }
+    }
+
+    /// Whether story `i` has triggers of its own, beside R, which the list marks.
+    pub(super) fn has_triggers(&self, i: usize) -> bool {
+        match i.checked_sub(self.scenes.len()) {
+            None => self.triggers.iter().any(|(s, _)| *s == i),
+            Some(p) => matches!(self.pages.get(p), Some(Page { kind: Kind::Own(own), .. }) if !own.triggers().is_empty()),
+        }
     }
 
     /// The open story's triggers, R's first.
@@ -292,7 +314,7 @@ impl<S: 'static> Live<S> {
                 if let Some(variant) = variant { variant(&mut s); }
                 s
             });
-            self.scene = Some(Box::new(Stage::new(state)));
+            self.scene = Some(Box::new(Staged::new(state)));
         } else if let Some((i, page)) = self.page() && let Kind::Own(own) = &page.kind && self.owned[i].is_none() {
             let variant = self.variant[self.selected];
             let stage = crate::with_scene_clock(scene_clock, || own.init(&*real, variant));

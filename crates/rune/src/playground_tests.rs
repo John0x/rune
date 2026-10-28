@@ -601,3 +601,6 @@ mod keys;
 
 #[path = "playground/chrome_tests.rs"]
 mod chrome;
+
+#[path = "playground/stage_tests.rs"]
+mod stage_layout;

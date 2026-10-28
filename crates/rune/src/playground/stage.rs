@@ -7,6 +7,25 @@ use super::*;
 /// Triggers and `Play::after` take closures too.
 pub type Step<X> = fn(&mut X, &mut Play<'_, X>);
 
+/// How the stage lays a story out, from [`Story::stage`] or [`Playground::stage`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Stage {
+    /// Sized as a window sizes its root, to the stage or the size picked beside it, in the
+    /// stage's middle.
+    #[default]
+    Center,
+    /// For content taller than the stage: laid out at the stage's width inside a 24 pt margin,
+    /// at its own height, from the top, and the stage scrolls.
+    Scroll,
+    /// Edge to edge across the whole stage, whatever size is picked beside it: for a story the
+    /// size of a window.
+    Fill,
+}
+
+/// [`Stage::Scroll`]'s margin.
+pub(super) const SCROLL_MARGIN: f32 = 24.0;
+
 /// A step queued on a stage, which runs once.
 pub(super) type Queued<X> = Box<dyn FnOnce(&mut X, &mut Play<'_, X>)>;
 
@@ -115,14 +134,14 @@ pub(super) fn trigger_tx<X>(key: char, label: &'static str, run: impl Fn(&mut X,
 const DUE_SLACK: f64 = 1e-6;
 
 /// A stage's state and its triggers' queued steps.
-pub(super) struct Stage<X> {
+pub(super) struct Staged<X> {
     pub(super) state: X,
     pub(super) script: Vec<(f64, Queued<X>)>,
 }
 
-impl<X> Stage<X> {
+impl<X> Staged<X> {
     pub(super) fn new(state: X) -> Self {
-        Stage { state, script: Vec::new() }
+        Staged { state, script: Vec::new() }
     }
 
     /// Runs the steps due by `t`, earliest first, each seeing the time it was due. Asks for a

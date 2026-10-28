@@ -20,6 +20,7 @@ pub struct Story<P: 'static> {
     view: View<P>,
     poll: Option<Box<dyn Fn(&mut P, f64, &mut Tx) -> bool>>,
     frame: Option<(f32, f32)>,
+    stage: Stage,
     triggers: Vec<Trigger<P>>,
     /// Its view, told whether the keyboard is on it.
     side: Option<SideView<P>>,
@@ -31,7 +32,7 @@ impl<P: 'static> Story<P> {
     /// `name` may be a `"Group/Name"` path. `init` and `view` may be closures, so a story
     /// table can make its stories in a loop, each capturing its row.
     pub fn new(name: &'static str, init: impl Fn() -> P + 'static, view: impl Fn(&P, &mut Cx<P>) -> El + 'static) -> Self {
-        Story { name, init: Init::New(Box::new(init)), view: stage::view(view), poll: None, frame: None, triggers: Vec::new(), side: None, side_key: None, variants: Vec::new() }
+        Story { name, init: Init::New(Box::new(init)), view: stage::view(view), poll: None, frame: None, stage: Stage::Center, triggers: Vec::new(), side: None, side_key: None, variants: Vec::new() }
     }
 
     /// A story whose state `derive` makes from the app's real state, each time it's made: when
@@ -97,6 +98,18 @@ impl<P: 'static> Story<P> {
         self
     }
 
+    /// How the stage lays it out: in its middle at the size picked beside it, by default;
+    /// [`Stage::Scroll`] for a page taller than the stage, or [`Stage::Fill`] for a story the
+    /// size of a window.
+    ///
+    /// ```ignore
+    /// Story::new("Settings/All", Settings::default, settings).stage(Stage::Scroll)
+    /// ```
+    pub fn stage(mut self, stage: Stage) -> Self {
+        self.stage = stage;
+        self
+    }
+
     /// The app state `init` derives from, for [`Story::from_real`].
     pub(super) fn real(&self) -> Option<std::any::TypeId> {
         match &self.init {
@@ -113,11 +126,11 @@ impl<P: 'static> Story<P> {
         self
     }
 
-    fn stage(stage: &dyn Any) -> &Stage<P> {
+    fn staged(stage: &dyn Any) -> &Staged<P> {
         stage.downcast_ref().expect("a story's stage is its own")
     }
 
-    fn stage_mut(stage: &mut dyn Any) -> &mut Stage<P> {
+    fn staged_mut(stage: &mut dyn Any) -> &mut Staged<P> {
         stage.downcast_mut().expect("a story's stage is its own")
     }
 }
@@ -128,7 +141,7 @@ enum Init<P> {
     Real(std::any::TypeId, Box<dyn Fn(&dyn Any) -> P>),
 }
 
-/// A [`Story`] with its state type erased. Its stage is a `Stage<P>`.
+/// A [`Story`] with its state type erased. Its stage is a `Staged<P>`.
 pub(super) trait OwnStory {
     /// A new stage, from the app's real state if the story derives from it.
     fn init(&self, real: &dyn Any, variant: usize) -> Box<dyn Any>;
@@ -150,6 +163,7 @@ pub(super) trait OwnStory {
     fn triggers(&self) -> Vec<(char, &'static str)>;
     fn variants(&self) -> Vec<&'static str>;
     fn frame(&self) -> Option<(f32, f32)>;
+    fn layout(&self) -> Stage;
 }
 
 impl<P: 'static> OwnStory for Story<P> {
@@ -159,24 +173,24 @@ impl<P: 'static> OwnStory for Story<P> {
             Init::Real(_, derive) => derive(real),
         };
         if let Some((_, apply)) = self.variants.get(variant) { apply(&mut state); }
-        Box::new(Stage::new(state))
+        Box::new(Staged::new(state))
     }
     fn state<'a>(&self, stage: &'a mut dyn Any) -> &'a mut dyn Any {
-        &mut Self::stage_mut(stage).state
+        &mut Self::staged_mut(stage).state
     }
     fn state_ref<'a>(&self, stage: &'a dyn Any) -> &'a dyn Any {
-        &Self::stage(stage).state
+        &Self::staged(stage).state
     }
     fn view(&self, stage: &dyn Any, cx: &mut Cx<()>) -> El {
         let mut own = cx.retype::<P>();
-        let root = (self.view)(&Self::stage(stage).state, &mut own);
+        let root = (self.view)(&Self::staged(stage).state, &mut own);
         cx.absorb(own);
         root
     }
     fn side(&self, stage: &dyn Any, active: bool, cx: &mut Cx<()>) -> Option<El> {
         let side = self.side.as_ref()?;
         let mut own = cx.retype::<P>();
-        let root = side(&Self::stage(stage).state, active, &mut own);
+        let root = side(&Self::staged(stage).state, active, &mut own);
         cx.absorb(own);
         Some(root)
     }
@@ -184,23 +198,23 @@ impl<P: 'static> OwnStory for Story<P> {
         self.side_key.is_some()
     }
     fn side_key(&self, stage: &mut dyn Any, ev: &KeyEvent, tx: &mut Tx) -> bool {
-        self.side_key.as_ref().is_some_and(|key| key(&mut Self::stage_mut(stage).state, ev, tx))
+        self.side_key.as_ref().is_some_and(|key| key(&mut Self::staged_mut(stage).state, ev, tx))
     }
     fn poll(&self, stage: &mut dyn Any, t: f64, tx: &mut Tx) -> bool {
-        let stage = Self::stage_mut(stage);
+        let stage = Self::staged_mut(stage);
         let ran = stage.run(t, tx);
         self.poll.as_ref().is_some_and(|poll| poll(&mut stage.state, t, tx)) || ran
     }
     fn polls(&self, stage: &dyn Any) -> bool {
-        self.poll.is_some() || !Self::stage(stage).script.is_empty()
+        self.poll.is_some() || !Self::staged(stage).script.is_empty()
     }
     fn trigger(&self, stage: &mut dyn Any, key: char, now: f64) -> bool {
         let Some(t) = self.triggers.iter().find(|t| t.key == key) else { return false };
-        Self::stage_mut(stage).script.push((now, t.queued()));
+        Self::staged_mut(stage).script.push((now, t.queued()));
         true
     }
     fn stop(&self, stage: &mut dyn Any) {
-        Self::stage_mut(stage).script.clear();
+        Self::staged_mut(stage).script.clear();
     }
     fn triggers(&self) -> Vec<(char, &'static str)> {
         self.triggers.iter().map(|t| (t.key, t.label)).collect()
@@ -210,5 +224,8 @@ impl<P: 'static> OwnStory for Story<P> {
     }
     fn frame(&self) -> Option<(f32, f32)> {
         self.frame
+    }
+    fn layout(&self) -> Stage {
+        self.stage
     }
 }

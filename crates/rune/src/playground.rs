@@ -40,8 +40,8 @@ use folds::Folds;
 use nav::Row;
 pub use open::slug;
 pub(crate) use stage::call;
-pub use stage::{Play, Step};
-use stage::{Stage, Trigger, View, trigger, trigger_tx};
+pub use stage::{Play, Stage, Step};
+use stage::{SCROLL_MARGIN, Staged, Trigger, View, trigger, trigger_tx};
 pub use story::Story;
 use story::OwnStory;
 pub(crate) use testing::stage_element;
@@ -83,6 +83,7 @@ pub struct Playground<S: 'static> {
     pages: Vec<Page<S>>,
     triggers: Vec<(&'static str, Trigger<S>)>,
     sides: Vec<(&'static str, Side<S>)>,
+    stages: Vec<(&'static str, Stage)>,
     sizes: Vec<(&'static str, (f32, f32))>,
     shortcut: Option<Shortcut>,
     bar: bool,
@@ -110,6 +111,7 @@ impl<S: 'static> Playground<S> {
             pages: Vec::new(),
             triggers: Vec::new(),
             sides: Vec::new(),
+            stages: Vec::new(),
             sizes: Vec::new(),
             shortcut: shortcut.parse().ok(),
             bar: true,
@@ -180,6 +182,13 @@ impl<S: 'static> Playground<S> {
     /// [`Story::side_keys`].
     pub fn side_keys(mut self, scene: &'static str, view: impl Fn(&S, bool, &mut Cx<S>) -> El + 'static, key: impl Fn(&mut S, &KeyEvent, &mut Tx) -> bool + 'static) -> Self {
         self.sides.push((scene, Side::Keys(Box::new(view), Box::new(key))));
+        self
+    }
+
+    /// How the stage lays out the scene named `scene` (its path, or just its name). See
+    /// [`Story::stage`].
+    pub fn stage(mut self, scene: &'static str, stage: Stage) -> Self {
+        self.stages.push((scene, stage));
         self
     }
 

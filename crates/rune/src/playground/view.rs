@@ -68,11 +68,17 @@ impl<S: 'static> Live<S> {
                 }
                 Row::Story(i) => (i == self.selected && self.header.is_none(), self.name(i), i),
             };
+            // Stories with triggers move, so a quiet mark tells them apart.
+            let mark = self.has_triggers(item).then(|| [
+                spacer(),
+                icon(&MOTION, 12.0).key(format!("playground-motion-{item}")).color(tertiary(t)).ml(6.0),
+            ]);
             list = list.child(
                 row().key(format!("playground-item-{item}")).w_full().h(ROW).px(8.0).center_y().radius(radius::MD)
                     .fill(if on { selected(t, dark) } else { Color::TRANSPARENT })
                     .hover(if on { selected(t, dark) } else { t.hover })
                     .child(text(name).font(type_::BODY).color(if on || item == self.selected { t.text } else { t.text_secondary }).truncate())
+                    .children(mark.into_iter().flatten())
                     .role("button").label(name)
                     .on_press_tx(move |_: &mut Controls, tx: &mut Tx| tx.playground.push(Request::Select(item))),
             );
@@ -93,11 +99,13 @@ impl<S: 'static> Live<S> {
     fn header_row(&self, t: Theme, dark: bool, group: &'static str, first: usize, top: bool) -> El {
         let on = self.header == Some(group);
         let folded = self.folded.contains(&group);
+        let count = self.order.iter().filter(|&&i| self.group(i) == group).count();
         let row = row().key(format!("playground-group-{first}")).w_full().h(24.0).px(8.0).gap(4.0).center_y().radius(radius::MD)
             .fill(if on { selected(t, dark) } else { Color::TRANSPARENT })
             .hover(if on { selected(t, dark) } else { t.hover })
             .child(text(group).font(type_::SECTION).color(if on { t.text } else { t.text_secondary }).truncate())
             .child(spacer())
+            .child(text(count.to_string()).key(format!("playground-count-{first}")).font(type_::LABEL).color(tertiary(t)))
             .child(icon(if folded { &CHEVRON_RIGHT } else { &CHEVRON_DOWN }, 14.0).color(t.text_secondary))
             .role("button").label(if folded { format!("Show {group}") } else { format!("Hide {group}") })
             .on_press_tx(move |_: &mut Controls, tx: &mut Tx| {
@@ -232,7 +240,8 @@ impl<S: 'static> Live<S> {
         let page = self.page();
         let frame = self.own().and_then(|(own, _)| own.frame());
         let preset = self.size.checked_sub(1).and_then(|i| self.sizes.get(i)).map(|(_, size)| *size);
-        let (w, h) = frame.or(preset).unwrap_or(area);
+        let layout = self.layout();
+        let (w, h) = if layout == Stage::Fill { area } else { frame.or(preset).unwrap_or(area) };
         let content = match (&self.scene, page) {
             (Some(scene), _) => Some(self.nested(cx, env, |c| call(view, &scene.state, c))),
             (None, Some((_, Page { kind: Kind::Live(page), .. }))) => Some(self.nested(cx, env, |c| page(app, c))),
@@ -251,13 +260,20 @@ impl<S: 'static> Live<S> {
         let content = content.unwrap_or_else(|| {
             col().center().child(text("Add scenes to AppSpec::scenes, or stories to the playground").font(type_::BODY).color(inner.text_secondary))
         });
-        // Sized as a window sizes its root.
-        let stage = el().key(format!("playground-stage-{}", self.generation)).w(w).h(h).child(content.w(w).h(h));
-        let stage = match (frame, preset) {
+        let key = format!("playground-stage-{}", self.generation);
+        let stage = match layout {
+            // A scroll measures its first child, so the margin goes on a column around the content.
+            Stage::Scroll => col().key(key).w(w).h(h).scroll(ScrollSpec { stick_bottom: false })
+                .child(col().key("playground-margin").w(w).padding(SCROLL_MARGIN).child(content.w((w - 2.0 * SCROLL_MARGIN).max(0.0)))),
+            // Sized as a window sizes its root.
+            _ => el().key(key).w(w).h(h).child(content.w(w).h(h)),
+        };
+        let stage = match (layout, frame, preset) {
+            (Stage::Fill, _, _) => stage,
             // An overlay's clear parts stay clear.
-            (Some(_), _) => stage.border(1.0, t.text_secondary.alpha(0.35)).border_dash(4.0, 3.0),
-            (None, Some(_)) => stage.outline(1.0, 0.0, inner.separator),
-            (None, None) => stage,
+            (_, Some(_), _) => stage.border(1.0, t.text_secondary.alpha(0.35)).border_dash(4.0, 3.0),
+            (_, None, Some(_)) => stage.outline(1.0, 0.0, inner.separator),
+            (_, None, None) => stage,
         };
         col().w(area.0).h(area.1).center().fill(inner.bg).clip_rounded(0.0).child(stage)
     }
@@ -277,6 +293,11 @@ impl<S: 'static> Live<S> {
 /// A selected row's fill, a step stronger in dark mode where the track is faint.
 fn selected(t: Theme, dark: bool) -> Color {
     if dark { t.control_off } else { t.control_track }
+}
+
+/// Text a step quieter than secondary: the list's counts and motion marks.
+fn tertiary(t: Theme) -> Color {
+    t.text_secondary.mix(t.bg, 0.45)
 }
 
 /// A key's cap beside its control in the side column.
