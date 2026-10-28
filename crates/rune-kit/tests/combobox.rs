@@ -212,3 +212,36 @@ fn a_custom_trigger_opens_a_list_that_fits_the_window_under_a_search_header() {
     let last = find(&rt, "models-option-item-199");
     assert!(last.visible[3] > 0.0);
 }
+
+/// Typing while the list sits scrolled to its end: what the reader saw fades out where it stood,
+/// the matches fade in from the top, and matches that land out of view skip their fade.
+#[test]
+fn typing_crossfades_the_rows_in_view() {
+    let mut rt = runtime();
+    for _ in 0..60 { rt.frame(1.0 / 60.0); }
+    key(&mut rt, Key::Up, Mods::default());
+    for _ in 0..60 { rt.frame(1.0 / 60.0); }
+    // (top in the viewport, opacity, leaving)
+    let row = |rt: &Runtime<State>, id: &str| {
+        let vp = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("viewport")).unwrap().rect;
+        let key = format!("models-option-{id}");
+        let e = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key.as_str()))?;
+        Some((e.rect[1] - vp[1], e.opacity, e.exiting))
+    };
+    key(&mut rt, Key::Text("0".into()), Mods::default());
+    let (top, opacity, _) = row(&rt, "item-0").expect("the first match");
+    assert!(top.abs() < 0.5 && opacity < 0.05, "it fades in at the top: {top} at {opacity}");
+    for _ in 0..4 { rt.frame(1.0 / 120.0); }
+    let (top, opacity, _) = row(&rt, "item-7").expect("a match under the viewport");
+    assert!(top > 190.0 && opacity == 1.0, "nobody sees it, so it skips its fade: {top} at {opacity}");
+    let (stood, _, _) = row(&rt, "item-2").unwrap();
+    key(&mut rt, Key::Text("9".into()), Mods::default());
+    let (top, _, leaving) = row(&rt, "item-2").expect("a row the filter drops");
+    assert!(leaving && (top - stood).abs() < 0.5, "it fades where it stood: {stood} → {top}");
+    let (top, opacity, _) = row(&rt, "item-90").expect("the new first match");
+    assert!(top.abs() < 0.5 && opacity < 0.05, "it fades in at the top over the leaving rows: {top} at {opacity}");
+    for _ in 0..4 { rt.frame(1.0 / 120.0); }
+    key(&mut rt, Key::Text("9".into()), Mods::default());
+    let (top, opacity, _) = row(&rt, "item-99").expect("a match mounted out of view");
+    assert!(top.abs() < 0.5 && opacity < 0.05, "it fades in rather than appearing whole: {top} at {opacity}");
+}

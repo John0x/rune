@@ -3,7 +3,7 @@
 //! `cargo run -p todo -- --snap todo.png`.
 
 use rune::tok::{self, Theme, radius, type_};
-use rune::{AppSpec, Cx, El, Spring, col, el, row, text};
+use rune::{AppSpec, Cx, El, ScrollSpec, Spring, col, el, row, text};
 
 struct Todo { id: u32, title: String, done: bool }
 
@@ -46,7 +46,8 @@ fn view(s: &State, _: &mut Cx<State>) -> El {
     let done = s.todos.iter().filter(|t| t.done).count();
     col().w_full().h_full().padding(24.0).gap(12.0).fill(t.bg)
         .child(progress(done, s.todos.len(), t))
-        .child(list)
+        // Past what the window holds, the list scrolls, following new rows, and "Add" stays.
+        .child(list.scroll(ScrollSpec { stick_bottom: true }).shrink().min_h(0.0))
         .child(add)
 }
 

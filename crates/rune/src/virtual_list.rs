@@ -23,6 +23,13 @@ pub(crate) struct VirtualList {
     rows: HashMap<String, Row>,
     /// The commit each row in `keys` first appeared in.
     born: Vec<u64>,
+    /// `keys` changed since the frame began ([`VirtualList::frame_begins`]).
+    keys_fresh: bool,
+    /// The last change to `keys` kept a row the reader could see.
+    held: bool,
+    /// Rows mounted with their insertion transition and not yet drawn; the runtime lands the
+    /// ones that drew nothing (`runtime/unseen_presence.rs`).
+    pub entering: HashSet<String>,
     /// Each row's height, measured or estimated, in `keys` order.
     row_heights: Vec<f32>,
     /// Running totals of `row_heights` (one longer), rebuilt when one changes. Every frame reads
@@ -168,9 +175,28 @@ impl VirtualList {
         self.rows.get(key).map(|r| r.index)
     }
 
-    /// The commit row `i` first appeared in.
-    pub fn born(&self, i: usize) -> u64 {
-        self.born[i]
+    /// Whether row `i`, mounting in `commit`, skips its insertion transition. A row scrolled into
+    /// view was there all along, so it does. One new to the rows enters as an insertion, and so
+    /// does one that a change to the rows this frame (a filter, a sort) mounts: the rows it
+    /// replaces leave with their exits. Rows mounting with their transition are noted in
+    /// `entering`, and the runtime lands the ones that drew out of view, so only what shows fades.
+    pub fn mounts_quietly(&mut self, i: usize, commit: u64) -> bool {
+        let quiet = self.born[i] < commit && !(self.keys_fresh && !self.shown.contains(&self.keys[i]));
+        if !quiet { self.entering.insert(self.keys[i].clone()); }
+        quiet
+    }
+
+    /// The rows changed this frame and none the reader could see stayed (a filter): the rows
+    /// that leave hold no place, so what comes in shows where they stood.
+    pub fn replaced_view(&self) -> bool {
+        self.keys_fresh && !self.held
+    }
+
+    /// A new frame: what changed the keys before it has been drawn. Within a frame a scroll the
+    /// change asks for (`Tx::scroll_into_view`) commits again, and the rows it brings in are
+    /// still the change's.
+    pub fn frame_begins(&mut self) {
+        self.keys_fresh = false;
     }
 
     /// Whether the rows are exactly `keys`, in order.
@@ -180,7 +206,7 @@ impl VirtualList {
 
     /// Replaces the rows. Keys that stay keep their measured height and birth; new ones are born
     /// at `commit`. Returns the first row visible at `offset` (when given) that stays, with its
-    /// top before the change, to anchor the reader to.
+    /// top before the change, to anchor the reader to: none when no row in view stays.
     pub fn set_keys(&mut self, keys: Vec<String>, commit: u64, offset: Option<f32>) -> Option<(String, f32)> {
         let mut rows = HashMap::with_capacity(keys.len());
         let mut born = Vec::with_capacity(keys.len());
@@ -192,7 +218,13 @@ impl VirtualList {
             heights.push(height.unwrap_or(self.estimate));
             assert!(rows.insert(key.clone(), Row { index, height }).is_none(), "virtual row keys must be unique");
         }
-        let anchor = offset.and_then(|offset| self.first_visible(offset, |k| rows.contains_key(k)));
+        // A change that keeps none of the rows in view (a filter) leaves nothing to hold.
+        let anchor = offset.and_then(|offset| self.first_visible(offset, |k| rows.contains_key(k)))
+            .filter(|(_, top)| offset.is_some_and(|offset| *top < offset + self.viewport));
+        if keys != self.keys {
+            self.keys_fresh = true;
+            self.held = if offset.is_some() { anchor.is_some() } else { self.keys.iter().any(|k| rows.contains_key(k)) };
+        }
         self.rows = rows;
         self.born = born;
         self.keys = keys;

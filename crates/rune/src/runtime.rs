@@ -213,6 +213,8 @@ mod flatten;
 use flatten::*;
 #[path = "runtime/measure.rs"]
 mod measure;
+#[path = "runtime/unseen_presence.rs"]
+mod unseen_presence;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Env {
@@ -2103,6 +2105,7 @@ impl<S: 'static> Runtime<S> {
         // Each queued action runs with its own input's arrival time; nothing else has one.
         let _input = crate::input_time::scope(None);
         let mut live_woke = self.take_live_wake();
+        for v in self.virtuals.values_mut() { v.frame_begins(); }
         #[cfg(feature = "hot")]
         if self.hot.as_mut().is_some_and(crate::hot::Session::changed) {
             // Replace handler trait objects before queued input can call an old vtable.
@@ -2370,16 +2373,7 @@ impl<S: 'static> Runtime<S> {
                 }
             }
         }
-        // An exit that drew nothing last frame (under a parent that hid at once, say) is over.
-        if self.built {
-            for (i, n) in self.nodes.iter().enumerate() {
-                if self.inh_scratch.get(i).is_some_and(|h| h.opacity < 1.0 / 512.0) && self.is_exiting(n.id)
-                    && !self.flying.iter().any(|f| f.0 == n.id)
-                {
-                    self.scene.unmount(n.id);
-                }
-            }
-        }
+        self.end_unseen_exits();
         let out = self.scene.frame();
         let mut animating = out.animating;
         let mut sources = if out.animating { AnimSource::TRACKS } else { 0 };
@@ -3880,6 +3874,12 @@ impl<S: 'static> Runtime<S> {
         let now = self.t;
         if self.fit_height && let Some(root) = nodes.first() { self.fit_window(root.local.h, tx, first); }
 
+        // What drew nothing last frame has no exit to show (`unseen_presence.rs`).
+        let drew_nothing = self.drew_nothing();
+        let unseen_ids: HashSet<NodeId> = if self.virtuals.is_empty() { HashSet::new() } else {
+            self.nodes.iter().zip(&drew_nothing).filter(|&(_, &u)| u).map(|(n, _)| n.id).collect()
+        };
+
         // Growth stacks: rows of a stack that existed before grow; a new stack mounts settled.
         for c in 0..nodes.len() {
             let Some(_spec) = nodes[c].growth else { continue };
@@ -3914,7 +3914,13 @@ impl<S: 'static> Runtime<S> {
             let mut stack = self.stacks.remove(&cid).unwrap_or_default();
             let new_ids: Vec<NodeId> = rows.iter().map(|&j| nodes[j].id).collect();
             let new_set: HashSet<NodeId> = new_ids.iter().copied().collect();
-            // Merge: keep leaving rows where they stood.
+            // Merge: keep leaving rows where they stood. In a virtual list, a row that drew
+            // nothing, or any row when the change keeps none the reader could see (a filter),
+            // leaves no space to close: the list's anchor already holds what shows (`set_keys`),
+            // and the space would only push the rows the change brings in down, out of view.
+            let list = self.virtuals.get(&nodes[c].path);
+            let is_virtual = list.is_some();
+            let replaced = list.is_some_and(crate::virtual_list::VirtualList::replaced_view);
             let mut order = Vec::with_capacity(new_ids.len() + 4);
             let mut ni = 0;
             for &old in &stack.order {
@@ -3929,7 +3935,7 @@ impl<S: 'static> Runtime<S> {
                         order.push(old);
                     }
                     ni += 1;
-                } else if self.grows.get(&old).is_some_and(|g| g.h > 0.01) && existed && !instant {
+                } else if self.grows.get(&old).is_some_and(|g| g.h > 0.01) && existed && !instant && !replaced && !(is_virtual && unseen_ids.contains(&old)) {
                     stack.closing.entry(old).or_insert(now + 0.15);
                     order.push(old);
                 } else {
@@ -4057,6 +4063,7 @@ impl<S: 'static> Runtime<S> {
 
             let was_present = self.scene.contains(id);
             let was_exiting = self.is_exiting(id);
+            if was_present && !was_exiting && !instant && !unseen_ids.is_empty() { self.reenter_unseen_row(&nodes, i, &unseen_ids); }
             if let Some((key, _)) = &nodes[i].matched {
                 arrivals.push((key.clone(), i, !was_present || was_exiting));
             }
@@ -4370,11 +4377,6 @@ impl<S: 'static> Runtime<S> {
         let present_len = nodes.len();
         let old_nodes = std::mem::take(&mut self.nodes);
         let old_ids: Vec<NodeId> = old_nodes.iter().map(|n| n.id).collect();
-        // What drew nothing last frame (faded out already, or under a hidden parent) has no exit
-        // to show.
-        let unseen: Vec<bool> = if self.built {
-            (0..old_nodes.len()).map(|i| self.inh_scratch.get(i).is_some_and(|h| h.opacity < 1.0 / 512.0)).collect()
-        } else { Vec::new() };
         for (oi, mut old) in old_nodes.into_iter().enumerate() {
             if let Some(&i) = self.node_index.get(&old.id) {
                 let mut fill = None;
@@ -4405,7 +4407,7 @@ impl<S: 'static> Runtime<S> {
             let parent_remained_present =
                 old_parent_id.is_none_or(|pid| self.node_index.get(&pid).is_some_and(|&i| i < present_len));
             if parent_remained_present {
-                if tx.settle || (instant && !self.is_exiting(old.id)) || unseen.get(oi).copied().unwrap_or(false) {
+                if tx.settle || (instant && !self.is_exiting(old.id)) || drew_nothing.get(oi).copied().unwrap_or(false) {
                     self.scene.unmount(old.id);
                 } else {
                     if let Some(t) = old_parent_id.and_then(|pid| self.node_index.get(&pid)).and_then(|&p| nodes[p].vis.child_exit) {
@@ -7066,6 +7068,7 @@ impl<S: 'static> Runtime<S> {
         self.update_help();
         self.layer_scratch = layers;
         self.built = true;
+        self.land_unseen_entrances();
         self.built_ids.clear();
         self.built_ids.extend(self.nodes.iter().map(|n| n.id));
         if video_signature != self.video_signature {

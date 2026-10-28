@@ -147,3 +147,43 @@ fn padding_and_row_radius_default_to_4_and_follow_their_builders() {
     assert!((c[3] - (6.0 * 28.0 + 12.0)).abs() < 0.05);
     assert!((c[1] + c[3] - 392.0).abs() < 0.05, "the bottom stays 8 points over the field");
 }
+
+/// Sixty rows: the 300 point popover shows the first ten and keeps the rows below it mounted,
+/// clipped away.
+fn settled_long() -> Runtime<S> {
+    let ids = (0..60).map(|i| format!("a{i}")).collect();
+    let mut rt = Runtime::new(S { ids, padding: None, row_radius: None }, view, (600.0, 600.0), Env::new(true, 1.0));
+    rt.frame(0.0);
+    for _ in 0..60 {
+        rt.frame(1.0 / 120.0);
+    }
+    rt
+}
+
+#[test]
+fn filtered_out_rows_clipped_away_leave_at_once() {
+    let mut rt = settled_long();
+    assert!(rt.presented("p-option-a20").is_some(), "a row below the viewport is mounted");
+    rt.update(|s, _| s.ids = ids(&["a0"]));
+    rt.frame(1.0 / 120.0);
+    assert!(rt.presented("p-option-a20").is_none(), "a row nobody sees has no fade to show");
+    for _ in 0..4 {
+        rt.frame(1.0 / 120.0);
+    }
+    let (_, opacity) = rt.presented("p-option-a5").expect("a row in view is still leaving");
+    assert!(opacity > 0.05 && opacity < 1.0, "it fades: {opacity}");
+}
+
+#[test]
+fn rows_a_filter_brings_into_view_fade_in() {
+    let mut rt = settled_long();
+    assert!(rt.presented("p-option-a50").is_none(), "far down the list, not mounted");
+    rt.update(|s, _| s.ids = ids(&["a50", "a51"]));
+    rt.frame(1.0 / 120.0);
+    let (_, opacity) = rt.presented("p-option-a50").expect("the filter brings it into view");
+    assert!(opacity < 0.9, "it enters as its leaving neighbours exit, not at full opacity: {opacity}");
+    for _ in 0..60 {
+        rt.frame(1.0 / 120.0);
+    }
+    assert!(rt.presented("p-option-a50").unwrap().1 > 0.99);
+}

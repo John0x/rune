@@ -126,6 +126,14 @@ def main():
     full = hold({**still, "root/chip": (10, 10, 50, 20, 1)}, 5) + [{**still, "root/chip": (10, 10, 50, 20, op)} for op in ease(1, 0, 12)] + hold(still, 10)
     assert not {"cut-exit", "pop-out"} & set(kinds(full)), "a fade to 0, then gone"
 
+    # an instant scroll (wrapping to a long list's end) mounts the rows it lands on and drops the
+    # rows it left: the scroll, not pops. The same swap with no scroll pops.
+    top = {**still, "root/list/a": (0, 0, 200, 30, 1), "root/list/b": (0, 30, 200, 30, 1)}
+    end = {**still, "root/list/y": (0, 0, 200, 30, 1), "root/list/z": (0, 30, 200, 30, 1)}
+    swap = hold(top, 10) + hold(end, 20)
+    assert {"pop-in", "pop-out"} <= set(kinds(swap)), "rows swapped in place"
+    assert not {"pop-in", "pop-out"} & set(kinds(swap, flags={"root/list/y": 4 | 8, "root/list/z": 4 | 8})), "rows scrolled in"
+
     # stable identity: closing row a must remove a, not b (index keys remove the last row).
     rows = lambda *ks: {**still, **{f"root/list/{k}": (0, 30 * i, 200, 30, 1) for i, k in enumerate(ks)}, "root/list": (0, 0, 200, 90, 1)}
     close = [{"t": 0.1, "type": "tap", "key": "a/close", "expect": "leaves", "element": "root/list/a"}]

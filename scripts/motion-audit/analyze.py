@@ -45,6 +45,7 @@ JUMP_PT = 12.0
 # Frames at rest a motion segment bridges (see the segments in `analyze`).
 SEG_GAP = 2
 MIN_AREA = 1.0
+SCROLLING = 4  # flags: under a scroll viewport whose offset moved this frame
 BLANK = 64  # flags: draws nothing and holds nothing (a hit or hover zone, a spacer)
 SETTLE_TAIL_MS = 250.0  # a motion's own sub-visible tail after it hides what it moves
 
@@ -152,6 +153,7 @@ def analyze(path, script=None):
     inputs = []  # (frame, event)
     births = defaultdict(list)  # frame -> ids
     deaths = defaultdict(list)  # frame -> (id, last state)
+    scrolled = defaultdict(set)  # frame -> containers (by path) of elements a scroll moved
     cpu = []
     changed_by_frame = []
     t_ms = []
@@ -202,6 +204,8 @@ def analyze(path, script=None):
             vp = visible_part(e, W, H)
             frac = area(vp) / area(e.rect) if area(e.rect) > 0 else 0.0
             e.hist.append((k, *e.rect, e.op, e.flags, frac, on_screen(e.rect, W, H)))
+            if e.flags & SCROLLING:
+                scrolled[k].add(e.name.rpartition("/")[0])
         q = fr.get("quality", {})
         cpu.append(q.get("cpu_ms", 0.0))
         anim = bool(q.get("animating"))
@@ -343,7 +347,9 @@ def analyze(path, script=None):
             if not h:
                 continue
             k0, x, y, w, hh, op, flags, frac, ons = h[0]
-            if op < POP_OPACITY or frac == 0 or not ons or w * hh < 4 or flags & BLANK:
+            # A viewport's content entering as it scrolls (a virtual list mounting the rows an
+            # instant scroll lands on) is the scroll, which jumps already exempt, not a pop.
+            if op < POP_OPACITY or frac == 0 or not ons or w * hh < 4 or flags & (SCROLLING | BLANK):
                 continue
             grows = len(h) > 1 and (abs(h[1][3] - w) > 0.5 or abs(h[1][4] - hh) > 0.5 or abs(h[1][5] - op) > 0.01)
             intent = flags >> 8
@@ -356,7 +362,8 @@ def analyze(path, script=None):
     for k, items in deaths.items():
         tops = set(top_level([i for i, *_ in items]))
         for id, rect, op, was_seen in items:
-            if id not in tops or not was_seen:
+            # Leaving as its viewport scrolls (rows a jump left behind) is the scroll too.
+            if id not in tops or not was_seen or els[id].name.rpartition("/")[0] in scrolled[k]:
                 continue
             # Nothing unmounts above opacity 0: a fade cut short is a smaller pop.
             findings.append(dict(kind="pop-out" if op >= POP_OPACITY else "cut-exit", element=els[id].name, frames=1, longest=1, at=str(k),

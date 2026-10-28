@@ -586,6 +586,26 @@ impl Scene {
         }
     }
 
+    /// An entering node is present at once, its entrance landed: one nobody saw run.
+    pub fn enter_now(&mut self, id: NodeId) {
+        if let Some(i) = self.slot(id)
+            && self.nodes[i].phase == Phase::Entering
+        {
+            self.present_now(i);
+        }
+    }
+
+    /// A present node enters again from nothing, as if just mounted: one nobody saw that a
+    /// change brings into view.
+    pub fn reenter(&mut self, id: NodeId) {
+        if let Some(i) = self.slot(id)
+            && self.nodes[i].phase == Phase::Present
+        {
+            self.track_set(i, prop::PRESENCE, 0.0);
+            self.revive(i);
+        }
+    }
+
     fn revive(&mut self, i: usize) {
         let p = self.presence_now(i);
         let n = &mut self.nodes[i];

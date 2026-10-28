@@ -101,6 +101,7 @@ impl<S: 'static> Measurement<'_, S> {
         v.selection.copy_providers.clear();
         v.selection.unmounted.clear();
         if let Some(rows) = source {
+            let quiet: Vec<bool> = v.range.clone().map(|i| v.mounts_quietly(i, self.commits)).collect();
             let key_warnings = &mut *self.key_warnings;
             let keys = &v.keys;
             let mut build = |i: usize| {
@@ -141,9 +142,9 @@ impl<S: 'static> Measurement<'_, S> {
                     &mut v.selection.texts, &mut v.selection.copy_providers,
                 );
             }
-            el.children = v.range.clone().map(|i| {
+            el.children = v.range.clone().zip(quiet).map(|(i, quiet)| {
                 let mut row = build(i);
-                row.virtual_mount = v.born(i) < self.commits;
+                row.virtual_mount = quiet;
                 row
             }).collect();
             v.selection.source = Some(rows);
@@ -172,7 +173,7 @@ impl<S: 'static> Measurement<'_, S> {
                     v.selection.unmounted.insert(i, child);
                     return None;
                 }
-                child.virtual_mount = v.born(i) < self.commits;
+                child.virtual_mount = v.mounts_quietly(i, self.commits);
                 Some(child)
             }).collect();
         }
