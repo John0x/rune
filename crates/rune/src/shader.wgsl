@@ -65,10 +65,17 @@ fn base_vs(i: In) -> Out {
     } else if (kind > 4.5 && kind < 9.5) {
         grow = 1.0;
     }
-    let lo = i.rect.xy - vec2<f32>(grow);
+    var lo = i.rect.xy - vec2<f32>(grow);
     // Effect slots (kind 12) reserve their place in the stream and cover no pixels.
     let size = select(i.rect.zw + vec2<f32>(2.0 * grow), vec2<f32>(0.0), kind > 11.5);
-    let p = lo + corner * size;
+    var hi = lo + size;
+    // One band of a big shadow or border ring rasterizes only its window (runtime/bands.rs).
+    // Neighbouring bands compute a shared edge the same way, so they meet without a seam.
+    if (kind < 1.5 && i.uv.z < 0.0) {
+        lo = max(lo, i.rect.xy + i.uv.xy);
+        hi = max(min(hi, i.rect.xy + vec2<f32>(-i.uv.z, i.uv.w)), lo);
+    }
+    let p = select(lo, hi, corner > vec2<f32>(0.5));
     var screen = p;
     // Icon loops rotate the quad, not its atlas allocation. Local p still samples the glyph.
     if (kind > 1.5 && kind < 2.5 && i.params.x != 0.0) {

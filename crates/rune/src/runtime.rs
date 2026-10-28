@@ -145,6 +145,8 @@ mod window_requests;
 #[path = "runtime/action.rs"]
 mod action;
 use action::*;
+#[path = "runtime/bands.rs"]
+mod bands;
 #[path = "runtime/paint_slots.rs"]
 mod paint_slots;
 #[path = "runtime/shape_paint.rs"]
@@ -6342,6 +6344,11 @@ impl<S: 'static> Runtime<S> {
                     Some(s) if stuck_k > 0.0 => (stuck_k, &s.shadows),
                     _ => (0.0, &[]),
                 };
+                // A box that paints itself solid hides the middle of its shadows (bands.rs).
+                let opaque = native_material.is_none() && blur_hole.is_none() && n.material.is_none() && o >= 1.0
+                    && n.vis.gradient.is_none() && n.vis.radial.is_none() && n.vis.surface.is_none()
+                    && !n.vis.shadows.is_empty() && self.color(n.id, P_FILL, n.vis.fill).a >= 1.0;
+                let caster = ([r[0], r[1], w, h], if n.vis.continuous_corners { radii.map(|v| -v) } else { radii });
                 for (k, sh) in n.vis.shadows.iter().chain(stuck_shadows.1).enumerate() {
                     let c = if k >= n.vis.shadows.len() { sh.color.alpha(sh.color.a * stuck_shadows.0) }
                         else if k < P_SHADOWS.len() { self.color(n.id, P_SHADOWS[k], sh.color) } else { sh.color };
@@ -6377,7 +6384,7 @@ impl<S: 'static> Runtime<S> {
                         Some(hole) => ([sradii[0], sradii[1], sradii[2], hole], [r[0] - rect[0], r[1] - rect[1], w, h]),
                         None => (sradii, [0.0; 4]),
                     };
-                    self.instances.push(Instance {
+                    let inst = Instance {
                         rect,
                         radii,
                         fill: premul(c, o, srgb),
@@ -6386,7 +6393,12 @@ impl<S: 'static> Runtime<S> {
                         uv,
                         clip,
                         fade: crate::render::pack_fade(fade, clip, clip),
-                    });
+                    };
+                    if opaque {
+                        bands::push_shadow(&mut self.instances, inst, caster.0, caster.1);
+                    } else {
+                        self.instances.push(inst);
+                    }
                 }
                 // Shadows keep circular corners; the element's own shapes take the sign, and
                 // negative radii draw continuous corners (shader.wgsl `sd_rounded`).
@@ -6564,7 +6576,7 @@ impl<S: 'static> Runtime<S> {
                         });
                     }
                 } else if fill[3] > 0.0005 || border_a > 0.0005 {
-                    self.instances.push(Instance {
+                    let inst = Instance {
                         rect: [r[0], r[1], w, h],
                         radii,
                         fill,
@@ -6573,7 +6585,12 @@ impl<S: 'static> Runtime<S> {
                         uv: border_uv,
                         clip,
                         fade: crate::render::pack_fade(fade, clip, clip),
-                    });
+                    };
+                    if fill == [0.0; 4] && border_kind == KIND_RECT && bw > 0.0 {
+                        bands::push_ring(&mut self.instances, inst);
+                    } else {
+                        self.instances.push(inst);
+                    }
                 }
                 self.instances.extend(dashed);
                 for (k, sh) in n.vis.shadows.iter().chain(stuck_shadows.1).enumerate() {
