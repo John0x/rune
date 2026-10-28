@@ -36,6 +36,8 @@ pub(super) struct InputClick {
     pub(super) captured: bool,
     /// Queued press/drag steps paired with `Action::Focus` entries in `Runtime::queue`.
     steps: VecDeque<(String, Step)>,
+    /// Where the pointer dragging a selection is, in window points.
+    pointer: (f32, f32),
 }
 
 impl InputClick {
@@ -177,6 +179,21 @@ impl<S: 'static> Runtime<S> {
         self.capture_inside = true;
     }
 
+    /// Carries out `Tx::place_caret`: a press at window point (x, y) on the field named `key`,
+    /// one click without a drag.
+    pub(super) fn place_caret(&mut self, key: &str, x: f32, y: f32) {
+        let Some(i) = (0..self.nodes.len())
+            .find(|&i| self.nodes[i].named(key) && self.nodes[i].input.is_some() && !self.subtree_exiting(i))
+        else {
+            return;
+        };
+        let [lx, ly] = self.to_local(i, x, y);
+        let n = &self.nodes[i];
+        let path = n.path.clone();
+        self.input_click.steps.push_back((path.clone(), Step::Down { clicks: 1, shift: false }));
+        self.queue.push(Action::Focus(path, lx - n.inset[0], ly - n.inset[1]));
+    }
+
     pub(super) fn input_drag(&mut self, x: f32, y: f32, drag_move: bool) {
         if !drag_move {
             return;
@@ -193,6 +210,7 @@ impl<S: 'static> Runtime<S> {
         let jn = &self.nodes[ji];
         let (ix, iy) = (lx - jn.inset[0], ly - jn.inset[1]);
         self.input_click.steps.push_back((path.clone(), Step::Drag));
+        self.input_click.pointer = (x, y);
         self.queue.push(Action::Focus(path, ix, iy));
     }
 
@@ -215,7 +233,11 @@ impl<S: 'static> Runtime<S> {
         let scroll = self.input_scroll.get(&path).copied().unwrap_or(0.0);
         match step {
             Step::Down { clicks, shift } => {
+                let press = self.node(&path).and_then(|n| n.input.as_ref()?.press.clone());
                 self.set_focus(Some(path), false);
+                if let Some(press) = press {
+                    press(states!(self), one);
+                }
                 let e = access(states!(self));
                 e.set_single_line(single);
                 e.break_history_group();
@@ -252,20 +274,25 @@ impl<S: 'static> Runtime<S> {
                     self.input_click.drop_drag();
                     return false;
                 }
+                let drag = self.node(&path).and_then(|n| n.input.as_ref()?.drag.clone());
+                if let Some(drag) = &drag {
+                    let (wx, wy) = self.input_click.pointer;
+                    drag(states!(self), wx, wy, one);
+                }
                 let e = access(states!(self));
                 e.set_single_line(single);
                 if e.preedit.is_some() {
                     self.input_click.clear();
-                    return false;
+                    return drag.is_some();
                 }
-                let Some(l) = layout else { return false };
+                let Some(l) = layout else { return drag.is_some() };
                 let h = hit(e, &l, x + scroll, y, s, single);
                 let at = unit_at(e, h, self.input_click.unit);
                 let (anchor, focus) = extend(self.input_click.origin, at);
                 let before = (e.anchor, e.focus);
                 e.set_selection(anchor, focus);
                 if (e.anchor, e.focus) == before {
-                    return false;
+                    return drag.is_some();
                 }
                 e.break_history_group();
                 one.instant = true;

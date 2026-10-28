@@ -2316,6 +2316,7 @@ impl<S: 'static> Runtime<S> {
             let from_change = std::mem::take(&mut tx.select_from_change);
             self.apply_select_request(request, from_change);
         }
+        if let Some((key, x, y)) = tx.place_caret.take() { self.place_caret(&key, x, y); }
         // What the commit or a `Tx::select_text` changed is heard next frame.
         let changes = self.selection_changes();
         self.queue.extend(changes);
@@ -4436,6 +4437,8 @@ impl<S: 'static> Runtime<S> {
                 input.access = None;
                 input.key = None;
                 input.change = None;
+                input.press = None;
+                input.drag = None;
                 input.edit.focused = false;
                 input.edit.clear_preedit();
                 input.edit.conceal();

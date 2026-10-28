@@ -25,6 +25,8 @@ pub mod syntax;
 mod accordion;
 mod actions;
 mod badge;
+#[cfg(feature = "blocks")]
+pub mod blocks;
 mod card;
 mod checkbox;
 mod collapsible;

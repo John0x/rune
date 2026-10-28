@@ -69,6 +69,8 @@ pub struct Tx {
     /// `select` came from an `El::on_selection_change` handler, so applying it must not queue
     /// another `on_selection_change` round for that change.
     pub(crate) select_from_change: bool,
+    /// `Tx::place_caret`: a text field's key and a window point.
+    pub(crate) place_caret: Option<(String, f32, f32)>,
     /// `Tx::live_only`: this handler changed nothing the view reads.
     pub(crate) live_only: bool,
     /// `Tx::open_playground` and kin, and the playground's own controls.
@@ -265,6 +267,14 @@ impl Tx {
     pub fn select_all_text(&mut self, key: impl Into<String>) {
         self.select = Some(SelectRequest::All(key.into()));
         self.select_from_change = false;
+    }
+
+    /// Focus the text field named `key` (as [`Tx::select_text`] names it) with its caret at
+    /// window point `(x, y)`, as a click there would, after this handler's commit. A point above
+    /// or below the field lands on its first or last line, so an editor made of one field per
+    /// block moves between them with Up and Down and keeps the caret's column.
+    pub fn place_caret(&mut self, key: impl Into<String>, x: f32, y: f32) {
+        self.place_caret = Some((key.into(), x, y));
     }
 
     /// Clear the [`El::selectable`] text selection, as a click elsewhere does.

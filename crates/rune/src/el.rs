@@ -62,6 +62,7 @@ impl Drag {
 
 pub(crate) type PressFn = Rc<dyn Fn(crate::states::States<'_>, &mut Tx)>;
 pub(crate) type InputKeyFn = Rc<dyn Fn(crate::states::States<'_>, &crate::KeyEvent, &mut Tx) -> bool>;
+pub(crate) type InputDragFn = Rc<dyn Fn(crate::states::States<'_>, f32, f32, &mut Tx)>;
 pub(crate) type StepFn = Rc<dyn Fn(crate::states::States<'_>, i32, &mut Tx)>;
 pub(crate) type StepLimitFn = Rc<dyn Fn(crate::states::States<'_>, bool, &mut Tx)>;
 
@@ -191,6 +192,8 @@ pub struct InputSpec {
     pub(crate) key: Option<InputKeyFn>,
     pub(crate) change: Option<PressFn>,
     pub(crate) paste: Option<InputPasteFn>,
+    pub(crate) press: Option<PressFn>,
+    pub(crate) drag: Option<InputDragFn>,
 }
 
 impl std::fmt::Debug for InputSpec {
@@ -1095,6 +1098,8 @@ pub fn text_input(edit: &TextEdit, style: TextStyle) -> El {
         key: None,
         change: None,
         paste: None,
+        press: None,
+        drag: None,
     }));
     e.sync_input_pills();
     e.sync_input_rich();
@@ -1277,6 +1282,24 @@ impl El {
     pub fn on_input_paste<S: 'static>(mut self, f: impl Fn(&mut S, &crate::ClipboardContent, &mut Tx) -> bool + 'static) -> Self {
         if let Some(input) = &mut self.input {
             input.paste = Some(Rc::new(move |s, content, tx| f(s.cast::<S>().expect("input paste state type"), content, tx)));
+        }
+        self
+    }
+    /// Called when a press places this text field's caret (a click, or [`Tx::place_caret`]),
+    /// after the field takes focus and before the caret moves: an editor drops a selection of its
+    /// own (whole blocks, say) that the press replaces.
+    pub fn on_input_press<S: 'static>(mut self, f: impl Fn(&mut S, &mut Tx) + 'static) -> Self {
+        if let Some(input) = &mut self.input {
+            input.press = Some(Rc::new(move |s, tx| f(s.cast::<S>().expect("input press state type"), tx)));
+        }
+        self
+    }
+    /// Called as a press held in this text field drags a selection, with the pointer in window
+    /// points, before the selection follows it: an editor of one field per block selects whole
+    /// blocks once the pointer leaves the block it started in.
+    pub fn on_input_drag<S: 'static>(mut self, f: impl Fn(&mut S, f32, f32, &mut Tx) + 'static) -> Self {
+        if let Some(input) = &mut self.input {
+            input.drag = Some(Rc::new(move |s, x, y, tx| f(s.cast::<S>().expect("input drag state type"), x, y, tx)));
         }
         self
     }

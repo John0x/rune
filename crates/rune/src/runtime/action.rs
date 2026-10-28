@@ -168,6 +168,7 @@ pub(super) fn merge(tx: &mut Tx, one: Tx) {
         tx.select = one.select;
         tx.select_from_change = one.select_from_change;
     }
+    if one.place_caret.is_some() { tx.place_caret = one.place_caret; }
     tx.instant |= one.instant;
     tx.settle |= one.settle;
     tx.follow_edge |= one.follow_edge;

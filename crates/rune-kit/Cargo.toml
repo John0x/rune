@@ -14,10 +14,16 @@ pulldown-cmark = { version = "0.13", default-features = false, optional = true }
 [features]
 # `Markdown` and `MarkdownStyle`.
 markdown = ["dep:pulldown-cmark"]
+# `blocks`: a Notion-like block editor that reads and writes Markdown.
+blocks = ["markdown"]
 # Native ```mermaid diagrams in `Markdown` (flowcharts and sequence diagrams), and `mermaid`.
 mermaid = ["markdown"]
 # Phase timings for the headless benches (`markdown_resize`).
 frame-profile = ["rune/frame-profile"]
+
+[[example]]
+name = "blocks"
+required-features = ["blocks"]
 
 [[example]]
 name = "scroll_x"
