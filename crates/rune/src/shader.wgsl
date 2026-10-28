@@ -121,7 +121,16 @@ fn shadow_x(x: f32, y: f32, sigma: f32, corner: f32, half: vec2<f32>) -> f32 {
     return integral.y - integral.x;
 }
 
+// What `shadow` sums to well inside the box, where every row it samples is fully covered: the
+// four midpoint weights of the ±3σ window, 3·(g(0.75) + g(2.25)) for a unit Gaussian g.
+const SHADOW_INSIDE: f32 = 0.99863125;
+
 fn shadow(p: vec2<f32>, half: vec2<f32>, sigma: f32, corner: f32) -> f32 {
+    // A big panel's shadow is mostly interior, and its erf rows there cost a 5K frame
+    // milliseconds. 6σ in, each row is within 1e-6 of fully covered.
+    if (abs(p.x) <= half.x - 6.0 * sigma && abs(p.y) <= half.y - corner - 6.0 * sigma) {
+        return SHADOW_INSIDE;
+    }
     let lo = p.y - half.y;
     let hi = p.y + half.y;
     let start = clamp(-3.0 * sigma, lo, hi);
