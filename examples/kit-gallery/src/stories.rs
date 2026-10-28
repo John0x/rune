@@ -7,6 +7,8 @@ use rune_theme_opencode::icons as ic;
 
 use crate::G;
 
+mod combobox;
+
 type Story = fn(&G, &Kit, &mut Vec<El>) -> El;
 
 macro_rules! stories {
@@ -62,7 +64,7 @@ fn close(s: &mut G) {
 }
 
 stories! {
-    "rune-combobox--searchable" => combobox_searchable,
+    "rune-combobox--searchable" => combobox::searchable,
     "ui-dialog--basic" => dialog_basic,
     "motion-focus-modal" => motion_focus_modal,
     "ui-button--playground" => button_playground,
@@ -211,14 +213,6 @@ fn popup_list_composer(s: &G, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_change(|s: &mut G, _| { s.open = Some("popup-list".into()); s.pick.insert("popup-list".into(), "0".into()); })
         .build(k)
         .key("composer")
-}
-
-fn combobox_searchable(s: &G, k: &Kit, layer: &mut Vec<El>) -> El {
-    let options: Vec<_> = (0..200).map(|i| ComboboxOption::new(format!("model-{i}"), format!("Model {i:03}"))).collect();
-    Combobox::new("model", &s.combo, &options, |s: &mut G| &mut s.combo)
-        .placeholder("Choose model").current(s.pick.get("model").map(String::as_str))
-        .on_choose(|s, id, _| { s.pick.insert("model".into(), id.into()); })
-        .build(k, layer)
 }
 
 fn dialog_basic(s: &G, k: &Kit, layer: &mut Vec<El>) -> El {
