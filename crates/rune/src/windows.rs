@@ -207,6 +207,16 @@ impl From<WindowOptions> for ConfiguredWindowOptions {
     fn from(options: WindowOptions) -> Self { Self { options, native: MacWindowOptions::default() } }
 }
 
+impl ConfiguredWindowOptions {
+    /// Amends the AppKit settings in place, keeping what a preset already set:
+    /// `WindowOptions::launcher_panel().macos(|native| native.corner_radius(16.0))` stays a
+    /// launcher. Ignored on other platforms.
+    pub fn macos(mut self, amend: impl FnOnce(MacWindowOptions) -> MacWindowOptions) -> Self {
+        self.native = amend(self.native);
+        self
+    }
+}
+
 /// One independent retained tree and app state. Share Live handles or application services
 /// between states; events, focus, animation clocks and redraws remain window-local.
 pub struct WindowSpec<S: 'static> {
@@ -393,6 +403,18 @@ mod tests {
         assert!(!app.window_options.visible);
         let window = WindowSpec::from_app("launcher", app);
         assert!(!window.options.visible && window.options.transparent);
+    }
+
+    #[test]
+    fn amending_a_preset_keeps_its_launcher_behaviour() {
+        let preset = WindowOptions::launcher_panel().macos(|native| native.corner_radius(16.0).shadow(true));
+        assert!(preset.native.launcher && preset.native.nonactivating_panel);
+        assert_eq!((preset.native.corner_radius, preset.native.shadow), (Some(16.0), Some(true)));
+        assert!(!preset.options.visible && preset.options.transparent);
+        let spec = AppSpec::new("launcher", (300.0, 100.0), || (), |_, _| crate::el());
+        let app = App::new(spec).configured_options(preset);
+        assert!(app.macos_window.launcher);
+        assert_eq!(app.macos_window.corner_radius, Some(16.0));
     }
 
     #[test]

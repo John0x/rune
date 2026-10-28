@@ -1495,7 +1495,8 @@ a circular arc). The window's layer clips everything in it, so the root view nee
 the radius; a border inside the edge is still the app's. The system shadow follows the rounded
 shape: any transparent window with `hasShadow` asks AppKit to re-sample its shadow once its
 first frame after each show, resize or scale change (or a launcher's prewarm) reaches the screen.
-Opaque or bordered windows ignore the radius.
+Opaque or bordered windows ignore the radius. To round a preset without losing what it set,
+amend its native options: `WindowOptions::launcher_panel().macos(|native| native.corner_radius(16.0))`.
 
 `WindowSpec::on_created` receives a weak `WindowHandle`: toggle click-through,
 visibility and topmost status, close a window, borrow its raw-window-handle, or
