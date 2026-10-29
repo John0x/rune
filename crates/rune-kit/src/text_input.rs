@@ -13,6 +13,25 @@ fn kit_rich_style(k: &Kit) -> RichStyle {
         code_block_bg: k.c.layer_02,
         quote_bar: k.c.border_strong,
         marker: Some(k.c.text_muted),
+        colors: mark_colors(k).0,
+        highlights: mark_colors(k).1,
+    }
+}
+
+/// Notion's text colors and backgrounds for [`rune::Mark::Color`] and
+/// [`rune::Mark::Highlight`] (gray, brown, orange, yellow, green, blue, purple, pink, red).
+pub(crate) fn mark_colors(k: &Kit) -> ([Color; 9], [Color; 9]) {
+    let hex = |s: &str| rune::theme::hex(s).unwrap_or(k.c.text_base);
+    if k.dark {
+        (
+            ["#9B9B9B", "#BA856F", "#C77D48", "#CA9849", "#529E72", "#5E87C9", "#9D68D3", "#D15796", "#DF5452"].map(hex),
+            ["#2F2F2F", "#4A3228", "#5C3B23", "#564328", "#243D30", "#143A4E", "#3C2D49", "#4E2C3C", "#522E2A"].map(hex),
+        )
+    } else {
+        (
+            ["#787774", "#9F6B53", "#D9730D", "#CB912F", "#448361", "#337EA9", "#9065B0", "#C14C8A", "#D44C47"].map(hex),
+            ["#F1F1EF", "#F4EEEE", "#FBECDD", "#FBF3DB", "#EDF3EC", "#E7F3F8", "#F6F3F9", "#FAF1F5", "#FDEBEC"].map(hex),
+        )
     }
 }
 

@@ -37,7 +37,8 @@ pub(super) fn block_prefix(prefix: &str) -> Option<Kind> {
         "-" | "*" | "+" => Kind::Bullet,
         "[]" | "[ ]" => Kind::Todo { checked: false },
         "[x]" | "[X]" => Kind::Todo { checked: true },
-        ">" | "\"" => Kind::Quote,
+        ">" => Kind::Toggle { open: false },
+        "\"" => Kind::Quote,
         p if p.len() > 1 && p.ends_with('.') && p[..p.len() - 1].bytes().all(|b| b.is_ascii_digit()) => Kind::Numbered,
         _ => return None,
     })

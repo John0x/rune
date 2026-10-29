@@ -19,7 +19,7 @@ pub(super) struct Choice {
     words: &'static str,
 }
 
-pub(super) const CHOICES: [Choice; 10] = [
+pub(super) const CHOICES: [Choice; 11] = [
     Choice { id: "text", shortcut: "", words: "text paragraph plain" },
     Choice { id: "h1", shortcut: "#", words: "heading 1 h1 title" },
     Choice { id: "h2", shortcut: "##", words: "heading 2 h2 subtitle" },
@@ -27,7 +27,8 @@ pub(super) const CHOICES: [Choice; 10] = [
     Choice { id: "bullet", shortcut: "-", words: "bulleted list bullet ul unordered" },
     Choice { id: "numbered", shortcut: "1.", words: "numbered list ordered ol" },
     Choice { id: "todo", shortcut: "[]", words: "to-do list todo task checkbox" },
-    Choice { id: "quote", shortcut: ">", words: "quote blockquote citation" },
+    Choice { id: "toggle", shortcut: ">", words: "toggle list collapse expand details" },
+    Choice { id: "quote", shortcut: "\"", words: "quote blockquote citation" },
     Choice { id: "code", shortcut: "```", words: "code snippet block" },
     Choice { id: "divider", shortcut: "---", words: "divider rule separator line hr" },
 ];
@@ -41,6 +42,7 @@ impl Choice {
             "bullet" => Kind::Bullet,
             "numbered" => Kind::Numbered,
             "todo" => Kind::Todo { checked: false },
+            "toggle" => Kind::Toggle { open: false },
             "quote" => Kind::Quote,
             "code" => Kind::Code { language: String::new() },
             "divider" => Kind::Divider,
@@ -76,7 +78,10 @@ impl Blocks {
         let text = &b.edit.text;
         if self.menu.is_some_and(|m| m.block == b.id) {
             let keep = self.menu_query().is_some_and(|(m, q)| {
-                text.as_bytes().get(m.slash) == Some(&b'/') && q.len() <= 24 && !q.contains('\n') && !(q.ends_with(' ') && matching(q).is_empty())
+                text.as_bytes().get(m.slash) == Some(&b'/')
+                    && q.len() <= 24
+                    && !q.contains('\n')
+                    && !(q.ends_with(' ') && matching(q).is_empty())
             });
             if !keep {
                 self.menu = None;

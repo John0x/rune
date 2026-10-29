@@ -1,7 +1,7 @@
 //! Keys in a block's field, before the field sees them: structure (Return, Backspace, Tab),
 //! moving between blocks, Markdown shortcuts, the slash menu, and whole-block selection.
 
-use rune::{ClipboardContent, Key, KeyEvent, Tx};
+use rune::{ClipboardContent, Key, KeyEvent, Mark, Tx};
 
 use super::{Blocks, Kind, Selection, inline, markdown, model};
 
@@ -32,6 +32,31 @@ fn changed(done: bool) -> Outcome {
     if done { Outcome::Changed } else { Outcome::Handled }
 }
 
+/// Notion's ⌘⌥ digit shortcuts: 0 text, 1–3 headings, 4 to-do, 5 bulleted, 6 numbered, 7
+/// toggle list, 8 code.
+fn turn_into_key(ev: &KeyEvent, tx: &Tx) -> Option<Kind> {
+    if !(ev.mods.cmd && ev.mods.alt) {
+        return None;
+    }
+    let digit = match &ev.key {
+        Key::Command(c) if c.is_ascii_digit() => Some(*c),
+        _ => None,
+    }
+    .or(tx.key_base().filter(char::is_ascii_digit))?;
+    Some(match digit {
+        '0' => Kind::Paragraph,
+        '1' => Kind::Heading(1),
+        '2' => Kind::Heading(2),
+        '3' => Kind::Heading(3),
+        '4' => Kind::Todo { checked: false },
+        '5' => Kind::Bullet,
+        '6' => Kind::Numbered,
+        '7' => Kind::Toggle { open: false },
+        '8' => Kind::Code { language: String::new() },
+        _ => return None,
+    })
+}
+
 /// The key of block `id`'s field in the editor keyed `editor`.
 pub(super) fn field_key(editor: &str, id: u64) -> String {
     format!("{editor}-f{id}")
@@ -41,9 +66,23 @@ impl Blocks {
     /// A key in block `id`'s field.
     pub(super) fn key(&mut self, id: u64, ev: &KeyEvent, caret: Option<Caret>, editor: &str, tx: &mut Tx) -> Outcome {
         let Some(i) = self.index(id) else { return Outcome::Ignored };
+        if let Some(kind) = turn_into_key(ev, tx) {
+            let range = self.selected().unwrap_or(i..i + 1);
+            for j in range.rev() {
+                if self.list[j].kind.has_text() {
+                    self.turn_into(j, kind.clone());
+                }
+            }
+            if let Some(h) = self.selection.and_then(|s| self.index(s.head)) {
+                self.keep_keys(h);
+            }
+            self.commit(None);
+            return Outcome::Changed;
+        }
         if self.selection.is_some() {
             return self.selection_key(ev, tx);
         }
+        self.last_block = Some(id);
         if self.menu.is_some_and(|m| m.block == id)
             && let Some(out) = self.menu_key(ev)
         {
@@ -99,6 +138,10 @@ impl Blocks {
             self.select(self.list[0].id, self.list[self.list.len() - 1].id);
             return Outcome::Handled;
         }
+        if let Some(out) = self.format_key(ev, code) {
+            return out;
+        }
+        let b = &self.list[i];
         match &ev.key {
             Key::Up | Key::Down if m.cmd && m.shift => {
                 let range = self.subtree(i);
@@ -108,6 +151,7 @@ impl Blocks {
                 self.toggle_todo(i);
                 Outcome::Changed
             }
+            Key::Enter if m.cmd && matches!(b.kind, Kind::Toggle { .. }) => changed(self.toggle_open(i)),
             Key::Enter if plain && !m.shift && code => {
                 self.list[i].edit.insert("\n");
                 Outcome::Changed
@@ -135,6 +179,30 @@ impl Blocks {
         }
     }
 
+    /// Notion's formatting keys: ⌘E inline code, ⌘⇧S strike, ⌘K a link, ⌘⇧H the last color
+    /// (⌘B, ⌘I and ⌘U are the field's own).
+    fn format_key(&mut self, ev: &KeyEvent, code: bool) -> Option<Outcome> {
+        if code {
+            return None;
+        }
+        let shift = ev.mods.shift;
+        Some(if ev.is_command('e') && !shift {
+            changed(self.format(Mark::Code))
+        } else if ev.is_command('s') && shift {
+            changed(self.format(Mark::Strike))
+        } else if ev.is_command('h') && shift {
+            let color = self.last_color.clone();
+            changed(self.paint(&color, false))
+        } else if ev.is_command('k') && !shift {
+            if !self.edit_link() {
+                return None;
+            }
+            Outcome::Handled
+        } else {
+            return None;
+        })
+    }
+
     /// Up or Down on the field's first or last line moves to the block above or below, at the
     /// caret's column; with Shift at the very start or end, it selects blocks.
     fn arrow(&mut self, i: usize, down: bool, shift: bool, caret: Option<Caret>, editor: &str, tx: &mut Tx) -> Outcome {
@@ -142,8 +210,20 @@ impl Blocks {
         let (a, z) = b.edit.range();
         let text = &b.edit.text;
         let edge = match caret {
-            Some(c) => if down { c.last_line } else { c.first_line },
-            None => if down { !text[z..].contains('\n') } else { !text[..a].contains('\n') },
+            Some(c) => {
+                if down {
+                    c.last_line
+                } else {
+                    c.first_line
+                }
+            }
+            None => {
+                if down {
+                    !text[z..].contains('\n')
+                } else {
+                    !text[..a].contains('\n')
+                }
+            }
         };
         if !edge {
             return Outcome::Ignored;
@@ -153,9 +233,9 @@ impl Blocks {
             if !at_end {
                 return Outcome::Ignored;
             }
-            let next = if down { (i + 1 < self.list.len()).then_some(i + 1) } else { i.checked_sub(1) };
+            // The block first, as Notion does; Shift and the arrows then extend from it.
             let id = b.id;
-            self.select(id, next.map_or(id, |n| self.list[n].id));
+            self.select(id, id);
             return Outcome::Handled;
         }
         let Some(j) = self.text_block(i, down) else { return Outcome::Ignored };
@@ -177,13 +257,16 @@ impl Blocks {
         Outcome::Handled
     }
 
-    /// The nearest block holding text after (or before) block `i`.
+    /// The nearest shown block holding text after (or before) block `i`.
     pub(super) fn text_block(&self, i: usize, forward: bool) -> Option<usize> {
-        if forward {
-            (i + 1..self.list.len()).find(|&j| self.list[j].kind.has_text())
-        } else {
-            (0..i).rev().find(|&j| self.list[j].kind.has_text())
-        }
+        let ok = |j: &usize| self.list[*j].kind.has_text() && !self.is_hidden(*j);
+        if forward { (i + 1..self.list.len()).find(ok) } else { (0..i).rev().find(ok) }
+    }
+
+    /// The nearest shown block after (or before) block `i`.
+    fn shown_block(&self, i: usize, forward: bool) -> Option<usize> {
+        let ok = |j: &usize| !self.is_hidden(*j);
+        if forward { (i + 1..self.list.len()).find(ok) } else { (0..i).rev().find(ok) }
     }
 
     /// A Markdown shortcut that typing `t` completes in block `i`: a kind at its start, or
@@ -223,8 +306,12 @@ impl Blocks {
 
     /// Focuses a field near block `i` (a divider has none), so keys keep coming while blocks
     /// are selected.
-    fn keep_keys(&mut self, i: usize) {
-        let j = if self.list[i].kind.has_text() { Some(i) } else { self.text_block(i, false).or_else(|| self.text_block(i, true)) };
+    pub(super) fn keep_keys(&mut self, i: usize) {
+        let j = if self.list[i].kind.has_text() {
+            Some(i)
+        } else {
+            self.text_block(i, false).or_else(|| self.text_block(i, true))
+        };
         if let Some(j) = j
             && !self.list[j].edit.focused
         {
@@ -245,7 +332,8 @@ impl Blocks {
         let out = match &ev.key {
             Key::Escape | Key::Enter if plain => {
                 self.selection = None;
-                if let Some(j) = self.list[head].kind.has_text().then_some(head).or_else(|| self.text_block(head, true)) {
+                if let Some(j) = self.list[head].kind.has_text().then_some(head).or_else(|| self.text_block(head, true))
+                {
                     let end = self.list[j].edit.text.len();
                     self.focus(j, end);
                 }
@@ -253,7 +341,7 @@ impl Blocks {
             }
             Key::Up | Key::Down if m.cmd && m.shift => changed(self.move_by(range, ev.key == Key::Down)),
             Key::Up | Key::Down if plain => {
-                let next = if ev.key == Key::Down { (head + 1).min(self.list.len() - 1) } else { head.saturating_sub(1) };
+                let next = self.shown_block(head, ev.key == Key::Down).unwrap_or(head);
                 let id = self.list[next].id;
                 self.select(if m.shift { sel.anchor } else { id }, id);
                 Outcome::Handled
@@ -278,6 +366,10 @@ impl Blocks {
                 self.duplicate(range);
                 Outcome::Changed
             }
+            _ if ev.is_command('h') && m.shift => {
+                let color = self.last_color.clone();
+                changed(self.paint(&color, false))
+            }
             _ if ev.is_command('a') => {
                 self.select(self.list[0].id, self.list[self.list.len() - 1].id);
                 Outcome::Handled
@@ -296,8 +388,16 @@ impl Blocks {
     }
 
     /// A press placed a caret in block `id`: that ends a block selection, and a menu elsewhere.
-    pub(super) fn pressed(&mut self, id: u64) {
+    /// With Shift, it selects the blocks from the one selected or edited before to this one.
+    pub(super) fn pressed(&mut self, id: u64, shift: bool) {
+        let anchor = self.selection.map(|s| s.anchor).or(self.last_block).filter(|&anchor| anchor != id);
+        self.block_menu = None;
+        if let (true, Some(anchor)) = (shift, anchor) {
+            self.select(anchor, id);
+            return;
+        }
         self.selection = None;
+        self.last_block = Some(id);
         if self.menu.is_some_and(|m| m.block != id) {
             self.menu = None;
         }

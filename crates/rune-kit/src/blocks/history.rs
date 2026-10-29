@@ -107,7 +107,12 @@ impl Blocks {
         self.list = snapshot
             .blocks
             .iter()
-            .map(|s| super::Block { id: s.id, edit: model::field(&s.kind, &s.text, s.marks.clone()), kind: s.kind.clone(), indent: s.indent })
+            .map(|s| super::Block {
+                id: s.id,
+                edit: model::field(&s.kind, &s.text, s.marks.clone()),
+                kind: s.kind.clone(),
+                indent: s.indent,
+            })
             .collect();
         self.selection = None;
         self.menu = None;

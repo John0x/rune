@@ -95,6 +95,8 @@ mod drop_dispatch;
 mod playground_host;
 #[path = "runtime/scroll_bottom.rs"]
 mod scroll_bottom;
+#[path = "runtime/drag_autoscroll.rs"]
+mod drag_autoscroll;
 #[path = "runtime/caret.rs"]
 mod caret;
 #[path = "runtime/layout_read.rs"]
@@ -419,6 +421,7 @@ pub(crate) struct Node {
     on_drag: Option<DragFn>,
     drag_out: Option<DragOutFn>,
     drag_threshold: Option<f32>,
+    drag_autoscroll: bool,
     on_drag_start: Option<PressFn>,
     on_drag_end: Option<DragEndFn>,
     drop: Option<Box<crate::el::DropSpec>>,
@@ -2398,6 +2401,7 @@ impl<S: 'static> Runtime<S> {
         }
         let mut source = |on: bool, bit: u16| { if on { sources |= bit; } on };
         animating |= source(self.step_growth(step as f32), AnimSource::GROWTH);
+        animating |= source(self.step_drag_autoscroll(step as f32), AnimSource::SCROLL);
         animating |= source(self.step_scroll(step as f32), AnimSource::SCROLL);
         for stack in self.stacks.values_mut() { stack.grown = 0.0; }
         animating |= source(self.reveals_active(), AnimSource::REVEAL);

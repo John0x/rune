@@ -42,6 +42,10 @@ pub enum Mark {
     /// chip ([`El::pill_style`](crate::El::pill_style), [`El::pill_colors`](crate::El::pill_colors),
     /// [`El::pill_icon`](crate::El::pill_icon)). Insert one with [`TextEdit::insert_pill`].
     Pill(String),
+    /// Text in color `n` of [`RichStyle::colors`] (Notion's gray, brown, … red).
+    Color(u8),
+    /// A background of color `n` of [`RichStyle::highlights`] behind the text.
+    Highlight(u8),
 }
 
 impl Mark {
@@ -54,7 +58,9 @@ impl Mark {
             | (Mark::Strike, Mark::Strike)
             | (Mark::Code, Mark::Code)
             | (Mark::Link(_), Mark::Link(_))
-            | (Mark::Pill(_), Mark::Pill(_)) => true,
+            | (Mark::Pill(_), Mark::Pill(_))
+            | (Mark::Color(_), Mark::Color(_))
+            | (Mark::Highlight(_), Mark::Highlight(_)) => true,
             _ => false,
         }
     }
@@ -88,6 +94,8 @@ impl Mark {
             Mark::Code => 4,
             Mark::Link(_) => 5,
             Mark::Pill(_) => 6,
+            Mark::Color(_) => 7,
+            Mark::Highlight(_) => 8,
         }
     }
 }
@@ -201,7 +209,16 @@ pub struct RichStyle {
     pub link: Color,
     pub quote_bar: Color,
     pub marker: Option<Color>,
+    /// The colors of [`Mark::Color`], by its index (out of range: the text's own).
+    pub colors: [Color; 9],
+    /// The backgrounds of [`Mark::Highlight`], by its index.
+    pub highlights: [Color; 9],
 }
+
+/// Notion's text colors' hues, in [`Mark::Color`]'s order: gray, brown, orange, yellow, green,
+/// blue, purple, pink, red (chroma 0 for gray).
+const MARK_HUES: [(f32, f32); 9] =
+    [(0.0, 0.0), (0.06, 45.0), (0.13, 55.0), (0.11, 85.0), (0.09, 155.0), (0.1, 245.0), (0.12, 300.0), (0.13, 350.0), (0.15, 25.0)];
 
 impl Default for RichStyle {
     fn default() -> Self {
@@ -212,6 +229,8 @@ impl Default for RichStyle {
             link: oklch(0.68, 0.16, 250.0),
             quote_bar: oklcha(0.6, 0.04, 255.0, 0.45),
             marker: None,
+            colors: MARK_HUES.map(|(c, h)| oklch(0.62, c, h)),
+            highlights: MARK_HUES.map(|(c, h)| oklcha(0.62, c.max(0.01), h, 0.25)),
         }
     }
 }
@@ -1252,8 +1271,8 @@ impl TextEdit {
         }
 
         // Merge overlapping or adjacent ranges of the same mark kind.
-        // For `Mark::Link`, later entries win over earlier overlapping links.
-        let mut by_kind: [Vec<MarkRange>; 7] = Default::default();
+        // For `Mark::Link` and the colors, later entries win over earlier overlapping ones.
+        let mut by_kind: [Vec<MarkRange>; 9] = Default::default();
         for m in self.marks.drain(..) {
             if m.start < m.end {
                 by_kind[m.mark.kind_order() as usize].push(m);
@@ -1276,8 +1295,9 @@ impl TextEdit {
                         merged.push(m);
                     }
                 }
-            } else if kind_idx == 5 {
-                // `Mark::Link`: resolve overlaps so later links overwrite earlier ones, then merge adjacent equal URLs.
+            } else if matches!(kind_idx, 5 | 7 | 8) {
+                // `Mark::Link`, `Mark::Color`, `Mark::Highlight`: resolve overlaps so later
+                // ones overwrite earlier ones, then merge adjacent equal ones.
                 let mut bounds: Vec<(usize, usize)> = list.iter().map(|m| (m.start, m.end)).collect();
                 bounds.sort_unstable();
                 let overlapping = bounds.windows(2).any(|w| w[1].0 < w[0].1);
@@ -2506,6 +2526,16 @@ impl TextEdit {
                 }
                 // The chip and its colours come from `display_pills`.
                 Mark::Pill(_) => {}
+                Mark::Color(n) => {
+                    if let Some(&color) = style.colors.get(usize::from(*n)) {
+                        spans.push(Span { start: r_start, end: r_end, color: Some(color), ..Span::default() });
+                    }
+                }
+                Mark::Highlight(n) => {
+                    if let Some(&bg) = style.highlights.get(usize::from(*n)) {
+                        spans.push(Span { start: r_start, end: r_end, bg: Some(bg), bg_pad: 1.0, ..Span::default() });
+                    }
+                }
             }
         };
 

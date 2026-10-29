@@ -2,14 +2,17 @@
 //! quotes, code, dividers), each its own rich text field.
 //!
 //! Markdown shortcuts turn a block into another kind as you type at its start (`# `, `## `,
-//! `### `, `- `, `1. `, `[] `, `> `, ```` ``` ````, `---`) and format text as you close them
-//! (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `[link](url)`); `/` opens a menu of kinds.
+//! `### `, `- `, `1. `, `[] `, `> ` for a toggle, `" ` for a quote, ```` ``` ````, `---`) and
+//! format text as you close them (`**bold**`, `*italic*`, `` `code` ``, `~~strike~~`,
+//! `[link](url)`); `/` opens a menu of kinds. Selecting text shows a toolbar to format it,
+//! link it (⌘K), color it or turn its block into another kind.
 //! Return splits a block, Backspace at its start turns it back into a paragraph and then merges
 //! it into the one above, Tab and Shift+Tab nest it; the arrows move between blocks and keep
 //! the caret's column. Escape selects the block, Shift and the arrows extend the selection, and
 //! a selection moves (⌘⇧↑, ⌘⇧↓), nests, duplicates (⌘D), copies, cuts or deletes blocks whole.
 //! A block's handle, shown on hover, drags it with the blocks nested under it, sideways to nest
-//! it. Undo and redo cover the whole document. A document reads and writes Markdown.
+//! it, and opens its menu when clicked. A toggle hides the blocks nested under it while closed.
+//! Undo and redo cover the whole document. A document reads and writes Markdown.
 //!
 //! The app owns a [`Blocks`] and binds a [`BlockEditor`] to it, mounting the slash menu's
 //! layer at its root like any overlay:
@@ -29,17 +32,22 @@
 //! }
 //! ```
 
+mod handle;
 mod history;
 mod inline;
 mod keys;
 mod markdown;
+mod marquee;
 mod menu;
 mod model;
+mod toolbar;
 mod view;
 
 use rune::{Mark, MarkRange, TextEdit};
 
-pub use view::{BlockEditor, GUTTER};
+pub use handle::GUTTER;
+pub use marquee::selection_area;
+pub use view::BlockEditor;
 
 /// What a block is.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -49,10 +57,18 @@ pub enum Kind {
     Heading(u8),
     Bullet,
     Numbered,
-    Todo { checked: bool },
+    Todo {
+        checked: bool,
+    },
     Quote,
+    /// A toggle list item: the blocks nested under it show while it's open.
+    Toggle {
+        open: bool,
+    },
     /// A code block; `language` names its syntax (`rust`, `ts`), or is empty.
-    Code { language: String },
+    Code {
+        language: String,
+    },
     Divider,
 }
 
@@ -68,6 +84,7 @@ impl Kind {
             Kind::Numbered => "Numbered list",
             Kind::Todo { .. } => "To-do list",
             Kind::Quote => "Quote",
+            Kind::Toggle { .. } => "Toggle list",
             Kind::Code { .. } => "Code",
             Kind::Divider => "Divider",
         }
@@ -75,7 +92,7 @@ impl Kind {
 
     /// A list item: Return continues it with another of its kind.
     pub fn is_list(&self) -> bool {
-        matches!(self, Kind::Bullet | Kind::Numbered | Kind::Todo { .. })
+        matches!(self, Kind::Bullet | Kind::Numbered | Kind::Todo { .. } | Kind::Toggle { .. })
     }
 
     /// Whether it holds text (all but dividers).
@@ -96,7 +113,7 @@ pub struct Block {
     pub kind: Kind,
     /// Nesting level: a block is a child of the nearest block above it with a smaller one.
     pub indent: u8,
-    /// Its text and inline formatting (bold, italic, strike, code, links).
+    /// Its text and inline formatting (bold, italic, strike, code, links, colors).
     pub edit: TextEdit,
 }
 
@@ -126,8 +143,20 @@ pub struct Blocks {
     /// Blocks selected whole, from `anchor` to `head` (ids), after Escape or a drag.
     selection: Option<Selection>,
     menu: Option<menu::SlashMenu>,
-    drag: Option<view::BlockDrag>,
+    drag: Option<handle::BlockDrag>,
+    /// The block whose ⋮⋮ opened its menu, and where (window points).
+    block_menu: Option<(u64, [f32; 2])>,
+    /// Whether the block menu's colors show.
+    block_colors: bool,
+    /// A rectangle being dragged to select blocks.
+    marquee: Option<marquee::Marquee>,
     hovered: Option<u64>,
+    /// The block edited last, where a Shift-click's selection starts.
+    last_block: Option<u64>,
+    /// The formatting toolbar's open menu or link field.
+    toolbar: toolbar::Toolbar,
+    /// The color ⌘⇧H applies: the last one picked.
+    last_color: Mark,
     history: history::History,
     revision: u64,
     /// What a field bound to a block that's gone edits.
@@ -165,7 +194,8 @@ impl Blocks {
     /// Replaces the whole document with `markdown`, as one step undo takes back.
     pub fn set_markdown(&mut self, markdown: &str) {
         let parts = markdown::parse(markdown);
-        self.list = parts.into_iter().map(|(kind, indent, text, marks)| self.make(kind, indent, &text, marks)).collect();
+        self.list =
+            parts.into_iter().map(|(kind, indent, text, marks)| self.make(kind, indent, &text, marks)).collect();
         self.ensure_text_block();
         self.selection = None;
         self.menu = None;
@@ -179,7 +209,13 @@ impl Blocks {
             selection: None,
             menu: None,
             drag: None,
+            block_menu: None,
+            block_colors: false,
+            marquee: None,
             hovered: None,
+            last_block: None,
+            toolbar: toolbar::Toolbar::default(),
+            last_color: Mark::Highlight(3),
             history: history::History::default(),
             revision: 0,
             scratch: TextEdit::new(""),
@@ -233,7 +269,19 @@ impl Blocks {
     }
 }
 
-/// Bold, italic, strike, inline code and links: what Markdown keeps.
-fn rich_marks() -> [Mark; 5] {
-    [Mark::Bold, Mark::Italic, Mark::Strike, Mark::Code, Mark::Link(String::new())]
+/// Bold, italic, underline, strike, inline code, links and colors.
+fn rich_marks() -> [Mark; 8] {
+    [
+        Mark::Bold,
+        Mark::Italic,
+        Mark::Underline,
+        Mark::Strike,
+        Mark::Code,
+        Mark::Link(String::new()),
+        Mark::Color(0),
+        Mark::Highlight(0),
+    ]
 }
+
+/// Notion's colors, in [`Mark::Color`] and [`Mark::Highlight`]'s order.
+pub const COLORS: [&str; 9] = ["Gray", "Brown", "Orange", "Yellow", "Green", "Blue", "Purple", "Pink", "Red"];

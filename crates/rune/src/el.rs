@@ -826,6 +826,7 @@ pub struct El {
     pub(crate) on_drag: Option<DragFn>,
     pub(crate) drag_out: Option<DragOutFn>,
     pub(crate) drag_threshold: Option<f32>,
+    pub(crate) drag_autoscroll: bool,
     pub(crate) on_drag_start: Option<PressFn>,
     pub(crate) on_drag_end: Option<DragEndFn>,
     pub(crate) drop: Option<Box<DropSpec>>,
@@ -918,6 +919,7 @@ fn base(dir: FlexDirection) -> El {
         on_drag: None,
         drag_out: None,
         drag_threshold: None,
+        drag_autoscroll: false,
         on_drag_start: None,
         on_drag_end: None,
         drop: None,
@@ -3166,6 +3168,15 @@ impl El {
     /// ```
     pub fn drag_threshold(mut self, points: f32) -> Self {
         self.drag_threshold = Some(points.max(0.0));
+        self
+    }
+    /// While this element's [`El::on_drag`] holds the pointer near the top or bottom edge of
+    /// the scroll viewport around it (or, for an element around a page, the one inside it under
+    /// the pointer), the viewport scrolls, faster nearer the edge, and the drag gets a
+    /// `Phase::Move` each frame it does: a dragged row or a selection rectangle reaches what's
+    /// off screen.
+    pub fn drag_autoscroll(mut self) -> Self {
+        self.drag_autoscroll = true;
         self
     }
     /// Called when a [`El::drag_out`] drag starts, after the drag image was taken, so the app

@@ -4,7 +4,7 @@
 //! F2 (or `--scene markdown`) shows the note as the Markdown the editor writes.
 
 use rune::{AppSpec, Cx, El, Key, KeyEvent, ScrollSpec, Tx, col, text};
-use rune_kit::blocks::{BlockEditor, Blocks, GUTTER};
+use rune_kit::blocks::{BlockEditor, Blocks, GUTTER, selection_area};
 use rune_kit::{Kit, root};
 
 const NOTE: &str = "# Weekly sync
@@ -19,7 +19,10 @@ const NOTE: &str = "# Weekly sync
 
 ## Challenges and blockers
 
-> The importer still drops nested lists.
+> The importer still drops <mark class=\"highlight-red\">nested lists</mark>.
+
+- ▸ Details from the call
+    - The <mark class=\"highlight-yellow_background\">parser</mark> loses the indent
 
 1. Reproduce it
 2. Write the fix
@@ -57,6 +60,7 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
             .on_edit(|s: &mut State| &mut s.note)
             .build(&k, cx, &mut layer)
     };
+    let markdown = s.markdown;
     let page = col()
         .key("page")
         .w_full()
@@ -65,6 +69,8 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(k.c.page)
         .scroll(ScrollSpec { stick_bottom: false })
         .child(col().key("column").w_full().max_w(760.0 + GUTTER).self_center().pt(40.0).pr(24.0).child(body));
+    // A drag in the margins selects blocks with a rectangle, as one between them does.
+    let page = if markdown { page } else { selection_area("note", &s.note, cx, |s: &mut State| &mut s.note, page) };
     root(page, layer)
 }
 

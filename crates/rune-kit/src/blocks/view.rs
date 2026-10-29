@@ -1,55 +1,39 @@
 //! [`BlockEditor`]: the document as rows of fields, with a gutter of handles, list markers,
-//! dragging and the slash menu.
+//! dragging, the slash menu and the formatting toolbar.
 
 use std::rc::Rc;
 
 use rune::{
-    Align, Color, Cursor, Cx, Drag, El, Icon, Phase, RichStyle, Side, Span, TextStyle, Tx, col, edit_access, el, icon,
-    row, text, text_input,
+    Align, Color, Cursor, Cx, El, RichStyle, Side, Span, TextStyle, Tx, col, edit_access, el, icon, row, text,
+    text_input,
 };
 
+use super::handle::{self, GUTTER, INDENT};
 use super::keys::{Caret, Outcome, field_key};
+use super::marquee::{self, Rows};
 use super::menu::matching;
-use super::{Block, Blocks, Kind};
+use super::{Block, Blocks, Kind, toolbar};
 use crate::syntax::{SyntaxTheme, highlight};
 use crate::{Kit, PopupItem, PopupList};
 
-/// Width of the gutter left of the blocks, where a hovered block's handles show.
-pub const GUTTER: f32 = 48.0;
-/// Width of a nesting level.
-const INDENT: f32 = 24.0;
 /// Width of a list marker (bullet, number, checkbox).
 const MARKER: f32 = 24.0;
 
-static HANDLE: Icon = Icon {
-    name: "blocks-handle",
-    view: 16.0,
-    body: r#"<g fill="currentColor"><circle cx="6" cy="3.5" r="1.25"/><circle cx="10" cy="3.5" r="1.25"/><circle cx="6" cy="8" r="1.25"/><circle cx="10" cy="8" r="1.25"/><circle cx="6" cy="12.5" r="1.25"/><circle cx="10" cy="12.5" r="1.25"/></g>"#,
-};
-static PLUS: Icon = Icon {
-    name: "blocks-plus",
-    view: 16.0,
-    body: r#"<path d="M8 3V13M3 8H13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"#,
-};
-
-/// A block being dragged by its handle: how far the pointer moved, and where it would land.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct BlockDrag {
-    id: u64,
-    dx: f32,
-    dy: f32,
-    /// The index it would land before, and how many levels deeper.
-    to: Option<(usize, i8)>,
-}
-
 type Access<S> = Rc<dyn for<'b> Fn(&'b mut S) -> &'b mut Blocks>;
 type ChangeFn<S> = Rc<dyn Fn(&mut S, &mut Tx)>;
+/// The app's styling of a block's text (see [`BlockEditor::decorate`]).
+type Decorate<'a> = Box<dyn Fn(&Block) -> Vec<Span> + 'a>;
+/// The app's element at the end of a block's row (see [`BlockEditor::aside`]).
+type Aside<'a> = Box<dyn Fn(&Block, bool) -> Option<El> + 'a>;
+
+/// Width of the column [`BlockEditor::aside`] takes at the end of each row.
+const ASIDE: f32 = 28.0;
 
 /// What the handlers share: the document's accessor, the app's change hook, the editor's key.
-struct Wire<S> {
-    access: Access<S>,
-    change: Option<ChangeFn<S>>,
-    editor: Rc<str>,
+pub(super) struct Wire<S> {
+    pub(super) access: Access<S>,
+    pub(super) change: Option<ChangeFn<S>>,
+    pub(super) editor: Rc<str>,
 }
 
 impl<S> Clone for Wire<S> {
@@ -59,14 +43,14 @@ impl<S> Clone for Wire<S> {
 }
 
 impl<S: 'static> Wire<S> {
-    fn changed(&self, s: &mut S, tx: &mut Tx) {
+    pub(super) fn changed(&self, s: &mut S, tx: &mut Tx) {
         if let Some(change) = &self.change {
             change(s, tx);
         }
     }
 
     /// Runs `f` on the document; when it changed it, records the change and tells the app.
-    fn edit(&self, s: &mut S, tx: &mut Tx, f: impl FnOnce(&mut Blocks) -> bool) {
+    pub(super) fn edit(&self, s: &mut S, tx: &mut Tx, f: impl FnOnce(&mut Blocks) -> bool) {
         let doc = (self.access)(s);
         if f(doc) {
             doc.commit(None);
@@ -88,6 +72,8 @@ struct Look {
     selection: Color,
     /// Behind blocks selected whole.
     picked: Color,
+    /// Where dragged blocks would land.
+    drop: Color,
     rich: RichStyle,
 }
 
@@ -96,7 +82,11 @@ impl Look {
         let c = &k.c;
         Look {
             body: TextStyle::new(16.0, 400.0).lh(24.0),
-            headings: [TextStyle::new(30.0, 650.0).lh(38.0), TextStyle::new(24.0, 620.0).lh(31.0), TextStyle::new(20.0, 600.0).lh(27.0)],
+            headings: [
+                TextStyle::new(30.0, 650.0).lh(38.0),
+                TextStyle::new(24.0, 620.0).lh(31.0),
+                TextStyle::new(20.0, 600.0).lh(27.0),
+            ],
             code: TextStyle::new(14.0, 400.0).mono().lh(21.0),
             text: c.text_base,
             muted: c.text_muted,
@@ -105,6 +95,7 @@ impl Look {
             rule: c.border_base,
             selection: k.selection(),
             picked: k.c.text_accent.alpha(0.16),
+            drop: k.c.text_accent.alpha(0.55),
             rich: RichStyle {
                 link: c.text_accent,
                 code_fg: None,
@@ -112,6 +103,8 @@ impl Look {
                 code_block_bg: c.layer_02,
                 quote_bar: c.border_strong,
                 marker: Some(c.text_muted),
+                colors: crate::text_input::mark_colors(k).0,
+                highlights: crate::text_input::mark_colors(k).1,
             },
         }
     }
@@ -142,6 +135,7 @@ impl Look {
             Kind::Heading(_) => "Heading 3",
             Kind::Bullet | Kind::Numbered => "List",
             Kind::Todo { .. } => "To-do",
+            Kind::Toggle { .. } => "Toggle",
             Kind::Quote => "Empty quote",
             Kind::Code { .. } => "Code",
             _ => "Type '/' for commands",
@@ -152,7 +146,7 @@ impl Look {
 /// A [`Blocks`] document's editor: `BlockEditor::new("note", &s.note).on_edit(|s: &mut App|
 /// &mut s.note).build(&kit, cx, &mut layer)`. Without `on_edit` it only shows the document.
 ///
-/// Each row leaves [`GUTTER`] points on its left for the handles a hovered block shows (add a
+/// Each row leaves [`GUTTER`](super::GUTTER) points on its left for the handles a hovered block shows (add a
 /// block, drag it); place the editor so that margin hangs outside the text column.
 pub struct BlockEditor<'a, S> {
     key: String,
@@ -160,11 +154,21 @@ pub struct BlockEditor<'a, S> {
     access: Option<Access<S>>,
     change: Option<ChangeFn<S>>,
     placeholder: String,
+    decorate: Option<Decorate<'a>>,
+    aside: Option<Aside<'a>>,
 }
 
 impl<'a, S: 'static> BlockEditor<'a, S> {
     pub fn new(key: impl Into<String>, doc: &'a Blocks) -> Self {
-        BlockEditor { key: key.into(), doc, access: None, change: None, placeholder: String::new() }
+        BlockEditor {
+            key: key.into(),
+            doc,
+            access: None,
+            change: None,
+            placeholder: String::new(),
+            decorate: None,
+            aside: None,
+        }
     }
 
     /// What an empty document shows while it isn't focused.
@@ -185,63 +189,114 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
         self
     }
 
+    /// Styles ranges of each block's text (byte offsets into [`Block::text`]): a color for
+    /// what someone else wrote, a highlight for a match. Code keeps its syntax colors.
+    pub fn decorate(mut self, f: impl Fn(&Block) -> Vec<Span> + 'a) -> Self {
+        self.decorate = Some(Box::new(f));
+        self
+    }
+
+    /// An element at the end of each block's row, in a column of its own: a mark that shows
+    /// where the block comes from, say. `f` gets the block and whether the pointer is on its
+    /// row, and returns `None` to leave the column empty.
+    pub fn aside(mut self, f: impl Fn(&Block, bool) -> Option<El> + 'a) -> Self {
+        self.aside = Some(Box::new(f));
+        self
+    }
+
     pub fn build(self, k: &Kit, cx: &Cx<S>, layer: &mut Vec<El>) -> El {
         let look = Look::new(k);
         let doc = self.doc;
-        let wire = self.access.clone().map(|access| Wire { access, change: self.change.clone(), editor: self.key.as_str().into() });
-        let heights: Rc<Vec<f32>> =
-            Rc::new(doc.list.iter().map(|b| cx.layout_size(&row_key(&self.key, b.id)).map_or(0.0, |s| s[1])).collect());
-        // Where the rows start on screen, while a field has focus (a drag selects across them).
-        let top = if doc.is_focused() { cx.layout(&self.key).map_or(0.0, |r| r[1]) } else { 0.0 };
-        let shifts = doc.drag.map(|d| doc.drag_shifts(d, &heights)).unwrap_or_default();
+        let wire = self.access.clone().map(|access| Wire {
+            access,
+            change: self.change.clone(),
+            editor: self.key.as_str().into(),
+        });
+        let geometry = Rows::read(cx, &self.key, doc);
+        let heights = geometry.heights.clone();
+        // Keyed after the editor, so the app's own keys don't stand in for it.
+        let rows_key = format!("{}-rows", self.key);
+        let origin = cx.layout_with(&rows_key, |r| [r[0], r[1], r[2]]);
         let selected = doc.selected();
-        let dragged = doc.drag.and_then(|d| doc.index(d.id)).map(|i| doc.subtree(i));
-        let mut rows = col().key(self.key.clone()).w_full();
+        let dragged = doc.dragging();
+        let hidden = doc.hidden();
+        let mut rows = col().key(rows_key).w_full();
         for (i, b) in doc.list.iter().enumerate() {
+            if hidden[i] {
+                continue;
+            }
+            let row = self.row(&look, doc, i, b);
             let row = Row {
-                i,
-                b,
-                look: &look,
                 selected: selected.as_ref().is_some_and(|r| r.contains(&i)),
                 dragged: dragged.as_ref().is_some_and(|r| r.contains(&i)),
-                shift: shifts.get(i).copied().unwrap_or([0.0, 0.0]),
-                hint: if doc.is_empty() && !b.edit.focused && !self.placeholder.is_empty() {
-                    Some(self.placeholder.as_str())
-                } else if b.edit.focused || b.kind != Kind::Paragraph {
-                    Some(look.hint(&b.kind))
-                } else {
-                    None
-                },
+                ..row
             };
-            rows = rows.child(row.build(k, cx, doc, &self.key, wire.as_ref(), &heights, top));
+            rows = rows.child(row.build(k, cx, doc, &self.key, wire.as_ref(), &geometry));
         }
         if let Some(wire) = &wire {
-            rows = rows.child(tail(wire));
+            rows = rows
+                .child(el().key(format!("{}-tail", self.key)).w_full().h(96.0).cursor(Cursor::Text))
+                .drag_autoscroll()
+                .on_drag(marquee::handler(wire, geometry.clone(), origin.map(|o| [o[0], o[1]])));
             menu(k, doc, wire, layer);
+            handle::block_menu(k, doc, wire, layer);
+            toolbar::toolbar(k, cx, doc, wire, layer);
+        }
+        if let Some(rectangle) = marquee::rectangle(k, doc, origin.map(|o| [o[0], o[1]])) {
+            rows = rows.child(rectangle);
+        }
+        let width = origin.map_or(0.0, |o| o[2]);
+        if let Some((y, indent)) = doc.drop_line(&heights) {
+            let x = GUTTER + f32::from(indent) * INDENT;
+            let line = el().key("drop").absolute(x, y - 2.0).size((width - x).max(0.0), 4.0).radius(2.0);
+            rows = rows.child(line.fill(look.drop).raise());
+        }
+        if let Some(ghost) = self.ghost(k, cx, &look, &geometry, width) {
+            rows = rows.child(ghost);
         }
         rows
     }
+
+    /// Block `i`'s row, before the view marks it selected or dragged.
+    fn row<'r>(&'r self, look: &'r Look, doc: &Blocks, i: usize, b: &'r Block) -> Row<'r> {
+        Row {
+            i,
+            b,
+            look,
+            selected: false,
+            dragged: false,
+            hint: if doc.is_empty() && !b.edit.focused && !self.placeholder.is_empty() {
+                Some(self.placeholder.as_str())
+            } else if b.edit.focused || b.kind != Kind::Paragraph {
+                Some(look.hint(&b.kind))
+            } else {
+                None
+            },
+            spans: self.decorate.as_ref().map(|f| f(b)).unwrap_or_default(),
+            aside: self.aside.as_ref().map(|f| f(b, doc.hovered == Some(b.id))),
+        }
+    }
+
+    /// A faded copy of the dragged blocks under the pointer, as Notion's.
+    fn ghost(&self, k: &Kit, cx: &Cx<S>, look: &Look, rows: &Rows, width: f32) -> Option<El> {
+        let doc = self.doc;
+        let (range, [dx, dy]) = doc.ghost()?;
+        let top: f32 = rows.heights[..range.start.min(rows.heights.len())].iter().sum();
+        let hidden = doc.hidden();
+        let editor = format!("{}-ghost", self.key);
+        let mut ghost = col().key(editor.clone()).absolute(dx, top + dy).w(width).opacity(0.5).raise();
+        for i in range.filter(|&i| !hidden[i]) {
+            let mut b = doc.list[i].clone();
+            b.edit.focused = false;
+            let row = self.row(look, doc, i, &b);
+            ghost = ghost.child(row.build(k, cx, doc, &editor, None::<&Wire<S>>, rows));
+        }
+        Some(ghost)
+    }
 }
 
-fn row_key(editor: &str, id: u64) -> String {
+pub(super) fn row_key(editor: &str, id: u64) -> String {
     format!("{editor}-b{id}")
-}
-
-/// The space below the blocks: a click there writes at the end.
-fn tail<S: 'static>(wire: &Wire<S>) -> El {
-    let wire = wire.clone();
-    el().key(format!("{}-tail", wire.editor)).w_full().h(96.0).cursor(Cursor::Text).on_press_tx(move |s: &mut S, tx| {
-        wire.edit(s, tx, |doc| {
-            let last = doc.list.len() - 1;
-            let b = &doc.list[last];
-            if b.kind == Kind::Paragraph && b.edit.text.is_empty() {
-                doc.focus(last, 0);
-                return false;
-            }
-            doc.insert(last + 1, Kind::Paragraph, 0, "", Vec::new());
-            true
-        });
-    })
 }
 
 /// One block's row, as the view builds it.
@@ -250,14 +305,16 @@ struct Row<'r> {
     b: &'r Block,
     look: &'r Look,
     selected: bool,
-    /// Whether it moves with a dragged block.
+    /// Whether it's being dragged (a copy follows the pointer).
     dragged: bool,
-    shift: [f32; 2],
     hint: Option<&'r str>,
+    /// The app's decorations of its text.
+    spans: Vec<Span>,
+    /// The app's element at its end, when the editor has a column for one.
+    aside: Option<Option<El>>,
 }
 
 impl Row<'_> {
-    #[allow(clippy::too_many_arguments)]
     fn build<S: 'static>(
         self,
         k: &Kit,
@@ -265,12 +322,11 @@ impl Row<'_> {
         doc: &Blocks,
         editor: &str,
         wire: Option<&Wire<S>>,
-        heights: &Rc<Vec<f32>>,
-        top: f32,
+        rows: &Rows,
     ) -> El {
         let b = self.b;
         let style = self.look.style(&b.kind);
-        let shown = doc.hovered == Some(b.id) || doc.drag.is_some_and(|d| d.id == b.id);
+        let shown = doc.hovered == Some(b.id) || self.dragged;
         let mut content = row()
             .key("content")
             .grow(1.0)
@@ -283,25 +339,34 @@ impl Row<'_> {
             content = content.child(marker);
         }
         content = content.child(match &b.kind {
-            Kind::Divider => {
-                row().key("rule").grow(1.0).h(self.look.body.line_px()).center_y().child(el().w_full().h(1.0).fill(self.look.rule))
-            }
+            Kind::Divider => row()
+                .key("rule")
+                .grow(1.0)
+                .h(self.look.body.line_px())
+                .center_y()
+                .child(el().w_full().h(1.0).fill(self.look.rule)),
             Kind::Code { .. } => {
-                let field = self.field(k, cx, doc, editor, wire, (heights, top)).w_full();
+                let field = self.field(k, cx, doc, editor, wire, rows).w_full();
                 col().key("code").grow(1.0).shrink().radius(6.0).fill(self.look.fill).padding(14.0).child(field)
             }
-            _ => self.field(k, cx, doc, editor, wire, (heights, top)).grow(1.0).shrink(),
+            _ => self.field(k, cx, doc, editor, wire, rows).grow(1.0).shrink(),
         });
+        // Where its menu opens: under ⋮⋮, read while the handles show.
+        let anchor = shown
+            .then(|| cx.layout_with(&format!("{}/gutter/drag", row_key(editor, b.id)), |r| [r[0], r[1] + r[3]]))
+            .flatten();
         let mut r = row()
             .key(row_key(editor, b.id))
             .w_full()
             .items_start()
             .pt(self.look.space_above(&b.kind))
             .pb(2.0)
-            .offset(self.shift[0], self.shift[1])
-            .opacity(if self.dragged { 0.55 } else { 1.0 })
-            .child(gutter(style.line_px(), k.c.icon_muted, shown, b, wire, heights))
+            .opacity(if self.dragged { 0.4 } else { 1.0 })
+            .child(handle::gutter(style.line_px(), k.c.icon_muted, shown, b, wire, &rows.heights, anchor))
             .child(content);
+        if let Some(aside) = self.aside {
+            r = r.child(el().key("aside").w(ASIDE).h(style.line_px()).center().children(aside));
+        }
         if let Some(wire) = wire {
             let (hover, id) = (wire.clone(), b.id);
             r = r.on_hover_change(move |s: &mut S, inside, _| {
@@ -324,7 +389,8 @@ impl Row<'_> {
     fn marker<S: 'static>(&self, k: &Kit, doc: &Blocks, wire: Option<&Wire<S>>) -> Option<El> {
         let b = self.b;
         let line = self.look.style(&b.kind).line_px();
-        let glyph = |s: String| el().w(MARKER).h(line).center().child(text(s).font(self.look.body).color(self.look.text));
+        let glyph =
+            |s: String| el().w(MARKER).h(line).center().child(text(s).font(self.look.body).color(self.look.text));
         Some(match &b.kind {
             Kind::Bullet => glyph(["•", "◦", "▪"][usize::from(b.indent) % 3].to_owned()),
             Kind::Numbered => glyph(format!("{}.", doc.number(self.i))),
@@ -339,7 +405,11 @@ impl Row<'_> {
                     .label("Done")
                     .fill(if *checked { c.bg_accent } else { Color::TRANSPARENT })
                     .border(1.5, if *checked { c.bg_accent } else { self.look.muted })
-                    .child(icon(k.glyph.check_small, 12.0).color(Color::WHITE).opacity(if *checked { 1.0 } else { 0.0 }));
+                    .child(icon(k.glyph.check_small, 12.0).color(Color::WHITE).opacity(if *checked {
+                        1.0
+                    } else {
+                        0.0
+                    }));
                 if let Some(wire) = wire {
                     let (wire, id) = (wire.clone(), b.id);
                     check = check.hit().cursor(Cursor::Pointer).on_press_tx(move |s: &mut S, tx| {
@@ -349,6 +419,24 @@ impl Row<'_> {
                 el().w(MARKER).h(line).center().child(check)
             }
             Kind::Quote => el().w(3.0).self_stretch().mr(14.0).ml(2.0).radius(1.5).fill(self.look.text),
+            Kind::Toggle { open } => {
+                let glyph = if *open { k.glyph.triangle_down } else { k.glyph.triangle_right };
+                let mut arrow = el()
+                    .key("toggle")
+                    .size(20.0, 20.0)
+                    .center()
+                    .radius(4.0)
+                    .role("button")
+                    .label(if *open { "Close" } else { "Open" })
+                    .child(icon(glyph, 12.0).color(self.look.text));
+                if let Some(wire) = wire {
+                    let (wire, id) = (wire.clone(), b.id);
+                    arrow = arrow.hit().cursor(Cursor::Pointer).hover(k.c.hover).on_press_tx(move |s: &mut S, tx| {
+                        wire.edit(s, tx, |doc| doc.index(id).is_some_and(|i| doc.toggle_open(i)));
+                    });
+                }
+                el().w(MARKER).h(line).center().child(arrow)
+            }
             _ => return None,
         })
     }
@@ -361,7 +449,7 @@ impl Row<'_> {
         doc: &Blocks,
         editor: &str,
         wire: Option<&Wire<S>>,
-        (heights, top): (&Rc<Vec<f32>>, f32),
+        rows: &Rows,
     ) -> El {
         let b = self.b;
         let look = self.look;
@@ -373,21 +461,28 @@ impl Row<'_> {
             .key(key.clone())
             .color(if checked { look.muted } else { look.text })
             .rich_style(look.rich)
-            .caret(if hidden { Color::TRANSPARENT } else { look.text }, if hidden { Color::TRANSPARENT } else { look.selection });
+            .caret(
+                if hidden { Color::TRANSPARENT } else { look.text },
+                if hidden { Color::TRANSPARENT } else { look.selection },
+            );
         if let Some(hint) = self.hint {
             f = f.placeholder(hint, look.faint);
         }
         if let Kind::Code { language } = &b.kind {
             let lang = (!language.is_empty()).then_some(language.as_str());
             f = f.decorations(SyntaxTheme::from_kit(k).spans(&highlight(lang, &b.edit.text), 0));
-        } else if checked {
-            let mut done = Span::new(0, b.edit.text.len());
-            done.color = Some(look.muted);
-            f = f.decorations(vec![done]);
+        } else if checked || !self.spans.is_empty() {
+            let mut spans = self.spans.clone();
+            if checked {
+                let mut done = Span::new(0, b.edit.text.len());
+                done.color = Some(look.muted);
+                spans.push(done);
+            }
+            f = f.decorations(spans);
         }
         let Some(wire) = wire else { return f };
         let caret = b.edit.focused.then(|| caret(cx, &key, style.line_px())).flatten();
-        let rows = Rows { heights: heights.clone(), top };
+        let rows = rows.clone();
         bind(f, b.id, caret, rows, wire)
     }
 }
@@ -403,26 +498,6 @@ fn caret<S>(cx: &Cx<S>, key: &str, line: f32) -> Option<Caret> {
         above: r[1] - 1.0,
         below: r[1] + r[3] + 1.0,
     })
-}
-
-/// The rows' heights and where the first starts on screen.
-struct Rows {
-    heights: Rc<Vec<f32>>,
-    top: f32,
-}
-
-impl Rows {
-    /// The row at window `y`.
-    fn at(&self, y: f32) -> usize {
-        let mut bottom = self.top;
-        for (i, h) in self.heights.iter().enumerate() {
-            bottom += h;
-            if y < bottom {
-                return i;
-            }
-        }
-        self.heights.len().saturating_sub(1)
-    }
 }
 
 /// A block field's handlers.
@@ -447,55 +522,12 @@ fn bind<S: 'static>(f: El, id: u64, caret: Option<Caret>, rows: Rows, wire: &Wir
             }
             done
         })
-        .on_input_press(move |s: &mut S, _| (w5.access)(s).pressed(id))
-        .on_input_drag(move |s: &mut S, _, y, _| (w6.access)(s).drag_select(id, rows.at(y)))
-}
-
-/// The handles left of a block: add a block below, and drag (a click selects the block).
-fn gutter<S: 'static>(line: f32, color: Color, shown: bool, b: &Block, wire: Option<&Wire<S>>, heights: &Rc<Vec<f32>>) -> El {
-    let mut g = row().key("gutter").w(GUTTER).h(line).pr(4.0).justify_end().center_y().gap(2.0).opacity(if shown { 1.0 } else { 0.0 });
-    let Some(wire) = wire else { return g };
-    let id = b.id;
-    let button = |key: &'static str, glyph: &'static Icon| {
-        el().key(key).size(20.0, 24.0).center().radius(4.0).child(icon(glyph, 15.0).color(color))
-    };
-    let add = {
-        let wire = wire.clone();
-        button("add", &PLUS).hit().cursor(Cursor::Pointer).on_press_tx(move |s: &mut S, tx| {
-            wire.edit(s, tx, |doc| doc.add_below(id));
-        })
-    };
-    let drag = {
-        let (wire, heights) = (wire.clone(), heights.clone());
-        button("drag", &HANDLE).hit().cursor(Cursor::Grab).on_drag(move |s: &mut S, d: &mut Drag, tx| {
-            let doc = (wire.access)(s);
-            match d.phase {
-                Phase::Down => {
-                    doc.drag = Some(BlockDrag { id, dx: 0.0, dy: 0.0, to: None });
-                    doc.select(id, id);
-                }
-                Phase::Move => {
-                    if let Some(mut g) = doc.drag {
-                        (g.dx, g.dy) = (d.dx, d.dy);
-                        g.to = doc.drop_target(g, &heights);
-                        doc.drag = Some(g);
-                    }
-                }
-                Phase::Up => {
-                    let g = doc.drag.take();
-                    if !d.cancelled()
-                        && let Some(g) = g
-                        && doc.drop(g)
-                    {
-                        doc.commit(None);
-                        wire.changed(s, tx);
-                    }
-                }
+        .on_input_press(move |s: &mut S, tx| (w5.access)(s).pressed(id, tx.mods().shift))
+        .on_input_drag(move |s: &mut S, _, y, _| {
+            if let Some(over) = rows.at(y) {
+                (w6.access)(s).drag_select(id, over);
             }
         })
-    };
-    g = g.child(add).child(drag);
-    g
 }
 
 /// The slash menu, when open.
@@ -503,7 +535,9 @@ fn menu<S: 'static>(k: &Kit, doc: &Blocks, wire: &Wire<S>, layer: &mut Vec<El>) 
     let Some((m, query)) = doc.menu_query() else { return };
     let items: Vec<PopupItem> = matching(query)
         .into_iter()
-        .map(|c| PopupItem::new(c.id, c.kind().label()).trailing(text(c.shortcut).font(k.ty.small).color(k.c.text_faint)))
+        .map(|c| {
+            PopupItem::new(c.id, c.kind().label()).trailing(text(c.shortcut).font(k.ty.small).color(k.c.text_faint))
+        })
         .collect();
     let (w1, w2, w3) = (wire.clone(), wire.clone(), wire.clone());
     PopupList::new(format!("{}-menu", wire.editor), field_key(&wire.editor, m.block))
@@ -535,80 +569,5 @@ impl Blocks {
             self.selection = Some(super::Selection { anchor: id, head: self.list[over].id });
             self.menu = None;
         }
-    }
-
-    /// The "+" handle: opens the slash menu in block `id` when it's an empty paragraph, or in a
-    /// new one below it.
-    fn add_below(&mut self, id: u64) -> bool {
-        let Some(i) = self.index(id) else { return false };
-        let b = &self.list[i];
-        let at = if b.kind == Kind::Paragraph && b.edit.text.is_empty() {
-            self.focus(i, 0);
-            i
-        } else {
-            let (at, indent) = (self.subtree(i).end, b.indent);
-            self.insert(at, Kind::Paragraph, indent, "", Vec::new());
-            at
-        };
-        self.selection = None;
-        self.list[at].edit.insert("/");
-        self.update_menu(at);
-        true
-    }
-
-    /// Where dragging block `g.id` (and its children) by `g.dx, g.dy` would drop it, given the
-    /// rows' heights: before which block, and how many levels deeper.
-    fn drop_target(&self, g: BlockDrag, heights: &[f32]) -> Option<(usize, i8)> {
-        let i = self.index(g.id)?;
-        let range = self.subtree(i);
-        let h = |j: usize| heights.get(j).copied().unwrap_or(0.0);
-        let top: f32 = (0..range.start).map(h).sum();
-        let center = top + g.dy + range.clone().map(h).sum::<f32>() * 0.5;
-        let mut y = 0.0;
-        let mut to = self.list.len();
-        for j in 0..self.list.len() {
-            let mid = y + h(j) * 0.5;
-            y += h(j);
-            if !range.contains(&j) && mid > center {
-                to = j;
-                break;
-            }
-        }
-        Some((to, (g.dx / INDENT).round().clamp(-8.0, 8.0) as i8))
-    }
-
-    /// How far each row is drawn from its place while `g` drags: the dragged ones with the
-    /// pointer, the ones between their place and the target a step aside.
-    fn drag_shifts(&self, g: BlockDrag, heights: &[f32]) -> Vec<[f32; 2]> {
-        let mut shifts = vec![[0.0, 0.0]; self.list.len()];
-        let Some(i) = self.index(g.id) else { return shifts };
-        let range = self.subtree(i);
-        let moved: f32 = range.clone().map(|j| heights.get(j).copied().unwrap_or(0.0)).sum();
-        let (to, by) = g.to.unwrap_or((range.end, 0));
-        for (j, shift) in shifts.iter_mut().enumerate() {
-            if range.contains(&j) {
-                *shift = [f32::from(by) * INDENT, g.dy];
-            } else if j >= range.end && j < to {
-                shift[1] = -moved;
-            } else if j >= to && j < range.start {
-                shift[1] = moved;
-            }
-        }
-        shifts
-    }
-
-    /// Drops a dragged block where its drag points; whether it moved.
-    fn drop(&mut self, g: BlockDrag) -> bool {
-        let (Some(i), Some((to, by))) = (self.index(g.id), g.to) else { return false };
-        let range = self.subtree(i);
-        let moves = to < range.start || to > range.end;
-        if !moves && by == 0 {
-            return false;
-        }
-        let first = self.list[range.start].id;
-        let last = self.list[range.end - 1].id;
-        self.move_range(range, to, by);
-        self.select(first, last);
-        true
     }
 }

@@ -105,6 +105,7 @@ impl Blocks {
         }
         let next = match &b.kind {
             Kind::Todo { .. } => Kind::Todo { checked: false },
+            Kind::Toggle { .. } => Kind::Toggle { open: false },
             kind if kind.is_list() => kind.clone(),
             _ => Kind::Paragraph,
         };
@@ -117,11 +118,63 @@ impl Blocks {
             return;
         }
         let ((text, marks), (tail, tail_marks)) = inline::split(&b.edit, a);
-        let has_children = self.subtree(i).len() > 1;
+        let subtree = self.subtree(i);
         let b = &mut self.list[i];
         b.edit = field(&b.kind, &text, marks);
-        let indent = b.indent + u8::from(has_children);
-        self.insert(i + 1, next, indent.min(MAX_INDENT), &tail, tail_marks);
+        // The text after the caret goes first inside an open toggle, after a closed one's
+        // hidden blocks, and first among a block's children.
+        let (at, indent, next) = match b.kind {
+            Kind::Toggle { open: true } => (i + 1, b.indent + 1, Kind::Paragraph),
+            Kind::Toggle { open: false } => (subtree.end, b.indent, next),
+            _ => (i + 1, b.indent + u8::from(subtree.len() > 1), next),
+        };
+        self.insert(at, next, indent.min(MAX_INDENT), &tail, tail_marks);
+    }
+
+    /// Whether a closed toggle above block `i` hides it.
+    pub(super) fn is_hidden(&self, i: usize) -> bool {
+        let mut indent = self.list[i].indent;
+        for b in self.list[..i].iter().rev() {
+            if indent == 0 {
+                return false;
+            }
+            if b.indent < indent {
+                if matches!(b.kind, Kind::Toggle { open: false }) {
+                    return true;
+                }
+                indent = b.indent;
+            }
+        }
+        false
+    }
+
+    /// Which blocks closed toggles hide.
+    pub(super) fn hidden(&self) -> Vec<bool> {
+        let mut closed: Option<u8> = None;
+        self.list
+            .iter()
+            .map(|b| {
+                if closed.is_some_and(|c| b.indent <= c) {
+                    closed = None;
+                }
+                let hidden = closed.is_some();
+                if !hidden && matches!(b.kind, Kind::Toggle { open: false }) {
+                    closed = Some(b.indent);
+                }
+                hidden
+            })
+            .collect()
+    }
+
+    /// Opens or closes toggle `i`; closing it takes the caret out of the blocks it hides.
+    pub(super) fn toggle_open(&mut self, i: usize) -> bool {
+        let Kind::Toggle { open } = &mut self.list[i].kind else { return false };
+        *open = !*open;
+        if !*open && self.focused().is_some_and(|f| self.subtree(i).contains(&f) && f != i) {
+            let end = self.list[i].edit.text.len();
+            self.focus(i, end);
+        }
+        true
     }
 
     /// Backspace at the start of block `i`: a list item, heading or quote becomes a
@@ -139,14 +192,16 @@ impl Blocks {
         }
     }
 
-    /// Merges block `i` into the block above (a divider above goes instead).
+    /// Merges block `i` into the block shown above it (a divider above goes instead); the
+    /// blocks nested under it stay nested under that one.
     fn merge_up(&mut self, i: usize) -> bool {
-        let Some(p) = i.checked_sub(1) else { return false };
+        let Some(p) = (0..i).rev().find(|&j| !self.is_hidden(j)) else { return false };
         if self.list[p].kind == Kind::Divider {
             self.list.remove(p);
             return true;
         }
         let gone = self.list.remove(i);
+        self.tidy_indents(i);
         let prev = &mut self.list[p];
         let caret = prev.edit.text.len();
         let (text, marks) = inline::join(&prev.edit, &gone.edit);
@@ -155,16 +210,15 @@ impl Blocks {
         true
     }
 
-    /// Delete at the end of block `i`: the block below merges into it (a divider goes).
+    /// Delete at the end of block `i`: the block shown below merges into it (a divider goes).
     pub(super) fn delete_at_end(&mut self, i: usize) -> bool {
-        if i + 1 >= self.list.len() {
-            return false;
-        }
-        if self.list[i + 1].kind == Kind::Divider {
-            self.list.remove(i + 1);
+        let Some(next) = (i + 1..self.list.len()).find(|&j| !self.is_hidden(j)) else { return false };
+        if self.list[next].kind == Kind::Divider {
+            self.list.remove(next);
+            self.tidy_indents(next);
         } else {
             let caret = self.list[i].edit.text.len();
-            self.merge_up(i + 1);
+            self.merge_up(next);
             self.focus(i, caret);
         }
         true
@@ -201,10 +255,13 @@ impl Blocks {
         let first = (i16::from(from) + i16::from(indent)).clamp(0, i16::from(limit));
         let by = first - i16::from(from);
         let n = taken.len();
-        self.list.splice(to..to, taken.into_iter().map(|mut b| {
-            b.indent = (i16::from(b.indent) + by).clamp(0, i16::from(MAX_INDENT)) as u8;
-            b
-        }));
+        self.list.splice(
+            to..to,
+            taken.into_iter().map(|mut b| {
+                b.indent = (i16::from(b.indent) + by).clamp(0, i16::from(MAX_INDENT)) as u8;
+                b
+            }),
+        );
         self.tidy_indents(to + n);
     }
 
@@ -267,7 +324,11 @@ impl Blocks {
         self.ensure_text_block();
         self.tidy_indents(start);
         let at = start.saturating_sub(1).min(self.list.len() - 1);
-        let at = (0..=at).rev().find(|&j| self.list[j].kind.has_text()).or_else(|| self.list.iter().position(|b| b.kind.has_text())).unwrap_or(0);
+        let at = (0..=at)
+            .rev()
+            .find(|&j| self.list[j].kind.has_text())
+            .or_else(|| self.list.iter().position(|b| b.kind.has_text()))
+            .unwrap_or(0);
         let end = self.list[at].edit.text.len();
         self.focus(at, end);
     }

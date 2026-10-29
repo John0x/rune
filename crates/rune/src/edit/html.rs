@@ -960,6 +960,8 @@ fn serialize_marks(edit: &TextEdit, range: Range<usize>, out: &mut String) {
             Mark::Strike => 4,
             Mark::Code => 5,
             Mark::Pill(_) => 6,
+            Mark::Color(_) => 7,
+            Mark::Highlight(_) => 8,
         });
         for m in &active {
             match m {
@@ -973,7 +975,7 @@ fn serialize_marks(edit: &TextEdit, range: Range<usize>, out: &mut String) {
                     escape_html(url, out);
                     out.push_str("\">");
                 }
-                Mark::Pill(_) => {}
+                Mark::Pill(_) | Mark::Color(_) | Mark::Highlight(_) => {}
             }
         }
         escape_html(&edit.text[a..b], out);
@@ -985,7 +987,7 @@ fn serialize_marks(edit: &TextEdit, range: Range<usize>, out: &mut String) {
                 Mark::Strike => out.push_str("</s>"),
                 Mark::Code => out.push_str("</code>"),
                 Mark::Link(_) => out.push_str("</a>"),
-                Mark::Pill(_) => {}
+                Mark::Pill(_) | Mark::Color(_) | Mark::Highlight(_) => {}
             }
         }
     }
