@@ -147,6 +147,7 @@ pub struct SplitView {
     motion: PaneMotion,
     peek: Option<SidebarPeek>,
     reduced: bool,
+    footer: Option<El>,
 }
 
 impl SplitView {
@@ -167,7 +168,14 @@ impl SplitView {
             motion: PaneMotion::new(),
             peek: None,
             reduced: false,
+            footer: None,
         }
+    }
+    /// A bar under the main card (a status bar) on the window's background: it spans the
+    /// card's width and takes the place of its bottom inset.
+    pub fn footer(mut self, footer: El) -> Self {
+        self.footer = Some(footer);
+        self
     }
     /// The leading pane. `access` finds its state in the app's; the grip and the toggle button
     /// write to it. `content` is usually a built `Sidebar`.
@@ -363,7 +371,7 @@ impl SplitView {
             .min_h(0.0)
             .ml(if sidebar_open { 0.0 } else { self.frame })
             .mr(if inspector_open { 0.0 } else { self.frame })
-            .mb(self.frame)
+            .mb(if self.footer.is_some() { 0.0 } else { self.frame })
             .fill(c.bg_base)
             .radius(k.radius.lg)
             .border(1.0, c.border_muted)
@@ -371,6 +379,14 @@ impl SplitView {
             .motion(spring)
             .children(toolbar)
             .child(self.main.grow(1.0).min_h(0.0));
+        let card = match self.footer.take() {
+            Some(footer) => {
+                let (left, right) = (if sidebar_open { 0.0 } else { self.frame }, if inspector_open { 0.0 } else { self.frame });
+                let footer = footer.ml(left).mr(right).motion(spring);
+                col().key("main-pane-column").grow(1.0).min_w(0.0).min_h(0.0).motion(spring).child(card).child(footer)
+            }
+            None => card,
+        };
         let mut below = row().key("main-row").w_full().grow(1.0).min_h(0.0).motion(spring).child(card);
         if let Some(mut p) = self.inspector {
             if let Some(c) = p.clear.take() {
