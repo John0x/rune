@@ -4,6 +4,7 @@ use rune::{Icon, Spring};
 
 use super::*;
 use crate::PaletteSeed;
+use crate::palette::tint;
 
 /// How markdown looks. [`MarkdownStyle::from_kit`] takes every colour and font from the kit's
 /// tokens, [`MarkdownStyle::neutral`] and [`MarkdownStyle::from_seed`] need no kit; each builder
@@ -113,13 +114,8 @@ pub(crate) struct DiagramPaint {
     pub note_border: Color,
     pub font: TextStyle,
     pub max_width: f32,
-}
-
-/// `t` of the way from `base` toward `hue` in Oklab, at `base`'s alpha: a quiet wash that keeps
-/// `base`'s lightness close in both themes.
-pub(super) fn tint(base: Color, hue: Color, t: f32) -> Color {
-    let [a, b] = [base.to_oklab(), hue.to_oklab()];
-    Color::from_oklab([0, 1, 2, 3].map(|i| if i == 3 { a[3] } else { a[i] + (b[i] - a[i]) * t }))
+    pub hover: Color,
+    pub hover_neighbours: bool,
 }
 
 impl MarkdownStyle {
@@ -192,16 +188,18 @@ impl MarkdownStyle {
             diagram: DiagramPaint {
                 text: c.text_base,
                 muted: c.text_muted,
-                surface: c.layer_01,
+                surface: c.bg_base,
                 surface_border: c.border_muted,
-                node_fill: c.bg_base,
-                node_border: k.alpha(c.text_base, 0.32),
-                line: k.alpha(c.text_base, 0.55),
-                cluster_fill: k.alpha(c.text_base, 0.04),
+                node_fill: c.layer_01,
+                node_border: k.alpha(c.text_base, 0.2),
+                line: k.alpha(c.text_base, 0.42),
+                cluster_fill: k.alpha(c.text_base, if k.dark { 0.04 } else { 0.025 }),
                 note_fill: c.warning.bg,
                 note_border: c.warning.border,
                 font: TextStyle { size: 13.0, line_height: 18.0, ..k.ty.body },
                 max_width: 680.0,
+                hover: k.alpha(c.text_base, 0.9),
+                hover_neighbours: false,
             },
         }
     }
@@ -351,7 +349,9 @@ impl MarkdownStyle {
         self.diagram.line = line;
         self
     }
-    /// The card a diagram sits on, and the tint behind flowchart subgraphs.
+    /// The card a diagram sits on, and the tint behind flowchart subgraphs. Keep `fill` opaque:
+    /// translucent lines and outlines are flattened over it so they don't brighten where they
+    /// overlap. For no card, pass the colour behind the diagram with a clear `border`.
     pub fn diagram_surface(mut self, fill: Color, border: Color, subgraph: Color) -> Self {
         self.diagram.surface = fill;
         self.diagram.surface_border = border;
@@ -369,10 +369,20 @@ impl MarkdownStyle {
         self.diagram.font = f;
         self
     }
-    /// The widest a diagram draws, in points (680 by default). A wider left-to-right flowchart
-    /// is laid out top-down instead; anything still wider is drawn smaller, down to 60%.
+    /// The widest a diagram draws, in points (680 by default). A left-to-right flowchart that
+    /// would have to shrink below 78% to fit is laid out top-down instead, when that comes out
+    /// narrower; anything still wider is drawn smaller, down to 60%.
     pub fn diagram_max_width(mut self, points: f32) -> Self {
         self.diagram.max_width = points.max(120.0);
+        self
+    }
+    /// What lights up while the pointer is over a flowchart or state diagram node: its edges and
+    /// their labels in `color` (the text colour by default; transparent turns it off), and with
+    /// `neighbours` its outline and the outlines of the nodes they reach. Pointing at an edge or
+    /// its label lights that edge and its label.
+    pub fn diagram_hover(mut self, color: Color, neighbours: bool) -> Self {
+        self.diagram.hover = color;
+        self.diagram.hover_neighbours = neighbours;
         self
     }
     /// Background fill of standard [`Markdown::highlights`] matches.

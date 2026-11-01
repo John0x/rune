@@ -10,6 +10,8 @@ use crate::trace::{Intent, MotionTrace, flags};
 use crate::transition::{Effect, Reveal, Transition};
 use crate::value::{Animatable, Color, Corners, MAX_LANES, Rect, Sides, Transform, Vec2, lanes};
 
+mod presence;
+mod props;
 mod trailing;
 mod travel;
 
@@ -193,6 +195,8 @@ pub struct Presented {
     /// motion-lint flags (animated, ancestorAnimated, clipped, filtered) and intent bits
     /// (own `<< 8`, ancestor `<< 16`).
     pub flags: u32,
+    /// How much of this node's own shape is drawn, 0 to 1 ([`crate::Transition::draw`]).
+    pub draw: f32,
 }
 
 impl Presented {
@@ -217,15 +221,18 @@ pub struct FrameOutput<'a> {
 struct Path {
     start: Rect,
     end_local: Rect,
+    /// Its parent's root-space target origin as the last frame drew it.
+    origin: Vec2,
 }
 
-// Effect state lanes: opacity, scale, offset x/y, size-fraction offset x/y, blur, hidden reveal.
-type Fx = [f32; 8];
-const FX_ID: Fx = [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+// Effect state lanes: opacity, scale, offset x/y, size-fraction offset x/y, blur, hidden reveal,
+// drawn shape.
+type Fx = [f32; 9];
+const FX_ID: Fx = [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 
 fn fx_of(e: &Effect) -> Fx {
     let hidden = if e.reveal.is_some() { 1.0 } else { 0.0 };
-    [e.opacity, e.scale, e.offset.x, e.offset.y, e.offset_fraction.x, e.offset_fraction.y, e.blur, hidden]
+    [e.opacity, e.scale, e.offset.x, e.offset.y, e.offset_fraction.x, e.offset_fraction.y, e.blur, hidden, e.draw]
 }
 
 #[derive(Clone)]
@@ -261,6 +268,19 @@ struct Node {
     last: Option<Presented>,
 }
 
+/// Where a node comes to rest (see [`Scene::rest`]), beside `Scene::nodes` so the nodes the
+/// renderer reads every frame stay the same size.
+#[derive(Clone, Copy)]
+struct Rest {
+    /// Root-space presented rect with every track at its target, and the origin children rest on.
+    rect: Rect,
+    origin: Vec2,
+    /// `rect` differs from where the node is this frame.
+    moving: bool,
+}
+
+const REST_ZERO: Rest = Rest { rect: Rect::ZERO, origin: Vec2::ZERO, moving: false };
+
 /// A small dual number: value and time derivative, for exact velocity of composed geometry.
 #[derive(Clone, Copy, Default)]
 struct D {
@@ -286,6 +306,7 @@ impl D {
 pub struct Scene {
     store: AnimationStore,
     nodes: Vec<Node>,
+    rests: Vec<Rest>,
     free: Vec<u32>,
     index: FxMap<u64, u32>,
     root_head: u32,
@@ -316,6 +337,7 @@ impl Scene {
         Scene {
             store: AnimationStore::new(),
             nodes: Vec::new(),
+            rests: Vec::new(),
             free: Vec::new(),
             index: FxMap::default(),
             root_head: NONE,
@@ -419,6 +441,14 @@ impl Scene {
     pub fn presented(&self, id: NodeId) -> Option<Presented> {
         self.slot(id).and_then(|i| self.nodes[i].last)
     }
+    /// The rect the node comes to rest at once every track (its own and its ancestors') reaches
+    /// its target, snapped like [`Presented::rect`], while that differs from where it is: the
+    /// difference from [`presented`](Self::presented) is the motion still in flight. Only a
+    /// node whose [`Presented::flags`] has `ANIMATED` or `ANCESTOR_ANIMATED` can be moving.
+    pub fn rest(&self, id: NodeId) -> Option<Rect> {
+        let r = &self.rests[self.slot(id)?];
+        r.moving.then(|| snap_rect(r.rect, self.store.pixel_scale()))
+    }
     /// Root-space layout rect this frame (without this node's own offset or presence offset),
     /// snapped to the same 1/64 device-px grid as [`Presented::rect`].
     pub fn world(&self, id: NodeId) -> Option<Rect> {
@@ -435,218 +465,6 @@ impl Scene {
         self.index.get(&id.0).map(|&i| i as usize)
     }
 
-    // ------------------------------------------------------------------------------------------
-    // Structure and presence
-
-    /// A keyed node appears. On `Mount::Animated` it enters with its transition's insertion
-    /// effect; on `Mount::Initial` (or under an entering parent, which it rides) it just appears.
-    /// If the key is still exiting, `Mount::Animated` revives it from exactly where it is and
-    /// `Mount::Initial` lands it present, at rest on `spec.frame`.
-    pub fn insert(&mut self, id: NodeId, spec: NodeSpec, mount: Mount) {
-        if let Some(i) = self.slot(id) {
-            self.nodes[i].transition = spec.transition;
-            let exiting = matches!(self.nodes[i].phase, Phase::Exiting { .. });
-            if exiting && mount == Mount::Initial {
-                self.present_now(i);
-                // Also lands motion toward an unchanged frame and ends screen travel.
-                self.set_frame(id, spec.frame, LayoutAnim::INSTANT);
-                return;
-            }
-            if exiting {
-                self.revive(i);
-            }
-            if self.nodes[i].frame != spec.frame && self.nodes[i].path.is_none() {
-                self.set_frame(id, spec.frame, LayoutAnim::new(crate::tokens::REFLOW));
-            }
-            return;
-        }
-        let parent = match spec.parent {
-            Some(p) => self.slot(p).unwrap_or_else(|| panic!("insert {id:?}: parent {p:?} isn't in the scene")) as u32,
-            None => NONE,
-        };
-        // A parent's presence tail runs on for ~0.7 s after it has visibly arrived; a child
-        // mounted in that tail enters on its own instead of popping in on the finished entrance.
-        let rides_parent = parent != NONE && match self.nodes[parent as usize].phase {
-            Phase::Present => false,
-            Phase::Entering => self.presence_now(parent as usize) < 1.0 - 1.0 / 255.0,
-            Phase::Exiting { .. } => true,
-        };
-        let animate = mount == Mount::Animated && !rides_parent;
-        let ins = spec.transition.insertion.kit_rules(false);
-        let node = Node {
-            id,
-            parent,
-            first_child: NONE,
-            last_child: NONE,
-            next_sibling: NONE,
-            prev_sibling: NONE,
-            alive: true,
-            frame: spec.frame,
-            opacity: spec.opacity,
-            radius: spec.radius,
-            fill: spec.fill,
-            transition: spec.transition,
-            phase: if animate { Phase::Entering } else { Phase::Present },
-            generation: 0,
-            fx_a: fx_of(&ins),
-            fx_b: FX_ID,
-            anchor: ins.anchor,
-            reveal: ins.reveal,
-            path: None,
-            ride_trailing: false,
-            tracks: [None; B],
-            dirty: true,
-            world: Rect::ZERO,
-            origin: Vec2::ZERO,
-            last: None,
-        };
-        let i = match self.free.pop() {
-            Some(i) => {
-                self.nodes[i as usize] = node;
-                i
-            }
-            None => {
-                self.nodes.push(node);
-                (self.nodes.len() - 1) as u32
-            }
-        };
-        // Link as the last child (siblings keep insertion order).
-        let tail = if parent == NONE { self.root_tail } else { self.nodes[parent as usize].last_child };
-        self.nodes[i as usize].prev_sibling = tail;
-        if tail == NONE {
-            if parent == NONE { self.root_head = i; } else { self.nodes[parent as usize].first_child = i; }
-        } else {
-            self.nodes[tail as usize].next_sibling = i;
-        }
-        if parent == NONE { self.root_tail = i; } else { self.nodes[parent as usize].last_child = i; }
-        self.index.insert(id.0, i);
-        self.order_dirty = true;
-        let enter = spec.transition.springs.enter;
-        if animate {
-            self.track_set(i as usize, prop::PRESENCE, 0.0);
-            self.track_animate(i as usize, prop::PRESENCE, 1.0, Anim::from(enter));
-            self.intent(id, Intent::TRANSITION | Intent::OPACITY, enter.duration);
-        } else {
-            self.track_set(i as usize, prop::PRESENCE, 1.0);
-        }
-    }
-
-    /// A present node's transition from its latest render: the removal effect and exit spring it
-    /// leaves with, and how it enters if it revives. An entrance already running keeps its look;
-    /// an exiting node keeps the transition it is leaving with.
-    pub fn set_transition(&mut self, id: NodeId, transition: Transition) {
-        if let Some(i) = self.slot(id)
-            && !matches!(self.nodes[i].phase, Phase::Exiting { .. })
-        {
-            self.nodes[i].transition = transition;
-        }
-    }
-
-    /// The app removed a keyed node. It stays drawn, plays its removal effect on the exit spring,
-    /// and is reported in `exited` only once its presence has settled at 0 (opacity 0).
-    pub fn remove(&mut self, id: NodeId) {
-        let Some(i) = self.slot(id) else { return };
-        if matches!(self.nodes[i].phase, Phase::Exiting { .. }) {
-            return;
-        }
-        let p = self.presence_now(i);
-        let rem = self.nodes[i].transition.removal.kit_rules(true);
-        let target = fx_of(&rem);
-        let n = &mut self.nodes[i];
-        n.generation += 1;
-        n.phase = Phase::Exiting { generation: n.generation };
-        if p >= 0.999 {
-            n.fx_a = target;
-            n.fx_b = FX_ID;
-        } else {
-            // Mid-entrance: keep the current look at p, land exactly on the removal effect at 0.
-            let cur = lerp_fx(&n.fx_a, &n.fx_b, p);
-            n.fx_a = target;
-            for k in 0..8 {
-                n.fx_b[k] = target[k] + (cur[k] - target[k]) / p.max(1e-3);
-            }
-        }
-        if rem.scale != 1.0 {
-            n.anchor = rem.anchor;
-        }
-        if rem.reveal.is_some() {
-            n.reveal = rem.reveal;
-        }
-        n.dirty = true;
-        let exit = n.transition.springs.exit;
-        self.track_animate(i, prop::PRESENCE, 0.0, Anim::from(exit));
-        self.intent(id, Intent::TRANSITION | Intent::OPACITY, exit.duration);
-    }
-
-    /// The app removed a keyed node with no exit: it and its subtree unmount now and are reported
-    /// in the next frame's `exited`.
-    pub fn unmount(&mut self, id: NodeId) {
-        if let Some(i) = self.slot(id) {
-            self.remove_now(i);
-        }
-    }
-
-    /// An entering node is present at once, its entrance landed: one nobody saw run.
-    pub fn enter_now(&mut self, id: NodeId) {
-        if let Some(i) = self.slot(id)
-            && self.nodes[i].phase == Phase::Entering
-        {
-            self.present_now(i);
-        }
-    }
-
-    /// A present node enters again from nothing, as if just mounted: one nobody saw that a
-    /// change brings into view.
-    pub fn reenter(&mut self, id: NodeId) {
-        if let Some(i) = self.slot(id)
-            && self.nodes[i].phase == Phase::Present
-        {
-            self.track_set(i, prop::PRESENCE, 0.0);
-            self.revive(i);
-        }
-    }
-
-    fn revive(&mut self, i: usize) {
-        let p = self.presence_now(i);
-        let n = &mut self.nodes[i];
-        n.generation += 1;
-        n.phase = Phase::Entering;
-        if p <= 0.001 {
-            let ins = n.transition.insertion.kit_rules(false);
-            n.fx_a = fx_of(&ins);
-        } else {
-            // Keep the current look at p, land exactly on identity at 1.
-            let cur = lerp_fx(&n.fx_a, &n.fx_b, p);
-            let q = (1.0 - p).max(1e-3);
-            for k in 0..8 {
-                n.fx_a[k] = (cur[k] - FX_ID[k] * p) / q;
-            }
-        }
-        n.fx_b = FX_ID;
-        n.dirty = true;
-        let enter = n.transition.springs.enter;
-        let id = n.id;
-        self.track_animate(i, prop::PRESENCE, 1.0, Anim::from(enter));
-        self.intent(id, Intent::TRANSITION | Intent::OPACITY, enter.duration);
-    }
-
-    /// An exiting node is present again at once: no presence effect, nothing left to settle.
-    fn present_now(&mut self, i: usize) {
-        let n = &mut self.nodes[i];
-        n.generation += 1;
-        n.phase = Phase::Present;
-        let ins = n.transition.insertion.kit_rules(false);
-        n.fx_a = fx_of(&ins);
-        n.fx_b = FX_ID;
-        n.anchor = ins.anchor;
-        n.reveal = ins.reveal;
-        self.track_set(i, prop::PRESENCE, 1.0);
-    }
-
-    fn presence_now(&self, i: usize) -> f32 {
-        self.nodes[i].tracks[prop::PRESENCE.id.0 as usize].and_then(|t| self.sample(t)).map_or(1.0, |(x, _)| x[0])
-    }
-
     /// Lane values and velocities of track `t`, sampled exactly at `now()`.
     fn sample(&self, t: TrackId) -> Option<([f32; MAX_LANES], [f32; MAX_LANES])> {
         let mut x = [0.0; MAX_LANES];
@@ -661,9 +479,17 @@ impl Scene {
     /// edge gets no motion at all. With `Travel::Screen` the node takes one straight root-space
     /// path instead, whatever its ancestors do.
     pub fn set_frame(&mut self, id: NodeId, frame: Rect, anim: impl Into<LayoutAnim>) {
+        self.set_frame_drawn(id, frame, anim.into(), [Vec2::ZERO; 2]);
+    }
+
+    /// [`set_frame`](Self::set_frame) for a node drawn `drawn[0]` away from its scene rect,
+    /// moving `drawn[1]` faster: a screen path starts there, at that speed.
+    pub(super) fn set_frame_drawn(&mut self, id: NodeId, frame: Rect, anim: LayoutAnim, drawn: [Vec2; 2]) {
         let Some(i) = self.slot(id) else { return };
-        let anim = anim.into();
         let old = self.nodes[i].frame;
+        if old == frame && self.nodes[i].path.is_none() && self.nodes[i].tracks[prop::FRAME.id.0 as usize].is_none() {
+            return;
+        }
         if frame.w != old.w {
             self.rebase_trailing(i, frame.w - old.w);
         }
@@ -689,7 +515,20 @@ impl Scene {
         };
         self.intent(id, Intent::POSITION | Intent::SIZE, ms);
         if anim.travel == Travel::Screen && !self.store.reduced_motion() {
-            let (start, vel) = self.exact_world(i);
+            // A path restarts from where it was drawn: under the origin the last frame drew it
+            // against, which an ancestor laid out elsewhere in this commit has already moved.
+            let (mut start, mut vel) = match self.nodes[i].path {
+                Some(path) => {
+                    let e = self.path_dual(i, path, path.origin);
+                    (e.map(|d| d.x), e.map(|d| d.v))
+                }
+                None => self.exact_world(i),
+            };
+            for k in 0..4 {
+                let [offset, speed] = drawn.map(|v| if k % 2 == 0 { v.x } else { v.y });
+                start[k] += offset;
+                vel[k] += speed;
+            }
             self.nodes[i].frame = frame;
             self.start_path(i, start, vel, anim);
             return;
@@ -796,23 +635,18 @@ impl Scene {
     fn world_dual(&self, i: usize) -> [D; 4] {
         let n = &self.nodes[i];
         if let Some(path) = n.path {
-            let mut p = [D::c(1.0); 2];
-            self.lanes_dual(i, prop::TRAVEL.id, &mut p);
-            let s = path.start.edges();
-            let end = path.end_local.translated(self.parent_target_origin(i)).edges();
-            return core::array::from_fn(|k| {
-                let a = D::c(s[k]);
-                a.add(D::c(end[k] - s[k]).mul(p[k % 2]))
-            });
+            return self.path_dual(i, path, self.parent_target_origin(i));
         }
-        let mut local = n.frame.edges().map(D::c);
-        self.lanes_dual(i, prop::FRAME.id, &mut local);
-        if n.parent == NONE {
-            return local;
-        }
-        let mut o = self.origin_dual(n.parent as usize);
-        o[0] = o[0].add(self.trail_dual(i));
-        core::array::from_fn(|k| local[k].add(o[k % 2]))
+        self.laid_dual(i)
+    }
+
+    /// Where node `i` is on its screen path, ending at its layout under parent origin `origin`.
+    fn path_dual(&self, i: usize, path: Path, origin: Vec2) -> [D; 4] {
+        let mut p = [D::c(1.0); 2];
+        self.lanes_dual(i, prop::TRAVEL.id, &mut p);
+        let s = path.start.edges();
+        let end = path.end_local.translated(origin).edges();
+        core::array::from_fn(|k| D::c(s[k]).add(D::c(end[k] - s[k]).mul(p[k % 2])))
     }
 
     /// The origin children of `i` ride: layout origin plus offsets (own and presence).
@@ -833,90 +667,6 @@ impl Scene {
             }
             o
         })
-    }
-
-    // ------------------------------------------------------------------------------------------
-    // Node properties
-
-    /// Animates one of the node's properties (`prop::OPACITY`, `prop::RADIUS`, …, or a custom one).
-    /// The first animation starts from the node's base value, so `.opacity(1)` → `animate(0)`
-    /// fades.
-    pub fn animate<T: Animatable>(&mut self, id: NodeId, prop: Prop<T>, target: T, anim: impl Into<Anim>) {
-        let Some(i) = self.slot(id) else { return };
-        let anim = anim.into();
-        self.ensure_prop(i, prop);
-        self.track_animate(i, prop, target, anim);
-        let bits = Intent::for_prop(prop.id);
-        self.intent(id, bits, anim.curve.logical_duration());
-    }
-
-    /// Sets a property immediately (direct manipulation).
-    pub fn set<T: Animatable>(&mut self, id: NodeId, prop: Prop<T>, value: T) {
-        if self.in_flight_to(id, prop, value) {
-            return;
-        }
-        if let Some(i) = self.slot(id) {
-            self.track_set(i, prop, value);
-        }
-    }
-
-    /// The property's presented value (last frame), falling back to the node's base value.
-    pub fn get<T: Animatable>(&self, id: NodeId, prop: Prop<T>) -> Option<T> {
-        let i = self.slot(id)?;
-        self.store.get(id, prop).or_else(|| self.base::<T>(i, prop.id))
-    }
-
-    fn ensure_prop<T: Animatable>(&mut self, i: usize, p: Prop<T>) {
-        if self.nodes[i].tracks.get(p.id.0 as usize).copied().flatten().is_none()
-            && !self.store.has(self.nodes[i].id, p)
-            && let Some(base) = self.base::<T>(i, p.id)
-        {
-            self.track_set(i, p, base);
-        }
-    }
-
-    fn base<T: Animatable>(&self, i: usize, p: PropId) -> Option<T> {
-        let n = &self.nodes[i];
-        let mut l = [0.0; MAX_LANES];
-        match p {
-            x if x == prop::OPACITY.id => l[0] = n.opacity,
-            x if x == prop::SCALE.id => l[0] = 1.0,
-            x if x == prop::FRAME.id => l[..4].copy_from_slice(&n.frame.edges()),
-            x if x == prop::RADIUS.id => l[..4].copy_from_slice(&n.radius.0),
-            x if x == prop::FILL.id => l = lanes(&n.fill),
-            x if x == prop::OFFSET.id || x == prop::ROTATION.id || x == prop::BLUR.id || x == prop::MASK.id => {}
-            _ => return None,
-        }
-        Some(T::read_lanes(&l[..T::LANES]))
-    }
-
-    fn current<T: Animatable>(&self, i: usize, p: Prop<T>) -> Option<T> {
-        let t = self.nodes[i].tracks.get(p.id.0 as usize).copied().flatten()?;
-        self.sample(t).map(|(x, _)| T::read_lanes(&x[..T::LANES]))
-    }
-
-    fn track_set<T: Animatable>(&mut self, i: usize, p: Prop<T>, value: T) {
-        let id = self.store.set(self.nodes[i].id, p, value);
-        self.record_track(i, p.id, id);
-    }
-
-    fn track_animate<T: Animatable>(&mut self, i: usize, p: Prop<T>, target: T, anim: Anim) {
-        let id = self.store.animate(self.nodes[i].id, p, target, anim);
-        self.record_track(i, p.id, id);
-    }
-
-    /// Remembers built-in props' tracks on the node (custom props live only in the store).
-    fn record_track(&mut self, i: usize, p: PropId, id: TrackId) {
-        if let Some(slot) = self.nodes[i].tracks.get_mut(p.0 as usize) {
-            *slot = Some(id);
-        }
-        self.nodes[i].dirty = true;
-    }
-
-    fn intent(&mut self, id: NodeId, bits: u32, seconds: f32) {
-        if self.trace.is_some() {
-            self.intents.push((id, bits, seconds));
-        }
     }
 
     // ------------------------------------------------------------------------------------------
@@ -993,6 +743,10 @@ impl Scene {
                 self.end_path(i);
                 self.track_set(i, prop::FRAME, end_local);
                 continue;
+            }
+            let po = self.parent_target_origin(i);
+            if let Some(path) = &mut self.nodes[i].path {
+                path.origin = po;
             }
             k += 1;
         }
@@ -1079,6 +833,38 @@ impl Scene {
         self.nodes[i].tracks[p.0 as usize].and_then(|t| self.store.values_of(t))
     }
 
+    fn targets<const N: usize>(&self, i: usize, p: PropId) -> Option<[f32; N]> {
+        let mut out = [0.0; N];
+        let t = self.nodes[i].tracks[p.0 as usize]?;
+        self.store.targets_of(t, &mut out).then_some(out)
+    }
+
+    /// Where `compute` would put node `i` with every track at its target. It repeats the same
+    /// arithmetic so that, at rest, the two rects are bit-identical.
+    fn rest_of(&self, i: usize, reduced: bool) -> Rect {
+        let n = &self.nodes[i];
+        let parent = n.parent;
+        let world = match n.path {
+            Some(path) => {
+                let p = self.targets::<2>(i, prop::TRAVEL.id).unwrap_or([1.0, 1.0]);
+                let s = path.start.edges();
+                let e = path.end_local.translated(self.parent_target_origin(i)).edges();
+                let ed: [f32; 4] = core::array::from_fn(|k| s[k] + (e[k] - s[k]) * p[k % 2]);
+                Rect::from_edges(ed[0], ed[1], ed[2], ed[3])
+            }
+            None => {
+                let origin = if parent == NONE { Vec2::ZERO } else { self.rests[parent as usize].origin };
+                let local = self.targets::<4>(i, prop::FRAME.id).map_or(n.frame, |v| Rect::read_lanes(&v));
+                local.translated(origin)
+            }
+        };
+        let p = self.targets::<1>(i, prop::PRESENCE.id).map_or(1.0, |v| v[0]);
+        let s = lerp_fx(&n.fx_a, &n.fx_b, p);
+        let s = if reduced { [s[0], 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] } else { s };
+        let own = self.targets::<2>(i, prop::OFFSET.id).map_or(Vec2::ZERO, |v| Vec2::read_lanes(&v));
+        world.translated(Vec2::new(own.x + s[2] + s[4] * world.w, own.y + s[3] + s[5] * world.h))
+    }
+
     fn compute(&mut self, i: usize, scale: f32, reduced: bool, own_dirty: bool, parent_dirty: bool) -> Presented {
         let parent = self.nodes[i].parent;
         let parent_origin = if parent == NONE { Vec2::ZERO } else { self.nodes[parent as usize].origin };
@@ -1103,7 +889,7 @@ impl Scene {
         };
         let p = self.values(i, prop::PRESENCE.id).map_or(1.0, |v| v[0]);
         let s = lerp_fx(&n.fx_a, &n.fx_b, p);
-        let s = if reduced { [s[0], 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] } else { s };
+        let s = if reduced { [s[0], 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] } else { s };
         let own_opacity = self.values(i, prop::OPACITY.id).map_or(n.opacity, |v| v[0]);
         let own_scale = self.values(i, prop::SCALE.id).map_or(1.0, |v| v[0]);
         let own_offset = self.values(i, prop::OFFSET.id).map_or(Vec2::ZERO, Vec2::read_lanes);
@@ -1181,10 +967,19 @@ impl Scene {
             phase: n.phase,
             in_flow,
             flags: fl,
+            draw: s[8].clamp(0.0, 1.0),
         };
+        // Where it is is where it rests while nothing that places it is in flight. A node riding
+        // its parent's trailing edge also moves with the parent's width.
+        let still = !self.nodes[i].ride_trailing
+            && (parent == NONE || self.rests[parent as usize].origin == self.nodes[parent as usize].origin) && [prop::TRAVEL.id, prop::FRAME.id, prop::PRESENCE.id, prop::OFFSET.id]
+            .iter()
+            .all(|p| self.nodes[i].tracks[p.0 as usize].is_none_or(|t| self.store.is_settled(t)));
+        let rest = if still { shown } else { self.rest_of(i, reduced) };
         let n = &mut self.nodes[i];
         n.world = world;
         n.origin = Vec2::new(shown.x, shown.y);
+        self.rests[i] = Rest { rect: rest, origin: Vec2::new(rest.x, rest.y), moving: rest != shown };
         out
     }
 

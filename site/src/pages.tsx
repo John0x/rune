@@ -85,7 +85,7 @@ function CodeRefs({ refs }: { refs: CodeRef[] }) {
   )
 }
 
-function Pager({ prev, next }: { prev?: [string, string]; next?: [string, string] }) {
+export function Pager({ prev, next }: { prev?: [string, string]; next?: [string, string] }) {
   return (
     <nav className="doc-pager" aria-label="Pages">
       {prev ? <a href={withBase(prev[0])}>← {prev[1]}</a> : <span />}
@@ -184,10 +184,14 @@ const buildable: { title: string; text: ReactNode; status: Status; meta: string;
   },
   {
     title: "Web",
-    text: <>The same apps in a browser over WebGPU, starting with live demos on this site. There's no web build yet.</>,
-    status: "planned",
-    meta: "M5",
-    href: "/roadmap#m5",
+    text: (
+      <>
+        The same apps in a browser over WebGPU, in one canvas on the page's main thread. Experimental: Safari keyboard
+        checks, accessibility and a WebGL fallback are still to come.
+      </>
+    ),
+    status: "partly",
+    meta: "examples/web-hello",
   },
   {
     title: "iOS, then Android",
@@ -311,7 +315,7 @@ export function HomeView() {
         <SectionHead id="build" title="What you can build" aside="October 2026">
           <p>
             Native apps first, and anything that needs Rune's pixels without a window, since headless runs use the same
-            code. The web and phones are planned, not built.
+            code. The web build is experimental, and phones are planned.
           </p>
         </SectionHead>
         <ul className="index-list">
@@ -482,7 +486,7 @@ export function HowItWorksView() {
   )
 }
 
-function Sample({ lang = "Rust", children }: { lang?: string; children: string }) {
+export function Sample({ lang = "Rust", children }: { lang?: string; children: string }) {
   return (
     <figure className="code-block">
       <figcaption className="code-head">
@@ -535,7 +539,8 @@ export function LaunchFastView() {
         </p>
         <p>
           Two of them need one line or nothing from the app. The rest is about what the app leaves out of its first
-          frame. The numbers are at the end.
+          frame. The numbers are at the end. Keeping the app fast after launch is on{" "}
+          <a href={withBase("/fast-apps")}>Fast apps</a>.
         </p>
       </PageHead>
 
@@ -552,7 +557,7 @@ export function LaunchFastView() {
 }`}</Sample>
         <div className="prose prose-after">
           <p>
-            On macOS the thread makes the wgpu instance, adapter and device, then builds the uber pipeline, loading the
+            On macOS the thread makes the instance, adapter and device, then builds the uber pipeline, loading the
             precompiled shader described below. The first window or overlay opened at launch takes the result, and
             waits if the thread is still working. Rune's run functions call it too, but only once they start the event
             loop, so calling it yourself in the first line of <code>main</code> gains the time your own setup takes
@@ -560,6 +565,18 @@ export function LaunchFastView() {
           </p>
           <ul>
             <li>Calling it twice does nothing the second time.</li>
+            <li>
+              It starts on the backend a Mac app draws with by default: Rune's own Metal backend, from the{" "}
+              <code>metal-backend</code> feature, which is on by default. An app built with{" "}
+              <code>default-features = false</code> draws with wgpu unless it adds the feature.
+            </li>
+            <li>
+              An app that opts out with <code>App::gpu_backend(GpuBackend::Wgpu)</code> calls{" "}
+              <code>rune::prewarm_gpu_on(GpuBackend::Wgpu)</code> instead. It chooses the backend, then starts the
+              thread, so the work doesn't start on the native backend and start over when{" "}
+              <code>App::gpu_backend</code> runs; that call afterwards changes nothing. <code>RUNE_GPU_BACKEND=wgpu</code>{" "}
+              or <code>=metal</code> overrides both without a rebuild.
+            </li>
             <li>
               If the app opens no window at launch, the result is dropped and nothing stays in memory. A{" "}
               <code>windowless</code> app that opens its window later makes the device then, as it always did.
@@ -581,7 +598,8 @@ export function LaunchFastView() {
             commits the compiled library instead, as <code>crates/rune/src/uber.metallib</code> (about 33 KB), and on
             macOS loads it through wgpu's passthrough shader support. This skips WGSL parsing, validation, translation
             and Metal's compile on every launch. <code>Renderer::new</code> on a cold shader cache goes from 232 ms to
-            85 ms, and from 3.4 ms to 0.6 ms on a warm one.
+            85 ms, and from 3.4 ms to 0.6 ms on a warm one. Rune's own Metal backend loads{" "}
+            <code>uber_native.metallib</code> the same way, the Metal its translation emits, so it skips the same work.
           </p>
         </SectionHead>
         <div className="prose">
@@ -600,7 +618,8 @@ export function LaunchFastView() {
           <h3>Changing the shader</h3>
           <p>
             Edit <code>clip.wgsl</code> or <code>shader.wgsl</code>, then run{" "}
-            <code>cargo test -p rune --lib precompiled_uber_metallib_is_fresh</code> on a Mac. The test compares the
+            <code>cargo test -p rune --lib --features metal-backend precompiled_uber_metallib_is_fresh</code> on a Mac.
+            The test compares the
             library and the shader's fingerprints, and its failure message says what to do:
           </p>
           <ul>
@@ -608,14 +627,15 @@ export function LaunchFastView() {
               <strong>"MSL is byte-identical; no Xcode or metallib regeneration needed"</strong> means only the
               fingerprint changed, for example after a comment edit or a descriptor change that generates the same
               Metal. Paste the three <code>pub(super) const</code> lines it prints into{" "}
-              <code>crates/rune/src/uber_metallib_hash.rs</code>.
+              <code>crates/rune/src/render/uber_metallib_hash.rs</code>.
             </li>
             <li>
               <strong>"generated MSL or Metal compile flags changed"</strong> or{" "}
               <strong>"does not match recorded hash"</strong> means the library is stale. Run{" "}
               <code>scripts/precompile-metal-shaders.sh</code>. It needs Xcode's Metal toolchain (
-              <code>xcrun -sdk macosx metal</code>), dumps the generated MSL, compiles it and rewrites both{" "}
-              <code>uber.metallib</code> and <code>uber_metallib_hash.rs</code>. Commit both files.
+              <code>xcrun -sdk macosx metal</code>), dumps the generated MSL, compiles it and rewrites{" "}
+              <code>uber.metallib</code>, <code>uber_native.metallib</code> and <code>uber_metallib_hash.rs</code>.
+              Commit all three.
             </li>
           </ul>
           <p>
@@ -664,8 +684,9 @@ export function LaunchFastView() {
           <p>
             <code>App::on_ready</code> (and <code>WindowSpec::on_ready</code>) runs on the event thread once per native
             window creation, after the first frame is ready. For a launcher it runs while the window is still hidden,
-            once its cached frame has finished on the GPU, which is the place to register a global shortcut. It isn't
-            called by headless tooling. The callback gets a <code>WindowHandle</code>, not the state, so capture an{" "}
+            once its cached frame has finished on the GPU, which is the place to register a global shortcut. A window
+            that isn't on screen (covered, occluded, hidden or on another Space) doesn't wait to draw: it runs at the
+            first frame skipped for that, or a second after the window opens. It isn't called by headless tooling. The callback gets a <code>WindowHandle</code>, not the state, so capture an{" "}
             <code>AppHandle</code> and hand the work to <code>update</code>, which runs on the UI thread with{" "}
             <code>&amp;mut S</code> and a <code>Tx</code>.
           </p>
@@ -677,6 +698,13 @@ export function LaunchFastView() {
             event loop even while no window shows, so an update may do main-thread native work such as creating a
             status item. For work that doesn't need the main thread, spawn a thread from the update and report back
             with <code>AppHandle::update</code> or <code>AppHandle::wake</code> and <code>AppSpec::poll</code>.
+          </p>
+          <p>
+            A launcher can wait for readiness. With <code>RUNE_READY_DIR</code> set, the process writes{" "}
+            <code>$RUNE_READY_DIR/&lt;bundle id&gt;.&lt;pid&gt;</code> right after its first <code>on_ready</code>{" "}
+            returns: one line of JSON with <code>pid</code>, <code>bundle_id</code>, <code>ready_ms</code> (since the
+            process started) and <code>rune</code> (its version). It removes the file when it exits normally; a
+            process killed outright leaves it, so treat one whose PID isn't running as stale.
           </p>
         </div>
       </section>
@@ -870,7 +898,7 @@ export function LaunchFastView() {
         </div>
       </section>
 
-      <Pager prev={["/how-it-works", "How it works"]} next={["/architecture", "Architecture"]} />
+      <Pager prev={["/how-it-works", "How it works"]} next={["/fast-apps", "Fast apps"]} />
     </>
   )
 }
@@ -996,7 +1024,7 @@ export function ArchitectureView() {
       </section>
       </div>
 
-      <Pager prev={["/launch-fast", "Launch fast"]} next={["/principles", "Principles"]} />
+      <Pager prev={["/fast-apps", "Fast apps"]} next={["/principles", "Principles"]} />
     </>
   )
 }

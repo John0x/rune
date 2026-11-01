@@ -174,7 +174,7 @@ fn debug_check_does_not_blame_live_only_for_layout_feedback_before_a_key() {
     rt.frame(0.5);
     // A layout callback changed view state, then a checked event, then another key
     // forces the queue's mid-frame commit rather than the final commit.
-    rt.nodes[0].on_layout = Some(Rc::new(|s, _| s.cast::<S>().unwrap().count += 1));
+    rt.nodes[0].handlers.on_layout = Some(Rc::new(|s, _, _| s.cast::<S>().unwrap().count += 1));
     rt.queue.push(Action::Layout(rt.nodes[0].path.clone(), [0.0; 4]));
     rt.key_up(KeyEvent { key: Key::Right, mods: Mods::default() });
     rt.key(KeyEvent { key: Key::Left, mods: Mods::default() });
@@ -183,15 +183,15 @@ fn debug_check_does_not_blame_live_only_for_layout_feedback_before_a_key() {
 }
 
 #[test]
-fn retained_exit_pruning_does_not_change_the_view_fingerprint() {
+fn retained_exit_pruning_does_not_change_the_view_print() {
     let mut rt = app(false);
-    let before = rt.view_fingerprint();
+    let before = rt.view_print();
     let id = rt.nodes.last().unwrap().id;
     rt.scene.remove(id);
-    let exiting = rt.view_fingerprint();
-    assert_ne!(before, exiting);
+    let exiting = rt.view_print();
+    assert!(before.first_difference(&exiting).is_some());
     rt.scene.set_time(10.0); rt.scene.frame(); rt.prune_exited();
-    assert_eq!(exiting, rt.view_fingerprint());
+    assert_eq!(exiting.first_difference(&rt.view_print()), None);
 }
 
 #[test]
@@ -247,4 +247,24 @@ fn live_transform_refreshes_hover_paint_without_a_handler() {
     let id = rt.nodes.iter().find(|n| n.key.as_deref() == Some("moving")).unwrap().id;
     rt.frame(1.0 / 120.0);
     assert_eq!(rt.scene.get(id, P_HOVER), Some(1.0));
+}
+
+#[test]
+fn a_commit_records_why_for_the_frame_log() {
+    for (source, want) in [(0, CommitWhy::POLL), (1, CommitWhy::INPUT)] {
+        let mut rt = app(false);
+        rt.check_live_only(false);
+        rt.frame(0.0);
+        rt.commit_why = 0;
+        rt.key_up(KeyEvent { key: Key::Right, mods: Mods::default() });
+        rt.frame(0.0);
+        assert_eq!(rt.commit_why, 0, "a live-only key commits nothing");
+        if source == 0 { rt.poll = Some(|s, _, _| { s.count += 1; true }); }
+        if source == 1 {
+            let (x, y) = rt.find("camera").unwrap();
+            rt.pointer_down(x, y); rt.pointer_up(x, y);
+        }
+        rt.frame(0.0);
+        assert_eq!(rt.commit_why & want, want, "source {source}: {:?}", CommitWhy::names(rt.commit_why));
+    }
 }

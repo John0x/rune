@@ -7,7 +7,9 @@
 //! a knob, ←/→ step it (⇧ for 10×), Tab or [ ] switch groups. Each group has Random, Reset, Undo, Copy (`name = value` lines)
 //! and presets, both declared in code and saved from the panel. Esc closes.
 //!
-//! Values are plain `name -> f32`; the app saves `values` and `saved` with its other state.
+//! Values are plain `name -> f32`; the app saves `values`, `saved` and `kept` with its other
+//! state. [`Knobs::change`] makes an undoable change ([`Knobs::undo`], [`Knobs::redo`]);
+//! [`Knobs::keep`] saves the values Revert goes back to and [`Knobs::differs`] marks.
 //! The panel is a dev tool: without the `panel` feature, `layer` draws nothing, `key` handles
 //! nothing and `get` returns each knob's default, so a shipped build runs on the constants.
 //!
@@ -21,25 +23,30 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rune::{Color, KeyEvent};
+use rune::KeyEvent;
 
 #[cfg(feature = "panel")]
 mod icons;
-#[cfg(feature = "panel")]
-mod view;
-
-#[cfg(feature = "panel")]
-pub use view::{actions, inline, layer};
-#[cfg(feature = "panel")]
-pub use side::side;
-
 #[cfg(feature = "panel")]
 mod rows;
 #[cfg(feature = "panel")]
 mod side;
 #[cfg(feature = "panel")]
 mod side_list;
+mod style;
 mod tree;
+#[cfg(feature = "panel")]
+mod view;
+
+#[cfg(feature = "panel")]
+pub use side::side;
+pub use style::Style;
+#[cfg(feature = "panel")]
+pub use view::actions;
+#[cfg(feature = "panel")]
+pub use view::inline;
+#[cfg(feature = "panel")]
+pub use view::layer;
 
 /// The spring the side panel slides in and out on by default; send ⌘⇧K's commit on
 /// [`Knobs::slide`] (`tx.motion(s.knobs.slide())`), so the page moves over with the panel.
@@ -228,6 +235,10 @@ pub struct Knobs {
     pub values: BTreeMap<String, f32>,
     /// Presets saved from the panel, by group name, in the order they were saved.
     pub saved: BTreeMap<String, Saved>,
+    /// The values as last kept with [`Knobs::keep`]: [`Knobs::revert`] goes back to them and
+    /// [`Knobs::differs`] marks a knob moved off them. Knobs left out were kept at their
+    /// defaults. The app saves it with `values`.
+    pub kept: BTreeMap<String, f32>,
     /// The group the panel shows; the last one used, and the first group until one is picked.
     pub group: Option<String>,
     /// Picking a region with the target button: the panel shows no group meanwhile.
@@ -243,10 +254,14 @@ pub struct Knobs {
     /// [`show`]: Knobs::show
     pub folded: BTreeSet<String>,
     pub unfolded: BTreeSet<String>,
-    /// What has been typed to filter the side panel.
+    /// What has been typed to filter the side panel: the filter field's text, kept in step with
+    /// it on every edit. Set it with [`Knobs::set_query`] so the field follows.
     pub query: String,
-    /// Typing goes into the filter: `/` (or a click on it) starts, Esc or Return stops.
+    /// The filter field is editing: `/` (or a click on it) starts, Esc or Return stops. While
+    /// it does, the field owns the keys it edits with.
     pub filtering: bool,
+    /// The filter field's model: caret, selection, undo. `query` mirrors its text.
+    edit: rune::TextEdit,
     /// The page the side panel's Tabs layout shows, once one is picked.
     pub tab: Option<String>,
     /// The side panel's keyboard row.
@@ -266,6 +281,7 @@ pub struct Knobs {
     /// The preset each group last applied.
     active: BTreeMap<String, String>,
     undo: Vec<BTreeMap<String, f32>>,
+    redo: Vec<BTreeMap<String, f32>>,
     seed: u64,
 }
 
@@ -350,12 +366,55 @@ impl Knobs {
         self.hot = Some(name.to_owned());
         self.hot_opt = option.map(|j| (name.to_owned(), j));
     }
+    /// Sets the filter's text, in the field and in `query`.
+    pub fn set_query(&mut self, q: &str) {
+        self.query = q.to_owned();
+        self.sync_edit();
+    }
+    /// Brings the field's text to `query`, if the app changed `query` itself.
+    pub(crate) fn sync_edit(&mut self) {
+        if self.edit.text != self.query {
+            self.edit.replace_text(self.query.clone());
+        }
+    }
+    /// Starts filtering, as `/` does: the field takes focus with its text selected, so typing
+    /// replaces it.
+    pub fn filter(&mut self, query: &str) {
+        self.set_query(query);
+        self.start_filter();
+    }
+    pub(crate) fn start_filter(&mut self) {
+        self.sync_edit();
+        self.filtering = true;
+        self.edit.focused = true;
+        self.edit.set_selection(0, self.edit.text.len());
+    }
+    /// Stops filtering; focus goes back to the panel.
+    pub(crate) fn stop_filter(&mut self) {
+        self.filtering = false;
+        self.edit.focused = false;
+    }
+    /// The field's model, for [`rune::El::on_edit`].
+    #[cfg(feature = "panel")]
+    pub(crate) fn edit_mut(&mut self) -> &mut rune::TextEdit {
+        &mut self.edit
+    }
+    /// The field's model as the view draws it.
+    #[cfg(feature = "panel")]
+    pub(crate) fn edit(&self) -> &rune::TextEdit {
+        &self.edit
+    }
+    /// The field changed: `query` follows.
+    #[cfg(feature = "panel")]
+    pub(crate) fn edited(&mut self) {
+        self.query = self.edit.text.clone();
+    }
     pub fn close(&mut self) {
         self.open = false;
         self.picking = false;
         self.hover = None;
         self.kbd = false;
-        self.filtering = false;
+        self.stop_filter();
         self.hot = None;
         self.hot_opt = None;
         self.drag = None;
@@ -378,7 +437,11 @@ impl Knobs {
     /// moves one option), Tab, ⇧Tab, `[` and `]` switch groups, Esc closes. True if taken.
     pub fn panel_key(&mut self, groups: &[Group], ev: &KeyEvent) -> bool {
         use rune::Key;
-        if ev.mods.cmd || ev.mods.alt || ev.mods.ctrl {
+        // Focus left the filter field without the panel hearing of it.
+        if self.filtering && !self.edit.focused {
+            self.filtering = false;
+        }
+        if ev.mods.cmd || ev.mods.alt || ev.mods.ctrl || self.filtering {
             return false;
         }
         if ev.key == Key::Escape {
@@ -427,22 +490,76 @@ impl Knobs {
         g.knobs.iter().any(|k| (self.get(k) - k.default).abs() > 1e-4) || self.active.get(g.name).is_some_and(|a| self.drifted(g, a))
     }
 
-    /// Remembers the values for Undo, once per change.
-    fn checkpoint(&mut self) {
+    /// Remembers the values for Undo, once per change: call it before a change the panel makes
+    /// itself (a drag calls it once, as it starts). A new change drops what Redo had.
+    pub fn checkpoint(&mut self) {
         if self.undo.last() != Some(&self.values) {
             self.undo.push(self.values.clone());
             if self.undo.len() > 100 {
                 self.undo.remove(0);
             }
         }
+        self.redo.clear();
     }
-    pub fn undo(&mut self) {
-        if let Some(v) = self.undo.pop() {
-            self.values = v;
+    /// Sets `k` to `v` so Undo can take it back.
+    pub fn change(&mut self, k: &Knob, v: f32) {
+        if (self.get(k) - k.clamp(v)).abs() > 1e-6 {
+            self.checkpoint();
+            self.set(k, v);
         }
+    }
+    /// Takes back the last change. True if there was one.
+    pub fn undo(&mut self) -> bool {
+        let Some(v) = self.undo.pop() else { return false };
+        self.redo.push(std::mem::replace(&mut self.values, v));
+        true
+    }
+    /// Puts back the change Undo took. True if there was one.
+    pub fn redo(&mut self) -> bool {
+        let Some(v) = self.redo.pop() else { return false };
+        self.undo.push(std::mem::replace(&mut self.values, v));
+        true
     }
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
+    }
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// What `k` was when the values were last kept.
+    pub fn kept_value(&self, k: &Knob) -> f32 {
+        k.clamp(self.kept.get(k.name).copied().unwrap_or(k.default))
+    }
+    /// `k` has moved off its kept value.
+    pub fn differs(&self, k: &Knob) -> bool {
+        (self.get(k) - self.kept_value(k)).abs() > 1e-4
+    }
+    /// Keeps every value as it is now, as what Revert goes back to.
+    pub fn keep(&mut self) {
+        self.kept = self.values.clone();
+    }
+    /// Keeps `knobs` as they are now, the rest as they were kept.
+    pub fn keep_some(&mut self, knobs: &[Knob]) {
+        for k in knobs {
+            match self.values.get(k.name) {
+                Some(v) => self.kept.insert(k.name.to_owned(), *v),
+                None => self.kept.remove(k.name),
+            };
+        }
+    }
+    /// Puts `knobs` back to their kept values, undoably.
+    pub fn revert(&mut self, knobs: &[Knob]) {
+        if !knobs.iter().any(|k| self.differs(k)) {
+            return;
+        }
+        self.checkpoint();
+        for k in knobs {
+            match self.kept.get(k.name) {
+                Some(v) => self.values.insert(k.name.to_owned(), *v),
+                None => self.values.remove(k.name),
+            };
+        }
     }
 
     /// Each of `g`'s knobs to a random value in its range.
@@ -611,97 +728,6 @@ pub fn side<S: 'static>(page: rune::El, _: &Knobs, _: &'static [Group], _: Style
 #[cfg(not(feature = "panel"))]
 pub fn actions<S: 'static>(_: Style, _: &[Action<S>]) -> rune::El {
     rune::el().key("knobs-actions")
-}
-
-/// The panel's colours. `dark()` is the knobs library's main look.
-#[derive(Clone, Copy, Debug)]
-pub struct Style {
-    pub bg: Color,
-    /// Wells: the preset tray.
-    pub inset: Color,
-    /// The selected preset chip.
-    pub raised: Color,
-    pub fg: Color,
-    /// Labels and readouts.
-    pub fg2: Color,
-    /// Group tabs at rest, icons, hints.
-    pub fg3: Color,
-    /// A card of rows.
-    pub fill: Color,
-    pub fill_hover: Color,
-    pub fill_selected: Color,
-    /// A slider's fill at rest, hovered and dragged.
-    pub slider: Color,
-    pub slider_hover: Color,
-    pub slider_active: Color,
-    pub handle: Color,
-    pub border: Color,
-    /// The hairline between rows, over their fills.
-    pub rule: Color,
-    /// The panel's top edge highlight.
-    pub rim: Color,
-    pub shadow: Color,
-    /// The outline around a region.
-    pub outline: Color,
-}
-
-impl Style {
-    /// Opaque colours worked out as the browser composites the knobs theme (sRGB), so they read
-    /// the same in Rune's linear blending.
-    pub fn dark() -> Self {
-        let h = |s: &str| rune::color::hex(s).unwrap_or(Color::BLACK);
-        Self {
-            bg: h("#1d1d1f"),
-            inset: h("#161618"),
-            raised: h("#3c3c3e"),
-            fg: h("#fafafa"),
-            fg2: h("#c4c4c6"),
-            fg3: h("#8a8a8d"),
-            fill: h("#29292b"),
-            fill_hover: h("#2f2f31"),
-            fill_selected: h("#363638"),
-            slider: h("#5a5a5c"),
-            slider_hover: h("#626264"),
-            slider_active: h("#6e6e70"),
-            handle: h("#ffffff"),
-            border: h("#2c2c2e"),
-            rule: Color::WHITE.alpha(0.025),
-            rim: h("#3a3a3c"),
-            shadow: Color::BLACK.alpha(0.45),
-            outline: Color::WHITE.alpha(0.55),
-        }
-    }
-
-    /// The light look: white card, dark text, grey fills.
-    pub fn light() -> Self {
-        let h = |s: &str| rune::color::hex(s).unwrap_or(Color::WHITE);
-        Self {
-            bg: h("#ffffff"),
-            inset: h("#ececee"),
-            raised: h("#ffffff"),
-            fg: h("#1d1d1f"),
-            fg2: h("#4a4a4d"),
-            fg3: h("#8a8a8d"),
-            fill: h("#f3f3f5"),
-            fill_hover: h("#ececee"),
-            fill_selected: h("#e4e4e7"),
-            slider: h("#dcdce0"),
-            slider_hover: h("#d3d3d8"),
-            slider_active: h("#c8c8ce"),
-            handle: h("#1d1d1f"),
-            border: h("#e2e2e5"),
-            rule: Color::BLACK.alpha(0.05),
-            rim: h("#ffffff"),
-            shadow: Color::BLACK.alpha(0.18),
-            outline: Color::BLACK.alpha(0.45),
-        }
-    }
-}
-
-impl Default for Style {
-    fn default() -> Self {
-        Self::dark()
-    }
 }
 
 #[cfg(all(test, feature = "panel"))]

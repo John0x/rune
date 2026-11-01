@@ -313,7 +313,7 @@ fn overlay_resume_keeps_running_motion_and_starts_new_motion_fresh() {
         width(&overlay, "box")
     };
     // Running motion keeps real time up to the resume cap.
-    let (capped, _) = run(|_| {}, |_| {}, Duration::from_secs_f64(crate::frame_clock::MAX_GAP));
+    let (capped, _) = run(|_| {}, |_| {}, Duration::from_secs_f64(crate::frame::clock::MAX_GAP));
     type Case = (&'static str, fn(&mut Overlay<Pair>), fn(&mut Overlay<Pair>));
     let hidden: Case = ("hidden", |o| o.hide(), |o| o.visible = true);
     #[cfg(target_os = "macos")]
@@ -324,7 +324,7 @@ fn overlay_resume_keeps_running_motion_and_starts_new_motion_fresh() {
         let (a, b) = run(pause, resume, Duration::from_secs(3));
         // `b` sits beside `a`, so its edges snap to a different 1/64 pt grid than `fresh`.
         assert!((b - fresh).abs() < 0.02, "{what}: motion starting on the resume frame must not jump: b={b}, fresh={fresh}");
-        assert!(capped < 211.0 && (a - capped).abs() < 0.01, "{what}: running motion resumes {:?} along: a={a}, expected={capped}", crate::frame_clock::MAX_GAP);
+        assert!(capped < 211.0 && (a - capped).abs() < 0.01, "{what}: running motion resumes {:?} along: a={a}, expected={capped}", crate::frame::clock::MAX_GAP);
     }
     // A missed frame while covered or asleep polls but commits nothing, retained or not: `b`
     // starts on the first uncovered frame, as above.
@@ -600,6 +600,57 @@ fn overlay_live_values_resume_before_retained_reveal_and_stop_on_hide() {
     assert!(overlay.dirty);
     overlay.rt.frame(0.0);
     assert_eq!(overlay.rt.elements()[0].text.as_deref(), Some("02"));
+}
+
+
+/// A resting overlay's timer frame builds before it takes a drawable or a display tick: one
+/// whose poll changes state but nothing on screen draws nothing, and one that changes what
+/// it shows draws, with the step it already took.
+#[test]
+fn a_timer_frame_that_changes_nothing_on_screen_draws_nothing() {
+    #[derive(Default)]
+    struct S { polls: u32, width: f32, grow: bool }
+    fn view(s: &S, _: &mut Cx<S>) -> El {
+        crate::el().child(crate::el().key("box").size(10.0 + s.width, 8.0).fill(crate::Color::WHITE))
+    }
+    fn poll(s: &mut S, _: f64, tx: &mut Tx) -> bool {
+        s.polls += 1;
+        if s.grow { s.width += 1.0; }
+        tx.wake_after(Duration::from_millis(33));
+        true
+    }
+    let app = AppSpec { poll: Some(poll), ..AppSpec::new("quiet timer", (100.0, 40.0), S::default, view) };
+    let (mut overlay, _) = Overlay::new(OverlaySpec::new("quiet timer", app.size, view).options(Default::default()), S::default(), &app);
+    overlay.rt.wall_start = None;
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: wgpu::TextureFormat::Bgra8UnormSrgb,
+        width: 200,
+        height: 80,
+        present_mode: wgpu::PresentMode::AutoVsync,
+        desired_maximum_frame_latency: 2,
+        alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+        view_formats: vec![],
+        color_space: Default::default(),
+    };
+    let start = Instant::now();
+    present(&mut overlay, start);
+    assert!(overlay.idle, "only the timer asks for another frame");
+    let mut quiet = frame::Quiet::default();
+    quiet.presented(&overlay.rt, &config, false);
+    assert!(quiet.presented.is_none(), "a frame it doesn't rest on records nothing");
+    quiet.presented(&overlay.rt, &config, true);
+    let presented = quiet.presented.as_ref().unwrap();
+
+    let at = start + Duration::from_millis(33);
+    let polls = overlay.rt.state.polls;
+    assert_eq!(frame::quiet_step(&mut overlay.rt, &mut overlay.clock, presented, &config, at, Some(at + FRAME)), None);
+    assert_eq!(overlay.rt.state.polls, polls + 1, "the timer's poll ran");
+
+    overlay.rt.state.grow = true;
+    let at = at + Duration::from_millis(33);
+    assert!(frame::quiet_step(&mut overlay.rt, &mut overlay.clock, presented, &config, at, Some(at + FRAME)).is_some(),
+        "a poll that changes what's on screen draws");
 }
 
 

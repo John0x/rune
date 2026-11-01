@@ -23,7 +23,7 @@ thread_local! {
     static WIDTHS: RefCell<Budget<u64, Rc<Columns>>> = RefCell::new(Budget::new(WIDTHS_BYTES));
 }
 
-pub(super) fn font_key(f: TextStyle) -> (u32, u32, u32, u32, String) {
+fn font_key(f: TextStyle) -> (u32, u32, u32, u32, String) {
     (f.size.to_bits(), f.weight.to_bits(), f.line_height.to_bits(), f.tracking.to_bits(), format!("{:?}{}{}{}", f.family, f.variations, f.features, f.italic))
 }
 
@@ -361,7 +361,7 @@ impl Renderer {
             self.s.table_pad.map(f32::to_bits),
             self.head_pad().map(f32::to_bits),
             self.s.table_flush_left,
-            link_styles,
+            (link_styles, rune::text::font_epoch()),
         ));
         if let Some(hit) = WIDTHS.with_borrow_mut(|c| c.get(&key).cloned()) {
             return hit;

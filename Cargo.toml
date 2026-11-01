@@ -4,12 +4,17 @@ members = [
     "crates/rune",
     "crates/rune-ref",
     "crates/rune-motion",
+    "crates/rune-staging",
     "crates/rune-kit",
     "crates/rune-fx",
     "crates/rune-light",
     "crates/procwatch",
+    "crates/rune-register",
     "crates/rune-knobs",
     "crates/rune-mac",
+    "crates/rune-mermaid",
+    "crates/rune-perf",
+    "crates/rune-taffy",
     "themes/opencode",
     "examples/hello",
     "examples/web-hello",
@@ -76,3 +81,24 @@ opt-level = 3
 
 [profile.rune-hot.package.fdeflate]
 opt-level = 3
+
+[workspace.lints.rust]
+# shared-lints begin
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+# shared-lints end
+unsafe_code = "allow" # shared: forbid; GPU and FFI code needs unsafe
+
+[workspace.lints.clippy]
+# shared-lints begin
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+dbg_macro = "deny"
+disallowed_types = "deny"
+expect_used = "warn"
+todo = "warn"
+unwrap_used = "warn"
+# shared-lints end
+undocumented_unsafe_blocks = "warn" # shared: deny; errors left
+let_underscore_must_use = "warn" # shared: deny; errors left
+disallowed_methods = "warn" # shared: deny; errors left

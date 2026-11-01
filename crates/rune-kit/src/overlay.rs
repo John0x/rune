@@ -39,12 +39,6 @@ impl Placement {
             Placement::RightStart => (Side::Right, Align::Start),
         }
     }
-
-    /// The point content grows from (the trigger side), for the 0.96 scale-in.
-    fn origin(self) -> Vec2 {
-        let (side, align) = self.split();
-        anchor_origin(side, align)
-    }
 }
 
 fn anchor_origin(side: Side, align: Align) -> Vec2 {
@@ -63,10 +57,6 @@ fn anchor_origin(side: Side, align: Align) -> Vec2 {
 
 /// Positions `content` next to the element keyed `anchor` and gives it the overlay entrance:
 /// fade plus 0.96 scale from the trigger side.
-pub(crate) fn anchor(k: &Kit, content: El, anchor: &str, placement: Placement, gap: f32) -> El {
-    anchor_with(k.motion.overlay, content, anchor, placement, gap)
-}
-
 pub(crate) fn anchor_at(k: &Kit, content: El, anchor: &str, side: Side, align: Align, gap: f32) -> El {
     fit(content, anchor, side, align, gap)
         .transition(Transition::scale_anchor(0.96, anchor_origin(side, align)))
@@ -77,7 +67,7 @@ fn anchor_with(motion: Spring, content: El, anchor: &str, placement: Placement, 
     let (side, align) = placement.split();
     content
         .anchored(anchor, side, align, gap)
-        .transition(Transition::scale_anchor(0.96, placement.origin()))
+        .transition(Transition::scale_anchor(0.96, anchor_origin(side, align)))
         .motion(motion)
 }
 
@@ -91,11 +81,24 @@ fn fit(content: El, anchor: &str, side: Side, align: Align, gap: f32) -> El {
     }
 }
 
+/// How far a dropdown's scrolling edge fades while rows are hidden under it: over half a row, so
+/// a list that scrolls reads as one even where the system hides scrollbars (hex#840).
+pub(crate) const LIST_SCROLL_FADE: f32 = 16.0;
+
 /// A dropdown's rows in a scroll viewport that shrinks with its fitted surface, so a list
-/// longer than the window has room for scrolls, its edges fading while rows pass under them.
-/// Put it in a column with `.min_h(0.0)` up to the surface.
+/// longer than the window has room for scrolls, its edges fading ([`LIST_SCROLL_FADE`]) while
+/// rows pass under them; a row brought into view stops clear of the fade. Put it in a column
+/// with `.min_h(0.0)` up to the surface.
 pub(crate) fn fit_scroll(rows: El) -> El {
-    col().key("scroll").w_full().shrink().min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(8.0).child(rows)
+    col()
+        .key("scroll")
+        .w_full()
+        .shrink()
+        .min_h(0.0)
+        .scroll(ScrollSpec { stick_bottom: false })
+        .scroll_edge_fade(LIST_SCROLL_FADE)
+        .scroll_margin(LIST_SCROLL_FADE)
+        .child(rows)
 }
 
 /// Positions a menu surface next to `anchor` with no entrance: it is there on the next frame,
@@ -234,10 +237,7 @@ impl Popover {
             layer.push(s);
         }
         let (side, align) = self.placement.split();
-        let content = fit(raised(k, content, k.radius.md), &anchor_key, side, align, self.gutter)
-            .transition(Transition::scale_anchor(0.96, self.placement.origin()))
-            .motion(k.motion.overlay);
-        layer.push(content);
+        layer.push(anchor_at(k, raised(k, content, k.radius.md), &anchor_key, side, align, self.gutter));
         trigger
     }
 }
@@ -520,7 +520,7 @@ impl HoverCard {
             .min_w(200.0)
             .max_w(320.0)
             .child(col().padding(4.0).children(self.body));
-        layer.push(anchor(k, raised(k, content, k.radius.lg), &anchor_key, self.placement, 4.0));
+        layer.push(anchor_with(k.motion.overlay, raised(k, content, k.radius.lg), &anchor_key, self.placement, 4.0));
         trigger
     }
 }

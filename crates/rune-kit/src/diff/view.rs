@@ -12,6 +12,7 @@ use rune::{Color, Cursor, Drag, El, GrowthSpec, Icon, Phase, ScrollSpec, Span, T
 use super::model::{FileStatus, LineKind, Side};
 use super::state::{Annotation, DiffMode, DiffState, EXPAND_STEP, Expand, GAP_H, HEADER_H, LINE_H, LineRange, LineRef, NOTE_H, Row};
 use crate::Kit;
+use crate::palette::tint;
 use crate::syntax::SyntaxTheme;
 
 static EXPAND_UP: Icon = Icon {
@@ -201,12 +202,6 @@ struct Tints {
     number: Color,
     bar: Color,
     count: Color,
-}
-
-/// `base` moved `t` of the way to `hue` in Oklab, keeping `base`'s alpha.
-fn tint(base: Color, hue: Color, t: f32) -> Color {
-    let [a, b] = [base.to_oklab(), hue.to_oklab()];
-    Color::from_oklab([0, 1, 2, 3].map(|i| if i == 3 { a[3] } else { a[i] + (b[i] - a[i]) * t }))
 }
 
 impl Look {
@@ -617,7 +612,9 @@ impl<S: 'static> View<S> {
             t = pads.into_iter().fold(t, |t, r| t.uncopied(r));
         }
         let (get, cell) = (self.d.get_mut.clone(), format!("{row_key}.{}", side as u8));
-        let mut code = col().grow(1.0).min_w(0.0).pl(CODE_PAD.0).pr(CODE_PAD.1).child(t).on_hover_change(move |s: &mut S, inside, _| get(s).hover_text(side, &cell, inside));
+        let mut code = col().grow(1.0).min_w(0.0).pl(CODE_PAD.0).pr(CODE_PAD.1).child(t).on_hover_change(move |s: &mut S, inside, tx: &mut Tx| {
+            if !get(s).hover_text(side, &cell, inside) { tx.live_only(); }
+        });
         if c.no_newline {
             code = code.child(text("No newline at end of file").font(l.small).color(l.muted).opacity(0.6).key("eof").pb(2.0));
         }

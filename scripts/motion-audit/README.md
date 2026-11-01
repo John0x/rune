@@ -15,6 +15,9 @@ python3 scripts/motion-audit/test_analyze.py        # analyze.py on synthetic tr
 `--trace-all --trace`. `--trace-all` adds unkeyed elements (named by path) to the usual
 motion-lint JSONL, and every trace now says why each frame animated (`quality.why`) and which
 tracks it sampled (`tk`: `[element id or path, property, active]`; inactive means settling).
+It also says how far scrolling carries each element when that changes (`sc`: `[id, x, y]` in
+window points, scaled and turned as its rect is). The motion checks (overshoot, jiggle, reversal, stall, dog-leg) add it back, so a node
+gliding inside a list that follows its end is judged against the list, not the screen.
 
 `analyze.py` reports, per trace:
 
@@ -24,11 +27,12 @@ tracks it sampled (`tk`: `[element id or path, property, active]`; inactive mean
 | `idle-frames`, `never-settles` | frames that animate with no visible change; motion still running at the end |
 | `pop-in`, `pop-out` | an element appears or disappears at full opacity and size with no transition |
 | `appear-then-jump` | mounts in one place, then moves there in a frame |
-| `jump`, `step`, `sibling-jump` | a one-frame change in position or size, on its own or next to something animating, seen on both frames (a loop wrapping while transparent or clipped is not one) |
+| `jump`, `step`, `sibling-jump` | a one-frame change in position or size, on its own or next to something animating, seen on both frames and in what shows: the visible part in the window moves, or what the element holds that shows moves with it, or it brings what it holds into view with no input (a scroll offset that lands in one frame with nothing asking for it; a loop wrapping while transparent or clipped, or a fold dropping rows above the window with the scroll offset, is not one) |
 | `overshoot`, `jiggle` | passes its target, or reverses direction more than once |
 | `latency`, `hitch` | input with no motion for several frames; a frame over budget |
 | `cut-exit` | unmounts partway through its fade: nothing leaves above opacity 0 |
-| `reversal`, `dog-leg` | one motion heads the wrong way first or goes out and back; a route much longer than its chord |
+| `reversal`, `dog-leg` | one motion heads the wrong way first or goes out and back; a route much longer than its chord, on screen and against its parent |
+| `stall` | one motion's speed drops for a frame and picks up again, as a retarget that lost part of its velocity does |
 
 An app's scenario can say what each input should do with `"expect"` on its script event:
 
@@ -69,8 +73,9 @@ gates its own motion inside `cargo test`, on its real view and state, with `rune
   path), and `quiet` marks where the cell's motion should end.
 - `check` lists what a person would see go wrong in a `Recording`: `pop-in`, `pop-out`,
   `cut-exit`, `jump`, `offset-jump`, `appear-then-jump`, `jerk`, `reversal`, `overshoot`,
-  `jiggle`, `text-swap`, `fade-snap`, `flicker`, `load-motion`, `never-settles`, `loop-jump` and
-  `wakes-after-end`. Thresholds and meanings are the `RULES` table. Elements are tracked by tree
+  `jiggle`, `text-swap`, `fade-snap`, `flicker`, `load-motion`, `never-settles`, `loop-jump`,
+  `wakes-after-end`, `lands-unseen`, `remount`, `unpinned`, `twice` and `scroll-commit` (the
+  app ran its view through a scroll). Thresholds and meanings are the `RULES` table. Elements are tracked by tree
   path, so a keyed row keeps its identity however the rows around it change.
 - `gate(cells, ALLOW)` runs the app's cells (a name and a closure that records one) in parallel,
   checks them, and fails the test on any finding its allowlist doesn't cover. Each allowlist row

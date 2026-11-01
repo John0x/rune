@@ -16,12 +16,12 @@ impl PlaceRequest {
         let mut request = Self { requested: display.clone(), display, placement, pointer: None };
         if request.display == crate::DisplayTarget::UnderPointer {
             #[cfg(target_os = "macos")]
-            { request.display = crate::macos::pointer_display().map_or(crate::DisplayTarget::Primary,
+            { request.display = crate::platform::macos::pointer_display().map_or(crate::DisplayTarget::Primary,
                 |id| crate::DisplayTarget::Native(crate::NativeDisplayId::MacOS(id))); }
             #[cfg(target_os = "windows")]
-            { request.pointer = crate::win32::pointer_position(); }
+            { request.pointer = crate::platform::win32::pointer_position(); }
             #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-            { request.pointer = crate::x11_overlay::pointer_position(); }
+            { request.pointer = crate::platform::x11::overlay::pointer_position(); }
         }
         request
     }
@@ -59,7 +59,7 @@ impl Display {
     /// logical coordinates. Keep the origin in this space; scale only local offsets.
     pub fn native_bounds(&self) -> [f64; 4] {
         #[cfg(target_os = "macos")]
-        if let Some(crate::NativeDisplayId::MacOS(id)) = self.native_id() { return crate::macos::display_bounds(id); }
+        if let Some(crate::NativeDisplayId::MacOS(id)) = self.native_id() { return crate::platform::macos::display_bounds(id); }
         let divisor = if matches!(self.native_id(), Some(crate::NativeDisplayId::Wayland(_))) { self.scale } else { 1.0 };
         [f64::from(self.position.0), f64::from(self.position.1), f64::from(self.size.0) / divisor, f64::from(self.size.1) / divisor]
     }
@@ -72,6 +72,7 @@ pub(crate) const DEFAULT_MIN_SIZE: (f32, f32) = (420.0, 400.0);
 pub struct WindowOptions {
     pub transparent: bool,
     pub borderless: bool,
+    /// Clicks, and so hover, pass to whatever is below.
     pub click_through: bool,
     pub always_on_top: bool,
     pub visible: bool,
@@ -183,7 +184,8 @@ impl MacWindowOptions {
     /// AppKit NSWindow.CollectionBehavior bit mask. Replaces the existing mask.
     pub fn collection_behavior(mut self, bits: usize) -> Self { self.collection_behavior = Some(bits); self }
     /// Requests NSWindowSharingNone; capture clients should also filter window_number().
-    /// false restores NSWindowSharingReadOnly. This is not a capture guarantee.
+    /// false restores NSWindowSharingReadOnly. This is not a capture guarantee. A nonactivating
+    /// panel applies it only while shown (see `OverlayOptions::exclude_from_capture`).
     pub fn exclude_from_capture(mut self, exclude: bool) -> Self { self.exclude_from_capture = Some(exclude); self }
     /// Rounds a transparent, borderless window or panel to `radius` points with a continuous
     /// (squircle) curve. The window's root layer clips everything it shows, Rune's drawing and
@@ -247,6 +249,8 @@ impl<S> WindowSpec<S> {
     /// (gamma) space instead of linear light, matching CSS and Core Animation. With a
     /// `Compositor`, `Frame::srgb_blend` says which encoding its passes must match.
     pub fn srgb_blend(mut self, enabled: bool) -> Self { self.app = self.app.srgb_blend(enabled); self }
+    /// This window's font smoothing (`App::font_smoothing`).
+    pub fn font_smoothing(mut self, mode: crate::FontSmoothing) -> Self { self.app = self.app.font_smoothing(mode); self }
     pub fn on_focus(mut self, f: fn(&mut S, bool, &mut crate::Tx)) -> Self { self.app = self.app.on_focus(f); self }
     /// This window's editor's input method events, like `App::on_ime`.
     pub fn on_ime(mut self, f: fn(&mut S, &crate::Ime, &mut crate::Tx) -> bool) -> Self { self.app = self.app.on_ime(f); self }

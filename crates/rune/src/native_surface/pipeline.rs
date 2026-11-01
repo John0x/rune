@@ -73,6 +73,8 @@ pub struct SurfaceRenderer {
     cache: HashMap<usize, Arc<Imported>>,
     draws: Vec<Prepared>,
     srgb_blend: bool,
+    /// The owning `Renderer`'s uploads, when it has one; queue writes otherwise.
+    staging: Option<rune_staging::Staging>,
     #[cfg(target_os = "macos")]
     importer: Option<macos::Importer>,
 }
@@ -158,6 +160,7 @@ impl SurfaceRenderer {
             cache: HashMap::new(),
             draws: Vec::new(),
             srgb_blend: false,
+            staging: None,
             #[cfg(target_os = "macos")]
             importer: None,
         }
@@ -165,6 +168,17 @@ impl SurfaceRenderer {
 
     pub fn set_srgb_blend(&mut self, enabled: bool) {
         self.srgb_blend = enabled;
+    }
+
+    pub(crate) fn set_staging(&mut self, staging: rune_staging::Staging) {
+        self.staging = Some(staging);
+    }
+
+    fn write(&self, queue: &wgpu::Queue, buffer: &wgpu::Buffer, data: &[u8]) {
+        match &self.staging {
+            Some(s) => s.write_buffer(buffer, 0, data),
+            None => queue.write_buffer(buffer, 0, data),
+        }
     }
 
     fn pipeline(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, format: wgpu::TextureFormat, blend: Blend) -> wgpu::RenderPipeline {
@@ -253,7 +267,7 @@ impl SurfaceRenderer {
             let imported = self.cache[&key].clone();
             let f = &imported.frame;
             let upright = f.orient.upright(f.size);
-            let image = image_rect(d.rect, upright, d.fit);
+            let image = super::place::image_rect(d.rect, upright, d.fit, d.surface.place());
             let exact = (image[2] - upright[0] as f32).abs() < 0.001
                 && (image[3] - upright[1] as f32).abs() < 0.001
                 && (image[0] - image[0].round()).abs() < 0.001
@@ -280,7 +294,10 @@ impl SurfaceRenderer {
             };
             if let Some(p) = self.draws.get_mut(count).filter(|p| Arc::ptr_eq(&p.imported, &imported)) {
                 *p.drawn.get_mut() = false;
-                queue.write_buffer(&p.uniform, 0, bytemuck::bytes_of(&u));
+                match &self.staging {
+                    Some(s) => s.write_buffer(&p.uniform, 0, bytemuck::bytes_of(&u)),
+                    None => queue.write_buffer(&p.uniform, 0, bytemuck::bytes_of(&u)),
+                }
                 p.before = d.before_instance;
                 p.surface = d.surface.clone();
             } else {
@@ -370,6 +387,11 @@ impl SurfaceRenderer {
     pub(super) fn live_planes(&self) -> usize {
         self.importer.as_ref().map_or(0, |i| i.live_planes.load(std::sync::atomic::Ordering::SeqCst))
     }
+    #[cfg(target_os = "macos")]
+    pub(crate) fn draws_nothing(&self) -> bool {
+        self.draws.is_empty()
+    }
+
     /// Include this in the containing render pass for hardware GPU timing.
     /// Submit that encoder through [`Self::submit`] before the next [`Self::prepare`].
     /// Plain `Queue::submit` does not retain the timing slot and may let it be reused
@@ -392,8 +414,7 @@ impl SurfaceRenderer {
     }
     /// Reproject one draw into a bounded layer without moving its screen-space clip or UVs.
     pub(crate) fn target(&self, queue: &wgpu::Queue, index: usize, bounds: [f32; 4]) {
-        queue.write_buffer(&self.draws[index].uniform, 0,
-            bytemuck::cast_slice(&[bounds[2], bounds[3], bounds[0], bounds[1]]));
+        self.write(queue, &self.draws[index].uniform, bytemuck::cast_slice(&[bounds[2], bounds[3], bounds[0], bounds[1]]));
     }
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, index: usize) {
         self.draw_format(pass, index, self.format);
@@ -569,18 +590,4 @@ fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
         },
         count: None,
     }
-}
-fn image_rect(node: [f32; 4], source: [u32; 2], fit: SurfaceFit) -> [f32; 4] {
-    let a = node[2] / source[0] as f32;
-    let b = node[3] / source[1] as f32;
-    let scale = match fit {
-        SurfaceFit::Fit => a.min(b),
-        SurfaceFit::Fill => a.max(b),
-    };
-    let w = source[0] as f32 * scale;
-    let h = source[1] as f32 * scale;
-    let x = node[0] + (node[2] - w) * 0.5;
-    let y = node[1] + (node[3] - h) * 0.5;
-    // At unit scale favour sharp shared text over a subpixel translation of its image.
-    if (scale - 1.0).abs() < 1e-6 { [x.round(), y.round(), w, h] } else { [x, y, w, h] }
 }

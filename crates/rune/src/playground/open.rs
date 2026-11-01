@@ -24,11 +24,9 @@ pub fn slug(path: &str) -> String {
 
 impl<S: 'static> Live<S> {
     /// The listed story called `name`: its path or just its name, matching case only if need
-    /// be, or its path's [`slug`].
+    /// be, or its path's [`slug`]. Where two match, the first in the list.
     pub(super) fn find(&self, name: &str) -> Option<usize> {
-        let mut listed = self.order.clone();
-        listed.sort_unstable();
-        self.find_in(name, &listed)
+        self.find_in(name, &self.order)
     }
 
     /// [`Live::find`] among `ids`, in order.
@@ -65,7 +63,7 @@ impl<S: 'static> Live<S> {
         let at = name.and_then(|n| self.find(n));
         if !self.open || at.is_some() {
             self.open = true;
-            if let Some(i) = at { self.reveal(i); }
+            if let Some(i) = at.or(self.folds.start.then_some(self.selected)) { self.reveal(i); }
             self.select(at.unwrap_or(self.selected), real);
         }
     }
@@ -81,5 +79,19 @@ impl Tx {
     /// Where the playground doesn't show, nothing happens, as with [`Tx::open_playground`].
     pub fn open_playground_at(&mut self, story: &str, variant: Option<&str>) {
         self.playground.push(Request::OpenAt(story.to_owned(), variant.map(str::to_owned)));
+    }
+
+    /// Makes the open story's stage again and runs its `'r'` trigger, as R does. After
+    /// [`Tx::open_playground_at`] in the same handler it applies to the story that opens.
+    /// With the playground closed, nothing happens.
+    pub fn replay_playground(&mut self) {
+        self.playground.push(Request::Replay);
+    }
+
+    /// Runs the open story's trigger on `key`, as its letter or its side-column button does;
+    /// `'r'` is [`Tx::replay_playground`]. A key the story has no trigger on does nothing.
+    pub fn playground_trigger(&mut self, key: char) {
+        let key = key.to_ascii_lowercase();
+        self.playground.push(if key == 'r' { Request::Replay } else { Request::Trigger(key) });
     }
 }

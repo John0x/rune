@@ -129,7 +129,7 @@ pub(crate) struct Gap {
 }
 
 /// Highlights of 128 lines of one side, by line number.
-pub(crate) struct Chunk {
+struct Chunk {
     /// Byte offset of each line in the chunk's text, and one past the last.
     starts: Vec<u32>,
     hl: Rc<[Highlight]>,
@@ -465,7 +465,10 @@ impl DiffState {
     /// The pointer entered or left a line's text on `side`: text selection then copies that
     /// side. A held press keeps the cell it started in entered, so dragging across to the
     /// other side doesn't switch.
-    pub(crate) fn hover_text(&mut self, side: Side, cell: &str, inside: bool) {
+    /// Notes the pointer entering or leaving a line's code; returns whether that changed the
+    /// side a selection copies, the only part the view reads.
+    pub(crate) fn hover_text(&mut self, side: Side, cell: &str, inside: bool) -> bool {
+        let was = self.copy_side;
         if inside {
             if !self.hovered.iter().any(|(_, c)| c == cell) {
                 self.hovered.push((side, cell.to_owned()));
@@ -476,6 +479,7 @@ impl DiffState {
         } else {
             self.hovered.retain(|(_, c)| c != cell);
         }
+        self.copy_side != was
     }
 
     pub fn visible_file(&self) -> usize {

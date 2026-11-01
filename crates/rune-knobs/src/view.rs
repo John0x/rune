@@ -16,7 +16,7 @@ const INLINE_CARD_W: f32 = 220.0;
 const TAG: TextStyle = TextStyle::new(11.0, 550.0).lh(14.0);
 
 /// The smallest region under the point.
-pub(crate) fn region_at(rects: &[(&'static str, [f32; 4])], x: f32, y: f32) -> Option<&'static str> {
+fn region_at(rects: &[(&'static str, [f32; 4])], x: f32, y: f32) -> Option<&'static str> {
     rects
         .iter()
         .filter(|(_, r)| x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3])
@@ -42,8 +42,8 @@ pub(crate) fn overlay<S: 'static>(k: &Knobs, groups: &'static [Group], st: Style
     if !k.open {
         return l;
     }
-    let (ox, oy) = rune::memo::layout(key).map_or((0.0, 0.0), |r| (r[0], r[1]));
-    let rects: Vec<(&'static str, [f32; 4])> = groups.iter().filter_map(|g| rune::memo::layout(g.region).map(|r| (g.name, r))).collect();
+    let (ox, oy) = rune::memo::window_layout(key).map_or((0.0, 0.0), |r| (r[0], r[1]));
+    let rects: Vec<(&'static str, [f32; 4])> = groups.iter().filter_map(|g| rune::memo::window_layout(g.region).map(|r| (g.name, r))).collect();
     let picking = k.picking;
     if picking {
         let at = rects.clone();
@@ -157,7 +157,9 @@ pub(crate) fn head<S: 'static>(k: &Knobs, groups: &'static [Group], st: Style, l
             .child(tool(st, "knobs-random", &icons::RANDOM, "Random", true, lens, move |k, _| k.random(&g)))
             .child(tool(st, "knobs-reset", &icons::RESET, "Reset", k.can_reset(&g), lens, move |k, _| k.reset(&g)));
     }
-    head.child(tool(st, "knobs-undo", &icons::UNDO, "Undo", k.can_undo(), lens, |k, _| k.undo())).child(tool(st, "knobs-copy", &icons::COPY, "Copy values", true, lens, move |k, tx| {
+    head.child(tool(st, "knobs-undo", &icons::UNDO, "Undo", k.can_undo(), lens, |k, _| {
+        k.undo();
+    })).child(tool(st, "knobs-copy", &icons::COPY, "Copy values", true, lens, move |k, tx| {
         let all: Vec<Group> = match k.current(groups) {
             Some(g) => vec![g],
             None => groups.to_vec(),

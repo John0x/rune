@@ -6,8 +6,36 @@
 use crate::render::{Instance, KIND_GLYPH, Renderer};
 use crate::runtime::Runtime;
 
+/// Draws a frame in place of Rune's default.
+///
+/// To paint custom content at `El::effect` slots, draw the frame with `Renderer::draw_with` and
+/// paint in its hook: it runs at each slot in painter order, inside the slot's isolated layers,
+/// so the slot's opacity (an exit fade included), clip and transform already apply. Keep
+/// resources per `EffectSite::mark`, read the slot's `EffectSite::data`, and drop a mark's
+/// resources once a frame passes without it:
+///
+/// ```ignore
+/// struct Hud { waves: HashMap<u32, Wave>, seen: HashSet<u32> }
+///
+/// impl Compositor<App> for Hud {
+///     fn render(&mut self, f: &mut Frame<'_, App>) {
+///         let (device, queue, clear) = (f.device, f.queue, f.rt.clear_color());
+///         f.ui.prepare(device, queue, &mut f.rt.text.atlas, &f.rt.instances, f.size);
+///         self.seen.clear();
+///         f.ui.draw_with(f.encoder, f.target, clear, &mut |pass, site| {
+///             self.seen.insert(site.mark);
+///             let wave = self.waves.entry(site.mark).or_insert_with(|| Wave::new(device));
+///             wave.draw(device, queue, pass, site, site.data);
+///         });
+///         self.waves.retain(|mark, _| self.seen.contains(mark));
+///     }
+/// }
+/// ```
 pub trait Compositor<S: 'static>: 'static {
     /// Device features to request when the adapter has them (e.g. `TIMESTAMP_QUERY`).
+    /// `IMMEDIATES` also raises `max_immediate_size` to the adapter's (4 KB on Metal): per-draw
+    /// values set with `RenderPass::set_immediates` travel inside the pass, where a uniform
+    /// written through the queue or `Frame::write_buffer` costs the frame another command buffer.
     fn features(&self) -> wgpu::Features {
         wgpu::Features::empty()
     }
@@ -58,6 +86,13 @@ impl<S: 'static> Frame<'_, S> {
     /// encode their output to match (`FxRenderer::set_srgb_blend` in rune-fx).
     pub fn srgb_blend(&self) -> bool {
         self.ui.srgb_blend()
+    }
+
+    /// `queue.write_buffer` without its per-call staging buffer: `data` goes through Rune's
+    /// reused staging memory and lands in `buffer` at `offset` ahead of the commands recorded
+    /// into `encoder` after this call. `offset` and `data.len()` are multiples of 4.
+    pub fn write_buffer(&mut self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
+        self.ui.write_buffer(self.device, self.queue, self.encoder, buffer, offset, data);
     }
 
     /// The default frame: every instance into the target, cleared to the window colour.

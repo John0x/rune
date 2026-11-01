@@ -1,10 +1,11 @@
+<!-- tallow -->
 # Rune
 
 A Rust GPU UI framework (wgpu, winit) for apps that feel like SwiftUI on iOS at 120 Hz on Mac, Windows, Linux, web and iOS. Views are plain Rust. Apps pin `dev` revs.
 
 ## Layout
 
-- `crates/rune`: layout, runtime, renderer, windows, overlays, dev tooling. `crates/rune-kit`: components. `crates/rune-motion`: springs and transitions. `crates/rune-fx`, `crates/rune-light`: effects. `crates/rune-ref`: reference renderer. `crates/procwatch`: an app's own memory and CPU (footprint, counting allocator, gauges, warnings, loopback JSON); libc only, no Rune dependency.
+- `crates/rune`: layout, runtime, renderer, windows, overlays, dev tooling. `crates/rune-kit`: components. `crates/rune-mermaid`: Mermaid diagrams (flowcharts, sequence and state diagrams). `crates/rune-motion`: springs and transitions. `crates/rune-fx`, `crates/rune-light`: effects. `crates/rune-ref`: reference renderer. `crates/procwatch`: an app's own memory and CPU (footprint, counting allocator, gauges, warnings, loopback JSON); libc only, no Rune dependency.
 - `examples/`: apps and labs. `themes/`: themes. `site/`: the docs site (see `site/README.md`).
 - `PLAN.md`: direction and milestones. `research/`: notes behind decisions. `demo/`: images the docs show.
 
@@ -20,6 +21,7 @@ A Rust GPU UI framework (wgpu, winit) for apps that feel like SwiftUI on iOS at 
 - `dev` is fast-forward-only: never force-push or rewrite it. Apps pin its revs, so a rewrite breaks every app's build on a clean fetch.
 - For any change that can move an app's output or break its build, add `changelog/unreleased/<YYYY-MM-DD>-<slug>.md` with one top-level bullet, in the style of the `CHANGELOG.md` entries. `scripts/changelog-fold` folds them into `## dev`.
 - Keep Rust files under 800 non-test lines (`#[cfg(test)]` code excluded); 1,500 is a hard cap. The point is to stop god files and edit collisions, not to chop a file that reads fine as one piece. Older files over the cap are listed in `scripts/file-size-exceptions.txt` with ceilings that only go down. Run `scripts/file-size.sh` to check.
+- Keep folders shaped by capability: `x.rs` or `x/` beside two or more `x_*.rs` (or three or more `x_*.rs` alone) means move them into `x/`; a folder over 40 source files warns and over 60 is an error (tests aren't counted; `examples/`, `benches/` and `bin/` are skipped). `scripts/folder-shape.sh` runs inside `scripts/file-size.sh`; old violations are in `scripts/folder-shape-exceptions.txt` with ceilings that only go down.
 - Put tests in a sibling `tests.rs` or `*_tests.rs`, and keep any test file or module under 1,000 lines.
 - Before adding to a file over the cap, move the area you touch into its own module, in its own PR.
 - A feature owns its state, keys and registrations so it plugs in with one line. New runtime state goes in the owning subsystem's struct, not a flat `Runtime` field.
@@ -46,6 +48,6 @@ Everything pushed stays public in history. Before committing, run `git diff --ca
 - home folder and temp paths, machine names and tailnet hostnames. Write repo-relative paths, and use `host.example.ts.net` in tests;
 - session IDs, chat or Slack links, and quotes from private sessions, chats or calls;
 - teammates' names attached to their plans, opinions or internal discussions, and private repos or branches;
-- quotes of, or citations to, Anomaly's internal guides and rules (Abattoir). Say what the code does and why on its own terms;
+- quotes of, or citations to, internal guides and rules. Say what the code does and why on its own terms;
 - agent handoff notes (`REVIEW-TO-PARENT.md` and similar), raw evidence, logs and benchmark dumps;
 - generated videos and strips nothing links to. Commit the stills a doc shows.

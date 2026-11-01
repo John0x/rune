@@ -250,7 +250,7 @@ export const layers: Entry[] = [
     ],
     code: [
       at("crates/rune/src/runtime.rs", "Taffy on the node arena"),
-      at("crates/rune/src/virtual_list.rs", "visible rows only"),
+      at("crates/rune/src/el/virtual_list.rs", "visible rows only"),
     ],
   },
   {
@@ -342,9 +342,9 @@ export const layers: Entry[] = [
     ],
     code: [
       at("crates/rune/src/window.rs", "winit today"),
-      at("crates/rune/src/macos.rs"),
-      at("crates/rune/src/win32.rs", "overlays"),
-      at("crates/rune/src/layer_shell.rs", "Wayland overlays"),
+      at("crates/rune/src/platform/macos.rs"),
+      at("crates/rune/src/platform/win32.rs", "overlays"),
+      at("crates/rune/src/platform/layer_shell.rs", "Wayland overlays"),
     ],
   },
   {
@@ -381,10 +381,11 @@ export const layers: Entry[] = [
     title: "Playground",
     body: (
       <p>
-        A storybook built into the window, on ⌘⇧D. The app's scenes and its own stories, grouped by type, show one at a
-        time on a plain stage, live and interactive, with their triggers and controls beside them. Each story has its
-        own state, so the real one is never touched. R replays a story from the start, its timed steps running on the
-        logical clock, the same every time.
+        A storybook built into the window, on ⌘⇧D. The app's scenes and its own stories, in a tree of groups nested by
+        their paths, show one at a time on a plain stage, live and interactive, with their triggers and controls beside
+        them. The keyboard is in one column at a time, the list, the stage or the controls, so a story's own keys work on
+        its stage. Each story has its own state, so the real one is never touched. R replays a story from the start, its
+        timed steps running on the logical clock, the same every time.
       </p>
     ),
     code: [at("crates/rune/src/playground.rs", "stories, triggers and replay")],
@@ -525,8 +526,13 @@ export const milestones: Milestone[] = [
   {
     id: "m5",
     title: "Web",
-    status: "later",
-    body: <p>The same apps in the browser over WebGPU, starting with live demos on this site.</p>,
+    status: "started",
+    body: (
+      <p>
+        The same apps in the browser over WebGPU, starting with live demos on this site. An experimental target builds
+        and runs today (<code>WEB.md</code>, <code>examples/web-hello</code>).
+      </p>
+    ),
   },
   {
     id: "m6",

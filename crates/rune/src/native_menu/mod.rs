@@ -19,7 +19,7 @@ mod standard_macos;
 #[cfg(target_os = "macos")]
 pub(crate) use default_macos::{ensure as ensure_default_menu, promote as promote_default_menu};
 #[cfg(target_os = "macos")]
-pub(crate) use standard_macos::{adopt as adopt_standard_view, install as install_standard_menus, take_unhandled};
+pub(crate) use standard_macos::{adopt as adopt_standard_view, install as install_standard_menus};
 #[cfg(target_os = "macos")]
 pub(crate) use key_equivalent::set_key_equivalent;
 
@@ -32,8 +32,10 @@ struct Description {
     title: String,
     location: Location,
     equivalent: Option<Shortcut>,
+    keys_first: bool,
     enabled: bool,
     checked: bool,
+    separator: bool,
 }
 
 /// A custom native item. Defaults to the app menu, enabled and unchecked, with its title as id.
@@ -45,13 +47,26 @@ impl<S> MenuItem<S> {
     pub fn new(title: impl Into<String>, action: fn(&mut S, &mut Tx)) -> Self {
         let title = title.into();
         Self { description: Description { id: title.clone(), title, location: Location::App,
-            equivalent: None, enabled: true, checked: false }, action }
+            equivalent: None, keys_first: false, enabled: true, checked: false, separator: false }, action }
+    }
+    /// A separator line, placed with `menu` or `dock` like an item. It has no id or title,
+    /// can't be fired, and needs no unique id.
+    pub fn separator() -> Self {
+        let mut item = Self::new("", |_, _| {});
+        item.description.separator = true;
+        item
     }
     pub fn id(mut self, id: impl Into<String>) -> Self { self.description.id = id.into(); self }
     /// Place this item in a named top-level menu. Existing native menus are reused.
     pub fn menu(mut self, title: impl Into<String>) -> Self { self.description.location = Location::Named(title.into()); self }
     pub fn dock(mut self) -> Self { self.description.location = Location::Dock; self }
     pub fn key_equivalent(mut self, shortcut: Shortcut) -> Self { self.description.equivalent = Some(shortcut); self }
+    /// Let the window's own key handling see this item's key equivalent first. AppKit gives a
+    /// menu equivalent to the menu before any view, so by default the item takes the chord
+    /// even while a field, a modal or `on_key` wants it. With this, the press goes to the key
+    /// window like any other key (the focused element, then modals, then `on_key`), and the
+    /// item runs only if no handler takes it. Picking the item in the menu always runs it.
+    pub fn keys_first(mut self) -> Self { self.description.keys_first = true; self }
     pub fn enabled(mut self, enabled: bool) -> Self { self.description.enabled = enabled; self }
     pub fn checked(mut self, checked: bool) -> Self { self.description.checked = checked; self }
 }
@@ -99,9 +114,10 @@ fn validate<S>(items: &[MenuItem<S>]) -> Result<(), MenuError> {
     let mut ids = std::collections::HashSet::new();
     for item in items {
         let d = &item.description;
+        if matches!(&d.location, Location::Named(title) if title.trim().is_empty()) { return Err(MenuError::Invalid("empty menu title".into())); }
+        if d.separator { continue; }
         if d.id.trim().is_empty() || d.title.trim().is_empty() { return Err(MenuError::Invalid("empty id or title".into())); }
         if !ids.insert(&d.id) { return Err(MenuError::Invalid(format!("duplicate id {}", d.id))); }
-        if matches!(&d.location, Location::Named(title) if title.trim().is_empty()) { return Err(MenuError::Invalid("empty menu title".into())); }
     }
     Ok(())
 }
@@ -139,15 +155,25 @@ impl<S: 'static> AppHandle<S> {
 
 fn lookup<S>(state: &State<S>, selector: &str) -> Result<usize, MenuError> {
     if !state.running { return Err(MenuError::NotRunning); }
-    let index = if let Some(index) = state.items.iter().position(|i| i.description.id == selector) { index }
+    let items = state.items.iter().enumerate().filter(|(_, i)| !i.description.separator);
+    let index = if let Some((index, _)) = items.clone().find(|(_, i)| i.description.id == selector) { index }
     else {
-        let mut matches = state.items.iter().enumerate().filter(|(_, i)| i.description.title == selector);
+        let mut matches = items.filter(|(_, i)| i.description.title == selector);
         let index = matches.next().ok_or_else(|| MenuError::UnknownItem(selector.into()))?.0;
         if matches.next().is_some() { return Err(MenuError::AmbiguousTitle(selector.into())); }
         index
     };
     if !state.items[index].description.enabled { return Err(MenuError::Disabled(selector.into())); }
     Ok(index)
+}
+
+/// The window host, for a key press it maps to `key`: what to do if no handler takes it, when
+/// a menu item (a standard ⌘W or ⌘M, or `MenuItem::keys_first`) is handing Rune that key.
+pub(crate) fn take_unhandled(key: Option<&crate::KeyEvent>) -> Option<crate::runtime::Unhandled> {
+    #[cfg(target_os = "macos")]
+    { key.and_then(standard_macos::take_unhandled) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = key; None }
 }
 
 pub(crate) fn fire<S: 'static>(shared: &Arc<Shared<S>>, selector: &str) -> Result<(), MenuError> {
@@ -293,12 +319,29 @@ mod tests {
     }
 
     #[test]
+    fn separators_need_no_ids_and_never_fire() {
+        let file = |title: &str| MenuItem::new(title, |s: &mut Vec<u32>, _| s.push(3)).menu("File");
+        let app = app().menu_item(file("New")).menu_item(MenuItem::separator().menu("File"))
+            .menu_item(file("Close")).menu_item(MenuItem::separator().menu("File")).menu_item(MenuItem::separator().dock());
+        let _guard = Guard::attach(&app.shared, true);
+        assert!(app.handle().take_menu_errors().is_empty());
+        assert_eq!(fire(&app.shared, ""), Err(MenuError::UnknownItem(String::new())));
+        fire(&app.shared, "Close").unwrap();
+        let mut state = Vec::new(); drain(&app, &mut state);
+        assert_eq!(state, [3]);
+        app.handle().set_menu([file("New"), MenuItem::separator().menu("File"), MenuItem::separator().menu("File")]).unwrap();
+        assert!(app.shared.menus.0.lock().unwrap().items[1].description.separator);
+        assert!(matches!(app.handle().set_menu([MenuItem::separator().menu(" ")]), Err(MenuError::Invalid(_))));
+    }
+
+    #[test]
     fn equivalent_and_non_send_state_remain_builder_compatible() {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<AppHandle<std::rc::Rc<()>>>();
         let shortcut: Shortcut = "cmd+shift+k".parse().unwrap();
         let item = item("quick").key_equivalent(shortcut.clone());
         assert_eq!(item.description.equivalent, Some(shortcut));
+        assert!(!item.description.keys_first && item.keys_first().description.keys_first);
     }
 
     #[cfg(not(target_os = "macos"))]

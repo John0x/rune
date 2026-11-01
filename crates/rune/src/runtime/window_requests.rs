@@ -34,7 +34,7 @@ impl<S: 'static> Runtime<S> {
         let jump = first || tx.instant || tx.relayout || self.reduced_motion;
         // Only a macOS window and headless runs move the frame on a spring.
         if !jump && self.window_resting && (cfg!(target_os = "macos") || self.wall_start.is_none()) { self.fit_hold = true; }
-        let request = crate::window_frame::FrameRequest {
+        let request = crate::window::frame::FrameRequest {
             size: Some((self.viewport.0, height)), animate: !jump,
             spring: (!jump).then(|| tx.motion.unwrap_or(motion::DEFAULT)), center: false,
         };
@@ -43,10 +43,14 @@ impl<S: 'static> Runtime<S> {
 
     /// The root's natural height at the current width, measured without committing, so a
     /// window that fits its content can open at that height.
-    pub(crate) fn content_height(&mut self) -> f32 {
-        let measured = self.measure(&Tx::default());
+    pub fn content_height(&mut self) -> f32 {
+        let measured = self.measure_pass(&Tx::default(), false);
         let height = measured.nodes.first().map_or(self.viewport.1, |root| root.local.h);
-        self.layout = measured.layout;
+        self.discard_measured(measured);
         height.ceil_to(self.env.scale).max(1.0)
+    }
+
+    pub fn set_fit_content_height(&mut self, on: bool) {
+        self.fit_height = on;
     }
 }

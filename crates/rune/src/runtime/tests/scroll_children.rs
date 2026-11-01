@@ -1,16 +1,17 @@
 use super::*;
 use crate::el::{GrowthSpec, ScrollSpec, row};
 
+fn fifty_rows_view(_: &(), _: &mut Cx<()>) -> El {
+    col()
+        .key("scroll")
+        .size(200.0, 200.0)
+        .scroll(ScrollSpec { stick_bottom: false })
+        .children((0..50).map(|i| row().key(format!("r{i}")).w_full().h(30.0)))
+}
+
 #[test]
 fn scroll_with_fifty_direct_row_children_scrolls_to_the_last_row() {
-    fn view(_: &(), _: &mut Cx<()>) -> El {
-        col()
-            .key("scroll")
-            .size(200.0, 200.0)
-            .scroll(ScrollSpec { stick_bottom: false })
-            .children((0..50).map(|i| row().key(format!("r{i}")).w_full().h(30.0)))
-    }
-    let mut rt = Runtime::new((), view, (200.0, 200.0), Env::new(true, 1.0));
+    let mut rt = Runtime::new((), fifty_rows_view, (200.0, 200.0), Env::new(true, 1.0));
     rt.frame(0.0);
     let last = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("r49")).unwrap();
     assert_eq!(last.rect[1], 1470.0);
@@ -74,14 +75,7 @@ fn stick_bottom_with_several_direct_children_stays_pinned_as_rows_arrive() {
 
 #[test]
 fn scroll_into_view_reaches_the_fortieth_direct_child() {
-    fn view(_: &(), _: &mut Cx<()>) -> El {
-        col()
-            .key("scroll")
-            .size(200.0, 200.0)
-            .scroll(ScrollSpec { stick_bottom: false })
-            .children((0..50).map(|i| row().key(format!("r{i}")).w_full().h(30.0)))
-    }
-    let mut rt = Runtime::new((), view, (200.0, 200.0), Env::new(true, 1.0));
+    let mut rt = Runtime::new((), fifty_rows_view, (200.0, 200.0), Env::new(true, 1.0));
     rt.frame(0.0);
     rt.update(|_, tx| tx.scroll_into_view("r39"));
     rt.frame(1.0 / 60.0);
@@ -236,3 +230,36 @@ fn scroll_x_with_multiple_children_unwraps_w_full_text_column() {
 }
 
 
+#[test]
+fn scroll_into_view_of_a_virtual_row_taller_than_the_viewport_lands_its_end_from_above() {
+    // Short rows, one 500pt row in a 200pt viewport, and a varying tail after it.
+    fn view(tail: &usize, _: &mut Cx<usize>) -> El {
+        let n = 31 + *tail;
+        let stack = col()
+            .key("rows")
+            .w_full()
+            .growth(GrowthSpec::default())
+            .virtual_rows(n, 20.0, |_: &usize, i| format!("r{i}").into(), |_: &usize, i| {
+                row().w_full().h(if i == 30 { 500.0 } else { 20.0 })
+            });
+        col()
+            .key("scroll")
+            .size(200.0, 200.0)
+            .scroll(ScrollSpec { stick_bottom: false })
+            .child(stack)
+    }
+    for tail in [0usize, 1, 2, 5] {
+        let mut rt = Runtime::new(tail, view, (200.0, 200.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt.update(|_, tx| tx.scroll_into_view("r30"));
+        for _ in 0..30 {
+            rt.frame(1.0 / 120.0);
+        }
+        let r30 = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("r30")).expect("r30 revealed");
+        assert!(
+            (r30.rect[1] + r30.rect[3] - 200.0).abs() < 0.05,
+            "tail {tail}: moving down, the row's end lands at the viewport's bottom, not its top: {:?}",
+            r30.rect
+        );
+    }
+}

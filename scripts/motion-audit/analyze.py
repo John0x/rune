@@ -17,7 +17,10 @@ looks wrong:
   overshoot        an edge passes its rest value and comes back
   jiggle           an edge reverses direction twice or more within one motion
   reversal         one motion heads the wrong way first, or goes out and comes back
-  dog-leg          a move's route is much longer than the straight line between its ends
+  stall            one motion's speed drops for a frame and picks up again (a retarget that
+                   lost part of its velocity)
+  dog-leg          a move's route is much longer than the straight line between its ends, on
+                   screen and against its parent
   latency          input whose first visible response comes frames later
   hitch            frame CPU over budget during motion
 
@@ -44,6 +47,10 @@ POP_OPACITY = 0.5
 JUMP_PT = 12.0
 # Frames at rest a motion segment bridges (see the segments in `analyze`).
 SEG_GAP = 2
+# A one-frame speed dip worth reporting: at least this many points a frame, and this share of
+# the slower neighbour's speed (a spring's speed never has a corner).
+STALL_PT = 0.5
+STALL_SHARE = 0.25
 MIN_AREA = 1.0
 SCROLLING = 4  # flags: under a scroll viewport whose offset moved this frame
 BLANK = 64  # flags: draws nothing and holds nothing (a hit or hover zone, a spacer)
@@ -56,7 +63,7 @@ def short(name, parts=3):
 
 
 class El:
-    __slots__ = ("id", "name", "parent", "rect", "op", "flags", "vis", "born", "hist", "ever_drawn")
+    __slots__ = ("id", "name", "parent", "rect", "op", "flags", "vis", "born", "hist", "ever_drawn", "scrolled")
 
     def __init__(self, id, name, parent):
         self.id, self.name, self.parent = id, name, parent
@@ -66,7 +73,10 @@ class El:
         self.vis = None
         self.born = None
         self.ever_drawn = False  # had area at some point (spacers never do)
-        self.hist = []  # (frame, x, y, w, h, op, flags, visible-area-fraction, on-screen)
+        self.scrolled = (0.0, 0.0)  # how far scrolling carries it, x and y (the trace's `sc`)
+        # (frame, x, y, w, h, op, flags, visible-area-fraction, on-screen, scrolled x, scrolled y,
+        #  shown x, y, w, h: the visible part in the window, as `shown`)
+        self.hist = []
 
 
 def area(r):
@@ -82,6 +92,12 @@ def visible_part(e, W, H):
     x0, y0 = max(r[0], 0), max(r[1], 0)
     x1, y1 = min(r[0] + r[2], W), min(r[1] + r[3], H)
     return [x0, y0, max(x1 - x0, 0), max(y1 - y0, 0)]
+
+
+def shown(vp, W, H):
+    """What shows, where one wholly past the window's edge would come in. Jumps and steps are
+    judged on it: an edge its clips hide on both frames moves nobody can see."""
+    return (min(vp[0], W), min(vp[1], H), vp[2], vp[3])
 
 
 def seen(e, W, H):
@@ -136,6 +152,32 @@ def loop_ids(els, moved):
         grew = bool(more)
         out |= more
     return out
+
+
+def unscrolled(h):
+    """History rows against the content they scroll with: a node gliding inside a list that
+    follows its end makes one motion there, however the scroll adds to it on screen."""
+    return [(st[0], st[1] + st[9], st[2] + st[10], *st[3:]) for st in h]
+
+
+def stalled(parent, edge, pts, travel):
+    """The first frame of one motion (`pts`, consecutive history rows) whose speed along
+    `travel` dips below both neighbours' and recovers, with the three speeds; one that rides
+    its parent (`parent`, its rows) is the parent's to report."""
+    ph = {x[0]: x for x in parent}
+    sign = math.copysign(1, travel)
+    for m in range(2, len(pts) - 1):
+        if pts[m + 1][0] - pts[m - 2][0] != 3:
+            continue
+        u = [(pts[m + j][edge] - pts[m + j - 1][edge]) * sign for j in (-1, 0, 1)]
+        floor = min(u[0], u[2])
+        if floor <= STALL_PT or u[1] >= floor - max(STALL_PT, STALL_SHARE * floor):
+            continue
+        k = pts[m][0]
+        if k in ph and k - 1 in ph and abs((ph[k][edge] - ph[k - 1][edge]) - (pts[m][edge] - pts[m - 1][edge])) < 0.05:
+            continue
+        return k, u
+    return None
 
 
 def analyze(path, script=None):
@@ -194,16 +236,19 @@ def analyze(path, script=None):
                 if k > 0:
                     births[k].append(id)
             changed.add(id)
+        for id, sx, sy in fr.get("sc", []):
+            els[id].scrolled = (sx, sy)
         for id in fr.get("g", []):
             if id in alive:
                 alive.discard(id)
                 e = els[id]
+                e.scrolled = (0.0, 0.0)
                 deaths[k].append((id, e.rect, e.op, seen(e, W, H) and not e.flags & BLANK))
         for id in alive:
             e = els[id]
             vp = visible_part(e, W, H)
             frac = area(vp) / area(e.rect) if area(e.rect) > 0 else 0.0
-            e.hist.append((k, *e.rect, e.op, e.flags, frac, on_screen(e.rect, W, H)))
+            e.hist.append((k, *e.rect, e.op, e.flags, frac, on_screen(e.rect, W, H), *e.scrolled, *shown(vp, W, H)))
             if e.flags & SCROLLING:
                 scrolled[k].add(e.name.rpartition("/")[0])
         q = fr.get("quality", {})
@@ -304,8 +349,24 @@ def analyze(path, script=None):
         by_why = defaultdict(list)
         for k, why in idle:
             by_why[why].append(k)
+        settle_cap = math.ceil(120.0 / dt_ms)
         for why, ks in by_why.items():
             rs = runs(ks)
+            # A scaled layer's 100 ms sub-pixel settle eases `r` onto the device grid after motion
+            # while `self.drawn` (`r_exact`) is already still; flag only cold or overrun runs.
+            if why == ("scale-settle",):
+                bad_rs = []
+                for a, b in rs:
+                    p = a - 1
+                    while p >= 0 and tuple(frames[p].get("quality", {}).get("why", [])) == ("scale-settle",):
+                        p -= 1
+                    warm = (p >= 0 and animating[p]) or (p + 1 < a and changed_by_frame[p + 1])
+                    if not warm or b - p > settle_cap:
+                        bad_rs.append((a, b))
+                rs = bad_rs
+                ks = [k for a, b in rs for k in range(a, b + 1)]
+                if not ks:
+                    continue
             findings.append(dict(kind="idle-frames", element="(frame)", frames=len(ks), longest=max(b - a + 1 for a, b in rs),
                                  at=fmt_runs(rs), detail=f"{len(ks)} frames animating ({'+'.join(why) or '?'}) with no traced change"))
     last_input = max((k for k, _ in inputs), default=0)
@@ -346,7 +407,7 @@ def analyze(path, script=None):
             h = [x for x in e.hist if x[0] >= k][:3]
             if not h:
                 continue
-            k0, x, y, w, hh, op, flags, frac, ons = h[0]
+            k0, x, y, w, hh, op, flags, frac, ons = h[0][:9]
             # A viewport's content entering as it scrolls (a virtual list mounting the rows an
             # instant scroll lands on) is the scroll, which jumps already exempt, not a pop.
             if op < POP_OPACITY or frac == 0 or not ons or w * hh < 4 or flags & (SCROLLING | BLANK):
@@ -379,10 +440,42 @@ def analyze(path, script=None):
         for i, *_ in items:
             changed_parents[k].add(els[i].parent)
     pressing = [bool(fr.get("k")) for fr in frames]
+    kids = defaultdict(list)
+    for e in els.values():
+        kids[e.parent].append(e)
+    at_frame = {}
+
+    def at(e, k):
+        if e.id not in at_frame:
+            at_frame[e.id] = {st[0]: st for st in e.hist}
+        return at_frame[e.id].get(k)
+
+    def carries(e, k, edge, step, entering):
+        """Whether something `e` holds shows on frames k - 1 and k and moves there by `step` with
+        it, as a scroll's rows do when its content jumps though its visible part stays put. With
+        `entering`, also one it brings into view from just off it: content that teleports pops in
+        a row that didn't show the frame before."""
+        if edge > 2:
+            return False
+        for c in kids.get(e.id, ()):
+            a, b = at(c, k - 1), at(c, k)
+            if not (a and b):
+                continue
+            if b[7] > 0 and abs(b[edge] - a[edge] - step) < 0.25:
+                if a[7] > 0 and abs(b[10 + edge] - a[10 + edge] - step) < 0.25:
+                    return True
+                if entering and a[7] == 0 and b[5] >= POP_OPACITY and not b[6] & BLANK:
+                    return True
+            if carries(c, k, edge, step, entering):
+                return True
+        return False
+
     for e in els.values():
         h = e.hist
         if len(h) < 3 or e.id in loops:
             continue
+        mine = unscrolled(h)
+        theirs = unscrolled(parent.hist) if (parent := els.get(e.parent)) else []
         # Only report the outermost element of a group moving together.
         for edge, label in ((1, "x"), (2, "y"), (3, "w"), (4, "h")):
             d = [h[i][edge] - h[i - 1][edge] if h[i][0] == h[i - 1][0] + 1 else 0.0 for i in range(1, len(h))]
@@ -392,7 +485,13 @@ def analyze(path, script=None):
                 if abs(step) < JUMP_PT:
                     continue
                 st, prev = h[i], h[i - 1]
-                if pressing[k] or st[6] & (4 | BLANK):
+                if pressing[k] or st[6] & BLANK:
+                    continue
+                # A scroll under a hand, or one gliding over frames, moves as it should. One that
+                # lands in a single frame with nothing asking for it is a teleport.
+                scrolling = (st[6] | prev[6]) & SCROLLING
+                hand = interrupted(k - 2, k)
+                if scrolling and hand:
                     continue
                 # A move nobody sees on either side isn't a jump: a loop wrapping while it's
                 # transparent or clipped away (a shimmer's sheen going back to its start).
@@ -401,11 +500,19 @@ def analyze(path, script=None):
                 intent = st[6] >> 8
                 if intent & (1 if label in "xy" else 2):
                     continue
-                before = d[i - 2] if i >= 2 else 0.0
-                after = d[i] if i < len(d) else 0.0
+                # Judged on what shows: its visible part moves, or what it holds that shows does.
+                # A fold dropping its rows above the window steps its top and height with the
+                # scroll offset, and nothing that shows moves, or it starts to glide from where
+                # it showed.
+                clipped = any(s[7] < 0.999 for s in (prev, st))
+                at_edge = edge if clipped and carries(e, k, edge, step, not hand) else 10 + edge
+                sd = lambda j: h[j][at_edge] - h[j - 1][at_edge] if 0 < j < len(h) and h[j][0] == h[j - 1][0] + 1 else 0.0
+                if abs(sd(i)) < JUMP_PT:
+                    continue
+                before, after = sd(i - 1), sd(i + 1)
                 if abs(before) < 1.0 and abs(after) < 1.0:
                     kind = "sibling-jump" if any(els.get(e.parent) and p == e.parent for p in changed_parents.get(k, ())) else "jump"
-                elif abs(step) > 3 * max(abs(before), abs(after), 1.0):
+                elif not scrolling and abs(sd(i)) > 3 * max(abs(before), abs(after), 1.0):
                     kind = "step"
                 else:
                     continue
@@ -415,9 +522,11 @@ def analyze(path, script=None):
                     if k in ph and k - 1 in ph and abs((ph[k][edge] - ph[k - 1][edge]) - step) < 0.5 and label in "xy":
                         continue  # rides its parent; the parent reports it
                 findings.append(dict(kind=kind, element=e.name, frames=1, longest=1, at=str(k),
-                                     detail=f"{label} {h[i - 1][edge]:.1f} → {st[edge]:.1f} ({step:+.1f}pt) in one frame; neighbours {before:+.1f}/{after:+.1f}"))
-            # motion segments. A motion may rest a frame or two where it turns (an out-and-back
-            # through its start), so up to SEG_GAP frames at rest don't end one.
+                                     detail=f"{label} {prev[at_edge]:.1f} → {st[at_edge]:.1f} ({sd(i):+.1f}pt) in one frame; neighbours {before:+.1f}/{after:+.1f}"))
+            # motion segments, against the scroll. A motion may rest a frame or two where it
+            # turns (an out-and-back through its start), so up to SEG_GAP frames at rest don't
+            # end one.
+            h = mine
             seg = []
             for i in range(1, len(h)):
                 moving = h[i][0] - h[i - 1][0] <= SEG_GAP + 1 and abs(h[i][edge] - h[i - 1][edge]) > 0.01
@@ -430,7 +539,7 @@ def analyze(path, script=None):
                     if all(h[j][5] <= 0.05 or not h[j][8] for j in seg):
                         seg = []
                         continue
-                    if any(pressing[h[j][0]] or h[j][6] & (4 | BLANK) for j in seg):
+                    if any(pressing[h[j][0]] or h[j][6] & BLANK for j in seg):
                         seg = []
                         continue
                     rest = vals[-1]
@@ -440,6 +549,7 @@ def analyze(path, script=None):
                     reversals = sum(1 for a, b in zip(signs, signs[1:]) if a != b)
                     past = max(((v - rest) * math.copysign(1, travel) for v in vals), default=0) if abs(travel) > 0.5 else 0
                     k0, k1 = h[seg[0]][0], h[seg[-1]][0]
+                    found = len(findings)
                     if past > 1.0:
                         findings.append(dict(kind="overshoot", element=e.name, frames=k1 - k0 + 1, longest=k1 - k0 + 1, at=f"{k0}–{k1}",
                                              detail=f"{label} {start:.1f} → {rest:.1f}, overshoots by {past:.1f}pt ({100 * past / abs(travel):.0f}%)"))
@@ -459,11 +569,20 @@ def analyze(path, script=None):
                         if back > 1.0:
                             findings.append(dict(kind="reversal", element=e.name, frames=k1 - k0 + 1, longest=k1 - k0 + 1, at=f"{k0}–{k1}",
                                                  detail=what))
+                    if len(findings) == found and abs(travel) > 0.5:
+                        stall = stalled(theirs, edge, [h[seg[0] - 1]] + [h[j] for j in seg], travel)
+                        if stall:
+                            k, u = stall
+                            findings.append(dict(kind="stall", element=e.name, frames=1, longest=1, at=str(k),
+                                                 detail=f"{label} speed {u[0]:.1f} → {u[1]:.1f} → {u[2]:.1f} pt/frame ({start:.1f} → {rest:.1f})"))
                 if not moving:
                     seg = []
-        # One straight path: the top-left corner's route against its chord, per continuous move.
+            h = e.hist
+        # One straight path: the top-left corner's route against its chord, per continuous move,
+        # against the scroll.
+        h = mine
         seg = []
-        ph = {x[0]: x for x in parent.hist} if (parent := els.get(e.parent)) else {}
+        ph = {x[0]: x for x in theirs}
         for i in range(1, len(h) + 1):
             if i < len(h) and h[i][0] == h[i - 1][0] + 1 and (abs(h[i][1] - h[i - 1][1]) > 0.01 or abs(h[i][2] - h[i - 1][2]) > 0.01):
                 seg.append(i)
@@ -478,6 +597,14 @@ def analyze(path, script=None):
                 if not (hidden or held or rides or interrupted(k0, k1)):
                     route = sum(math.hypot(p[1] - q[1], p[2] - q[2]) for q, p in zip(pts, pts[1:]))
                     chord = math.hypot(pts[-1][1] - pts[0][1], pts[-1][2] - pts[0][2])
+                    # Its own move on a moving parent (a chevron sliding along a row as the list
+                    # scrolls) bends only by the parent's: straight against the parent is one path.
+                    if all(p[0] in ph for p in pts):
+                        rel = [(p[1] - ph[p[0]][1], p[2] - ph[p[0]][2]) for p in pts]
+                        own = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(rel, rel[1:]))
+                        bent = own > 1.2 * math.hypot(rel[-1][0] - rel[0][0], rel[-1][1] - rel[0][1])
+                        if own < route - 0.01 and (own <= JUMP_PT or not bent):
+                            route = chord
                     if chord > JUMP_PT and route > 1.2 * chord:
                         findings.append(dict(kind="dog-leg", element=e.name, frames=k1 - k0 + 1, longest=k1 - k0 + 1, at=f"{k0}–{k1}",
                                              detail=f"({pts[0][1]:.0f},{pts[0][2]:.0f}) → ({pts[-1][1]:.0f},{pts[-1][2]:.0f}) travels {route:.0f}pt for a {chord:.0f}pt move"))
