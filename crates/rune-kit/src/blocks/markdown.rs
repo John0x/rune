@@ -9,6 +9,9 @@ use rune::{Mark, MarkRange};
 
 use super::{Block, COLORS, Kind};
 
+/// What a pill's link starts with.
+const MENTION: &str = "mention:";
+
 /// The markers that start a toggle's text: closed, open.
 const TOGGLE: [&str; 2] = ["▸ ", "▾ "];
 
@@ -34,6 +37,8 @@ struct Reader {
     /// The block being read, and whether it's a list item's own.
     current: Option<(Part, bool)>,
     open: Vec<(Mark, usize)>,
+    /// The image being read: its source and alternative text.
+    image: Option<(String, String)>,
 }
 
 impl Reader {
@@ -90,6 +95,19 @@ impl Reader {
         }
     }
 
+    /// An image is a block of its own: an empty paragraph it starts goes.
+    fn close_image(&mut self) {
+        let Some((src, alt)) = self.image.take() else { return };
+        if self.current.as_ref().is_some_and(|((kind, _, text, _), own)| {
+            *kind == Kind::Paragraph && text.is_empty() && !*own
+        }) {
+            self.current = None;
+        }
+        let depth = self.depth();
+        self.start(Kind::Image { src, alt }, depth);
+        self.flush();
+    }
+
     fn start(&mut self, kind: Kind, indent: u8) {
         self.flush();
         self.current = Some(((kind, indent, String::new(), Vec::new()), false));
@@ -135,6 +153,11 @@ impl Reader {
         match event {
             Event::Start(tag) => self.open_tag(tag),
             Event::End(tag) => self.close_tag(tag),
+            Event::Text(t) if self.image.is_some() => {
+                if let Some((_, alt)) = &mut self.image {
+                    alt.push_str(&t);
+                }
+            }
             Event::Text(t) | Event::Html(t) => self.text(&t),
             Event::InlineHtml(t) => self.html(&t),
             Event::Code(t) => {
@@ -202,7 +225,14 @@ impl Reader {
             Tag::Strong => self.open.push((Mark::Bold, self.len())),
             Tag::Emphasis => self.open.push((Mark::Italic, self.len())),
             Tag::Strikethrough => self.open.push((Mark::Strike, self.len())),
-            Tag::Link { dest_url, .. } => self.open.push((Mark::Link(dest_url.into_string()), self.len())),
+            Tag::Link { dest_url, .. } => {
+                let mark = match dest_url.strip_prefix(MENTION) {
+                    Some(id) => Mark::Pill(id.replace("%20", " ")),
+                    None => Mark::Link(dest_url.into_string()),
+                };
+                self.open.push((mark, self.len()));
+            }
+            Tag::Image { dest_url, .. } => self.image = Some((dest_url.into_string(), String::new())),
             _ => {}
         }
     }
@@ -220,6 +250,7 @@ impl Reader {
                 }
                 self.flush();
             }
+            TagEnd::Image => self.close_image(),
             TagEnd::TableCell => self.text(" | "),
             TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link => {
                 if let Some((mark, start)) = self.open.pop() {
@@ -294,6 +325,10 @@ fn write_block(out: &mut String, b: &Block, pad: &str, number: usize) {
             out.push_str("---");
             return;
         }
+        Kind::Image { src, alt } => {
+            out.push_str(&format!("{pad}![{}]({src})", escape(alt)));
+            return;
+        }
         Kind::Code { language } => {
             let fence = "`".repeat(longest_run(text, '`').max(2) + 1);
             out.push_str(&format!("{pad}{fence}{language}\n"));
@@ -343,7 +378,7 @@ fn escape_start(body: &str) -> String {
 /// The order marks nest in, outermost first; [`UNWRITTEN`] for those Markdown drops.
 fn rank(mark: &Mark) -> u8 {
     match mark {
-        Mark::Link(_) => 0,
+        Mark::Link(_) | Mark::Pill(_) => 0,
         Mark::Bold => 1,
         Mark::Italic => 2,
         Mark::Color(_) => 3,
@@ -364,7 +399,7 @@ fn opener(mark: &Mark, code: &str) -> String {
         Mark::Italic => "*".into(),
         Mark::Underline => "<u>".into(),
         Mark::Strike => "~~".into(),
-        Mark::Link(_) => "[".into(),
+        Mark::Link(_) | Mark::Pill(_) => "[".into(),
         Mark::Code => code.into(),
         Mark::Color(n) => format!("<mark class=\"highlight-{}\">", color(n)),
         Mark::Highlight(n) => format!("<mark class=\"highlight-{}_background\">", color(n)),
@@ -375,6 +410,7 @@ fn opener(mark: &Mark, code: &str) -> String {
 fn closer(mark: &Mark, code: &str) -> String {
     match mark {
         Mark::Link(url) => format!("]({url})"),
+        Mark::Pill(id) => format!("]({MENTION}{})", id.replace(' ', "%20")),
         Mark::Underline => "</u>".into(),
         Mark::Color(_) | Mark::Highlight(_) => "</mark>".into(),
         mark => opener(mark, code),
@@ -455,4 +491,40 @@ fn escape(text: &str) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod image_and_mention_tests {
+    use super::super::Blocks;
+    use super::*;
+
+    #[test]
+    fn an_image_is_a_block_and_survives_markdown() {
+        let source = "Before\n\n![a shot](images/abc.png)\n\nAfter";
+        let doc = Blocks::from_markdown(source);
+        let kinds: Vec<&Kind> = doc.blocks().iter().map(|b| &b.kind).collect();
+        assert_eq!(kinds.len(), 3);
+        assert_eq!(kinds[1], &Kind::Image { src: "images/abc.png".into(), alt: "a shot".into() });
+        assert_eq!(doc.to_markdown().trim_end(), source);
+    }
+
+    #[test]
+    fn a_mention_is_a_pill_and_survives_markdown() {
+        let source = "See [test file.ts](mention:file:src/test%20file.ts) now";
+        let doc = Blocks::from_markdown(source);
+        let block = &doc.blocks()[0];
+        assert_eq!(block.text(), "See test file.ts now");
+        assert!(block.marks().iter().any(|m| m.mark == Mark::Pill("file:src/test file.ts".into())));
+        assert_eq!(doc.to_markdown().trim_end(), source);
+    }
+
+    #[test]
+    fn an_inserted_image_leaves_a_block_to_type_in() {
+        let mut doc = Blocks::new();
+        doc.focus_start();
+        doc.insert_image("images/a.png", "");
+        assert!(matches!(doc.blocks()[0].kind, Kind::Image { .. }));
+        assert_eq!(doc.blocks()[1].kind, Kind::Paragraph);
+        assert!(doc.blocks()[1].edit.focused);
+    }
 }

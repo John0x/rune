@@ -211,7 +211,7 @@ pub fn selection_area<S: 'static>(
 ) -> El {
     let key = format!("{editor}-area");
     let origin = cx.layout_with(&key, |r| [r[0], r[1]]);
-    let wire = Wire { access: Rc::new(access), change: None, editor: editor.into() };
+    let wire = Wire { access: Rc::new(access), change: None, paste: None, editor: editor.into() };
     let rows = Rows::read(cx, editor, doc);
     col()
         .key(key)

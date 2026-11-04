@@ -14,6 +14,12 @@
 //! it, and opens its menu when clicked. A toggle hides the blocks nested under it while closed.
 //! Undo and redo cover the whole document. A document reads and writes Markdown.
 //!
+//! The app can offer an `@` menu (files, people, agents): it reads what's typed with
+//! [`Blocks::mention_query`] and answers with [`Blocks::set_mention_items`]; what's picked becomes
+//! a pill, `[label](mention:id)` in Markdown. [`BlockEditor::image`] shows image blocks
+//! (`![alt](src)`, added with [`Blocks::insert_image`]), and [`BlockEditor::on_paste`] takes
+//! what's pasted first, an image say.
+//!
 //! The app owns a [`Blocks`] and binds a [`BlockEditor`] to it, mounting the slash menu's
 //! layer at its root like any overlay:
 //!
@@ -38,6 +44,7 @@ mod inline;
 mod keys;
 mod markdown;
 mod marquee;
+mod mention;
 mod menu;
 mod model;
 mod toolbar;
@@ -47,6 +54,7 @@ use rune::{Mark, MarkRange, TextEdit};
 
 pub use handle::GUTTER;
 pub use marquee::selection_area;
+pub use mention::MentionItem;
 pub use view::BlockEditor;
 
 /// What a block is.
@@ -70,6 +78,11 @@ pub enum Kind {
         language: String,
     },
     Divider,
+    /// An image: what the app's [`BlockEditor::image`] shows for `src`.
+    Image {
+        src: String,
+        alt: String,
+    },
 }
 
 impl Kind {
@@ -87,6 +100,7 @@ impl Kind {
             Kind::Toggle { .. } => "Toggle list",
             Kind::Code { .. } => "Code",
             Kind::Divider => "Divider",
+            Kind::Image { .. } => "Image",
         }
     }
 
@@ -97,12 +111,12 @@ impl Kind {
 
     /// Whether it holds text (all but dividers).
     pub fn has_text(&self) -> bool {
-        !matches!(self, Kind::Divider)
+        !matches!(self, Kind::Divider | Kind::Image { .. })
     }
 
     /// Whether its text takes inline formatting (all but code and dividers).
     pub fn is_rich(&self) -> bool {
-        !matches!(self, Kind::Code { .. } | Kind::Divider)
+        !matches!(self, Kind::Code { .. } | Kind::Divider | Kind::Image { .. })
     }
 }
 
@@ -143,6 +157,9 @@ pub struct Blocks {
     /// Blocks selected whole, from `anchor` to `head` (ids), after Escape or a drag.
     selection: Option<Selection>,
     menu: Option<menu::SlashMenu>,
+    /// The `@` menu, open, and what the app offers in it.
+    mention: Option<mention::MentionMenu>,
+    mention_items: Vec<MentionItem>,
     drag: Option<handle::BlockDrag>,
     /// The block whose ⋮⋮ opened its menu, and where (window points).
     block_menu: Option<(u64, [f32; 2])>,
@@ -208,6 +225,8 @@ impl Blocks {
             next_id: 1,
             selection: None,
             menu: None,
+            mention: None,
+            mention_items: Vec::new(),
             drag: None,
             block_menu: None,
             block_colors: false,
@@ -261,6 +280,27 @@ impl Blocks {
         }
         self.selection = None;
         self.menu = None;
+        self.mention = None;
+    }
+
+    /// Adds an image after the focused block (in its place, if that's an empty paragraph), or
+    /// at the end; the caret goes to the text block after it.
+    pub fn insert_image(&mut self, src: impl Into<String>, alt: impl Into<String>) {
+        let kind = Kind::Image { src: src.into(), alt: alt.into() };
+        let focused = self.focused();
+        let replaces = focused.filter(|&i| self.list[i].kind == Kind::Paragraph && self.list[i].edit.text.is_empty());
+        let at = replaces.or(focused.map(|i| i + 1)).unwrap_or(self.list.len());
+        let indent = focused.map_or(0, |i| self.list[i].indent);
+        if let Some(i) = replaces {
+            self.list.remove(i);
+        }
+        self.insert(at, kind, indent, "", Vec::new());
+        if self.list.get(at + 1).is_none_or(|b| !b.kind.has_text()) {
+            self.insert(at + 1, Kind::Paragraph, indent, "", Vec::new());
+        } else {
+            self.focus(at + 1, 0);
+        }
+        self.commit(None);
     }
 
     /// Whether one of the blocks has keyboard focus.

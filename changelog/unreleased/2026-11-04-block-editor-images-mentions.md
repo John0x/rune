@@ -1,0 +1,1 @@
+- **`rune_kit::blocks`: images and an `@` menu.** `Kind::Image` is a block of its own (`![alt](src)`; `Blocks::insert_image`, shown with `BlockEditor::image`), `BlockEditor::on_paste` takes what's pasted first, and `@` opens a menu of what the app offers (`Blocks::mention_query`, `Blocks::set_mention_items`), whose picks are pills: `[label](mention:id)` in Markdown.

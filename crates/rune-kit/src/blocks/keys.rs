@@ -83,6 +83,11 @@ impl Blocks {
             return self.selection_key(ev, tx);
         }
         self.last_block = Some(id);
+        if self.mention.is_some_and(|m| m.block == id)
+            && let Some(out) = self.mention_key(ev)
+        {
+            return out;
+        }
         if self.menu.is_some_and(|m| m.block == id)
             && let Some(out) = self.menu_key(ev)
         {
@@ -93,6 +98,35 @@ impl Blocks {
             self.commit(None);
         }
         out
+    }
+
+    /// The keys the `@` menu takes.
+    fn mention_key(&mut self, ev: &KeyEvent) -> Option<Outcome> {
+        if self.mention_items().is_empty() && ev.key != Key::Escape {
+            return None;
+        }
+        match ev.key {
+            Key::Up => {
+                self.mention_step(-1);
+                Some(Outcome::Handled)
+            }
+            Key::Down => {
+                self.mention_step(1);
+                Some(Outcome::Handled)
+            }
+            Key::Enter | Key::Tab if !ev.mods.shift => {
+                let done = self.mention_choose(None);
+                if done {
+                    self.commit(None);
+                }
+                Some(if done { Outcome::Changed } else { Outcome::Handled })
+            }
+            Key::Escape => {
+                self.mention = None;
+                Some(Outcome::Handled)
+            }
+            _ => None,
+        }
     }
 
     fn menu_key(&mut self, ev: &KeyEvent) -> Option<Outcome> {
@@ -401,12 +435,16 @@ impl Blocks {
         if self.menu.is_some_and(|m| m.block != id) {
             self.menu = None;
         }
+        if self.mention.is_some_and(|m| m.block != id) {
+            self.mention = None;
+        }
     }
 
     /// Block `id`'s text changed in its field (typing, IME, cut, a paste it took).
     pub(super) fn typed(&mut self, id: u64) {
         if let Some(i) = self.index(id) {
             self.update_menu(i);
+            self.update_mention(i);
         }
         self.commit(Some(id));
     }

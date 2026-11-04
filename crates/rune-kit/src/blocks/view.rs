@@ -25,6 +25,10 @@ type ChangeFn<S> = Rc<dyn Fn(&mut S, &mut Tx)>;
 type Decorate<'a> = Box<dyn Fn(&Block) -> Vec<Span> + 'a>;
 /// The app's element at the end of a block's row (see [`BlockEditor::aside`]).
 type Aside<'a> = Box<dyn Fn(&Block, bool) -> Option<El> + 'a>;
+/// What the app shows for an image block (see [`BlockEditor::image`]).
+type ImageView<'a> = Box<dyn Fn(&str, &str) -> El + 'a>;
+/// The app's turn at what's pasted (see [`BlockEditor::on_paste`]).
+type PasteFn<S> = Rc<dyn Fn(&mut S, &rune::ClipboardContent, &mut Tx) -> bool>;
 
 /// Width of the column [`BlockEditor::aside`] takes at the end of each row.
 const ASIDE: f32 = 28.0;
@@ -33,12 +37,18 @@ const ASIDE: f32 = 28.0;
 pub(super) struct Wire<S> {
     pub(super) access: Access<S>,
     pub(super) change: Option<ChangeFn<S>>,
+    pub(super) paste: Option<PasteFn<S>>,
     pub(super) editor: Rc<str>,
 }
 
 impl<S> Clone for Wire<S> {
     fn clone(&self) -> Self {
-        Wire { access: self.access.clone(), change: self.change.clone(), editor: self.editor.clone() }
+        Wire {
+            access: self.access.clone(),
+            change: self.change.clone(),
+            paste: self.paste.clone(),
+            editor: self.editor.clone(),
+        }
     }
 }
 
@@ -156,6 +166,8 @@ pub struct BlockEditor<'a, S> {
     placeholder: String,
     decorate: Option<Decorate<'a>>,
     aside: Option<Aside<'a>>,
+    image: Option<ImageView<'a>>,
+    paste: Option<PasteFn<S>>,
 }
 
 impl<'a, S: 'static> BlockEditor<'a, S> {
@@ -168,7 +180,21 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
             placeholder: String::new(),
             decorate: None,
             aside: None,
+            image: None,
+            paste: None,
         }
+    }
+
+    /// What an image block shows for its `src` and `alt`; its alternative text otherwise.
+    pub fn image(mut self, f: impl Fn(&str, &str) -> El + 'a) -> Self {
+        self.image = Some(Box::new(f));
+        self
+    }
+
+    /// Gets what's pasted first, an image say: true when it took it.
+    pub fn on_paste(mut self, f: impl Fn(&mut S, &rune::ClipboardContent, &mut Tx) -> bool + 'static) -> Self {
+        self.paste = Some(Rc::new(f));
+        self
     }
 
     /// What an empty document shows while it isn't focused.
@@ -210,6 +236,7 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
         let wire = self.access.clone().map(|access| Wire {
             access,
             change: self.change.clone(),
+            paste: self.paste.clone(),
             editor: self.key.as_str().into(),
         });
         let geometry = Rows::read(cx, &self.key, doc);
@@ -239,6 +266,7 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
                 .drag_autoscroll()
                 .on_drag(marquee::handler(wire, geometry.clone(), origin.map(|o| [o[0], o[1]])));
             menu(k, doc, wire, layer);
+            mention_menu(k, doc, wire, layer);
             handle::block_menu(k, doc, wire, layer);
             toolbar::toolbar(k, cx, doc, wire, layer);
         }
@@ -274,6 +302,10 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
             },
             spans: self.decorate.as_ref().map(|f| f(b)).unwrap_or_default(),
             aside: self.aside.as_ref().map(|f| f(b, doc.hovered == Some(b.id))),
+            image: match (&b.kind, &self.image) {
+                (Kind::Image { src, alt }, Some(f)) => Some(f(src, alt)),
+                _ => None,
+            },
         }
     }
 
@@ -312,11 +344,13 @@ struct Row<'r> {
     spans: Vec<Span>,
     /// The app's element at its end, when the editor has a column for one.
     aside: Option<Option<El>>,
+    /// What the app shows for it, an image block.
+    image: Option<El>,
 }
 
 impl Row<'_> {
     fn build<S: 'static>(
-        self,
+        mut self,
         k: &Kit,
         cx: &Cx<S>,
         doc: &Blocks,
@@ -345,6 +379,12 @@ impl Row<'_> {
                 .h(self.look.body.line_px())
                 .center_y()
                 .child(el().w_full().h(1.0).fill(self.look.rule)),
+            Kind::Image { alt, .. } => {
+                let shown = self.image.take();
+                col().key("image").grow(1.0).shrink().py(4.0).child(shown.unwrap_or_else(|| {
+                    text(alt.clone()).font(self.look.body).color(self.look.muted)
+                }))
+            }
             Kind::Code { .. } => {
                 let field = self.field(k, cx, doc, editor, wire, rows).w_full();
                 col().key("code").grow(1.0).shrink().radius(6.0).fill(self.look.fill).padding(14.0).child(field)
@@ -377,7 +417,7 @@ impl Row<'_> {
                     doc.hovered = None;
                 }
             });
-            if b.kind == Kind::Divider {
+            if !b.kind.has_text() {
                 let wire = wire.clone();
                 r = r.on_press(move |s: &mut S| (wire.access)(s).select(id, id));
             }
@@ -516,6 +556,11 @@ fn bind<S: 'static>(f: El, id: u64, caret: Option<Caret>, rows: Rows, wire: &Wir
             w3.changed(s, tx);
         })
         .on_input_paste(move |s: &mut S, content, tx| {
+            if let Some(paste) = &w4.paste
+                && paste(s, content, tx)
+            {
+                return true;
+            }
             let done = (w4.access)(s).paste(id, content);
             if done {
                 w4.changed(s, tx);
@@ -555,6 +600,37 @@ fn menu<S: 'static>(k: &Kit, doc: &Blocks, wire: &Wire<S>, layer: &mut Vec<El>) 
         })
         .on_choose(move |s: &mut S, id, tx| w2.edit(s, tx, |doc| doc.menu_choose(Some(id))))
         .on_close(move |s: &mut S| (w3.access)(s).menu = None)
+        .build(k, layer);
+}
+
+/// The `@` menu, when open: what the app offers.
+fn mention_menu<S: 'static>(k: &Kit, doc: &Blocks, wire: &Wire<S>, layer: &mut Vec<El>) {
+    let Some(m) = doc.mention else { return };
+    let items: Vec<PopupItem> = (doc.mention_items().iter())
+        .map(|item| {
+            let row = PopupItem::new(item.id.clone(), item.label.clone());
+            match &item.detail {
+                Some(detail) => row.trailing(text(detail.clone()).font(k.ty.small).color(k.c.text_faint)),
+                None => row,
+            }
+        })
+        .collect();
+    let (w1, w2, w3) = (wire.clone(), wire.clone(), wire.clone());
+    PopupList::new(format!("{}-mentions", wire.editor), field_key(&wire.editor, m.block))
+        .anchored(field_key(&wire.editor, m.block), Side::Bottom, Align::Start, 6.0)
+        .width(320.0)
+        .max_height(340.0)
+        .items(items)
+        .active(Some(m.active))
+        .empty_message("Nothing matches")
+        .label("Mention")
+        .on_active(move |s: &mut S, i| {
+            if let Some(m) = &mut (w1.access)(s).mention {
+                m.active = i;
+            }
+        })
+        .on_choose(move |s: &mut S, id, tx| w2.edit(s, tx, |doc| doc.mention_choose(Some(id))))
+        .on_close(move |s: &mut S| (w3.access)(s).mention = None)
         .build(k, layer);
 }
 

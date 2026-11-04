@@ -196,7 +196,7 @@ impl Blocks {
     /// blocks nested under it stay nested under that one.
     fn merge_up(&mut self, i: usize) -> bool {
         let Some(p) = (0..i).rev().find(|&j| !self.is_hidden(j)) else { return false };
-        if self.list[p].kind == Kind::Divider {
+        if !self.list[p].kind.has_text() {
             self.list.remove(p);
             return true;
         }
@@ -213,7 +213,7 @@ impl Blocks {
     /// Delete at the end of block `i`: the block shown below merges into it (a divider goes).
     pub(super) fn delete_at_end(&mut self, i: usize) -> bool {
         let Some(next) = (i + 1..self.list.len()).find(|&j| !self.is_hidden(j)) else { return false };
-        if self.list[next].kind == Kind::Divider {
+        if !self.list[next].kind.has_text() {
             self.list.remove(next);
             self.tidy_indents(next);
         } else {
