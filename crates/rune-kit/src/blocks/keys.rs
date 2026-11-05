@@ -57,6 +57,26 @@ fn turn_into_key(ev: &KeyEvent, tx: &Tx) -> Option<Kind> {
     })
 }
 
+/// Linear's: ⌘⇧ 6 toggle list, 7 to-do, 8 bulleted, 9 numbered, \\ code, and ⌥⇧ . quote.
+fn turn_into_shifted(ev: &KeyEvent, tx: &Tx) -> Option<Kind> {
+    if !ev.mods.shift || ev.mods.ctrl {
+        return None;
+    }
+    let base = tx.key_base().or(match &ev.key {
+        Key::Command(c) => Some(*c),
+        _ => None,
+    })?;
+    match (ev.mods.cmd, ev.mods.alt, base) {
+        (true, false, '6') => Some(Kind::Toggle { open: false }),
+        (true, false, '7') => Some(Kind::Todo { checked: false }),
+        (true, false, '8') => Some(Kind::Bullet),
+        (true, false, '9') => Some(Kind::Numbered),
+        (true, false, '\\') => Some(Kind::Code { language: String::new() }),
+        (false, true, '.') => Some(Kind::Quote),
+        _ => None,
+    }
+}
+
 /// The key of block `id`'s field in the editor keyed `editor`.
 pub(super) fn field_key(editor: &str, id: u64) -> String {
     format!("{editor}-f{id}")
@@ -66,7 +86,7 @@ impl Blocks {
     /// A key in block `id`'s field.
     pub(super) fn key(&mut self, id: u64, ev: &KeyEvent, caret: Option<Caret>, editor: &str, tx: &mut Tx) -> Outcome {
         let Some(i) = self.index(id) else { return Outcome::Ignored };
-        if let Some(kind) = turn_into_key(ev, tx) {
+        if let Some(kind) = turn_into_key(ev, tx).or_else(|| turn_into_shifted(ev, tx)) {
             let range = self.selected().unwrap_or(i..i + 1);
             for j in range.rev() {
                 if self.list[j].kind.has_text() {

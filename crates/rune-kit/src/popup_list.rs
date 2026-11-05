@@ -18,6 +18,7 @@ pub struct PopupItem {
     leading: Option<El>,
     trailing: Option<El>,
     disabled: bool,
+    line_above: bool,
 }
 
 impl PopupItem {
@@ -29,6 +30,7 @@ impl PopupItem {
             leading: None,
             trailing: None,
             disabled: false,
+            line_above: false,
         }
     }
     /// Secondary muted text shown after the label on the same row.
@@ -43,6 +45,12 @@ impl PopupItem {
         self
     }
     /// Trailing element at the right edge of the row (a keybind hint, badge, or check icon).
+    /// A hairline above it, starting a group.
+    pub fn line_above(mut self, on: bool) -> Self {
+        self.line_above = on;
+        self
+    }
+
     pub fn trailing(mut self, el: El) -> Self {
         self.trailing = Some(el);
         self
@@ -252,6 +260,9 @@ impl<S: 'static> PopupList<S> {
                 .radius(self.row_radius)
                 .transition(Transition::opacity())
                 .fill(if is_active { k.c.hover } else { Color::TRANSPARENT });
+            if option.line_above {
+                item = item.child(el().key("line").absolute(0.0, 0.0).w_full().h(1.0).fill(k.c.border_base).inert());
+            }
             if let Some(leading) = &option.leading {
                 item = item.child(leading.clone());
             }

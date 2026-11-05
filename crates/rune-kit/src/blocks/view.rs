@@ -29,6 +29,10 @@ type Aside<'a> = Box<dyn Fn(&Block, bool) -> Option<El> + 'a>;
 type ImageView<'a> = Box<dyn Fn(&str, &str) -> El + 'a>;
 /// The app's turn at what's pasted (see [`BlockEditor::on_paste`]).
 type PasteFn<S> = Rc<dyn Fn(&mut S, &rune::ClipboardContent, &mut Tx) -> bool>;
+/// The app's rows of the slash menu (see [`BlockEditor::on_slash`]).
+type SlashFn<S> = Rc<dyn Fn(&mut S, &str, &mut Tx)>;
+/// What the app draws of a code block (see [`BlockEditor::preview`]).
+type Preview<'a> = Box<dyn Fn(&str, &str) -> Option<El> + 'a>;
 
 /// Width of the column [`BlockEditor::aside`] takes at the end of each row.
 const ASIDE: f32 = 28.0;
@@ -38,6 +42,7 @@ pub(super) struct Wire<S> {
     pub(super) access: Access<S>,
     pub(super) change: Option<ChangeFn<S>>,
     pub(super) paste: Option<PasteFn<S>>,
+    pub(super) slash: Option<SlashFn<S>>,
     pub(super) editor: Rc<str>,
 }
 
@@ -47,6 +52,7 @@ impl<S> Clone for Wire<S> {
             access: self.access.clone(),
             change: self.change.clone(),
             paste: self.paste.clone(),
+            slash: self.slash.clone(),
             editor: self.editor.clone(),
         }
     }
@@ -54,8 +60,12 @@ impl<S> Clone for Wire<S> {
 
 impl<S: 'static> Wire<S> {
     pub(super) fn changed(&self, s: &mut S, tx: &mut Tx) {
+        let action = (self.access)(s).slash_action.take();
         if let Some(change) = &self.change {
             change(s, tx);
+        }
+        if let (Some(action), Some(slash)) = (action, &self.slash) {
+            slash(s, action, tx);
         }
     }
 
@@ -168,6 +178,8 @@ pub struct BlockEditor<'a, S> {
     aside: Option<Aside<'a>>,
     image: Option<ImageView<'a>>,
     paste: Option<PasteFn<S>>,
+    slash: Option<SlashFn<S>>,
+    preview: Option<Preview<'a>>,
 }
 
 impl<'a, S: 'static> BlockEditor<'a, S> {
@@ -182,6 +194,8 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
             aside: None,
             image: None,
             paste: None,
+            slash: None,
+            preview: None,
         }
     }
 
@@ -198,6 +212,20 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
     }
 
     /// What an empty document shows while it isn't focused.
+    /// Hears the id of a row of the slash menu that's the app's ([`SlashDoes::Action`](super::SlashDoes)),
+    /// once its `/` is gone from the block.
+    pub fn on_slash(mut self, f: impl Fn(&mut S, &str, &mut Tx) + 'static) -> Self {
+        self.slash = Some(Rc::new(f));
+        self
+    }
+
+    /// What a code block draws, by its language and source: a diagram, say. It shows in place of
+    /// the source, which a press brings back.
+    pub fn preview(mut self, f: impl Fn(&str, &str) -> Option<El> + 'a) -> Self {
+        self.preview = Some(Box::new(f));
+        self
+    }
+
     pub fn placeholder(mut self, text: impl Into<String>) -> Self {
         self.placeholder = text.into();
         self
@@ -237,6 +265,7 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
             access,
             change: self.change.clone(),
             paste: self.paste.clone(),
+            slash: self.slash.clone(),
             editor: self.key.as_str().into(),
         });
         let geometry = Rows::read(cx, &self.key, doc);
@@ -302,6 +331,10 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
             },
             spans: self.decorate.as_ref().map(|f| f(b)).unwrap_or_default(),
             aside: self.aside.as_ref().map(|f| f(b, doc.hovered == Some(b.id))),
+            preview: match (&b.kind, &self.preview) {
+                (Kind::Code { language }, Some(preview)) => preview(language, b.text()),
+                _ => None,
+            },
             image: match (&b.kind, &self.image) {
                 (Kind::Image { src, alt }, Some(f)) => Some(f(src, alt)),
                 _ => None,
@@ -346,6 +379,8 @@ struct Row<'r> {
     aside: Option<Option<El>>,
     /// What the app shows for it, an image block.
     image: Option<El>,
+    /// What the app draws of it, a code block.
+    preview: Option<El>,
 }
 
 impl Row<'_> {
@@ -386,8 +421,31 @@ impl Row<'_> {
                 }))
             }
             Kind::Code { .. } => {
-                let field = self.field(k, cx, doc, editor, wire, rows).w_full();
-                col().key("code").grow(1.0).shrink().radius(6.0).fill(self.look.fill).padding(14.0).child(field)
+                let preview = self.preview.take();
+                let id = b.id;
+                match (preview, wire) {
+                    // What it draws; pressed, its source.
+                    (Some(shown), Some(wire)) if !b.edit.focused => {
+                        let wire = wire.clone();
+                        col().key("code").grow(1.0).shrink().child(shown).cursor(Cursor::Pointer).on_press(move |s: &mut S| {
+                            let doc = (wire.access)(s);
+                            if let Some(i) = doc.index(id) {
+                                let end = doc.list[i].edit.text.len();
+                                doc.focus(i, end);
+                            }
+                        })
+                    }
+                    (preview, _) => {
+                        let field = self.field(k, cx, doc, editor, wire, rows).w_full();
+                        col()
+                            .key("code")
+                            .grow(1.0)
+                            .shrink()
+                            .gap(10.0)
+                            .child(col().w_full().radius(6.0).fill(self.look.fill).padding(14.0).child(field))
+                            .children(preview)
+                    }
+                }
             }
             _ => self.field(k, cx, doc, editor, wire, rows).grow(1.0).shrink(),
         });
@@ -578,17 +636,24 @@ fn bind<S: 'static>(f: El, id: u64, caret: Option<Caret>, rows: Rows, wire: &Wir
 /// The slash menu, when open.
 fn menu<S: 'static>(k: &Kit, doc: &Blocks, wire: &Wire<S>, layer: &mut Vec<El>) {
     let Some((m, query)) = doc.menu_query() else { return };
-    let items: Vec<PopupItem> = matching(query)
+    let items: Vec<PopupItem> = matching(doc.slash, query)
         .into_iter()
-        .map(|c| {
-            PopupItem::new(c.id, c.kind().label()).trailing(text(c.shortcut).font(k.ty.small).color(k.c.text_faint))
+        .enumerate()
+        .map(|(at, c)| {
+            let item = PopupItem::new(c.id, c.label)
+                .trailing(text(c.shortcut).font(k.ty.small).color(k.c.text_faint))
+                .line_above(c.group_start && at > 0 && query.is_empty());
+            match c.icon {
+                Some(glyph) => item.leading(icon(glyph, 15.0).color(k.c.icon_base)),
+                None => item,
+            }
         })
         .collect();
     let (w1, w2, w3) = (wire.clone(), wire.clone(), wire.clone());
     PopupList::new(format!("{}-menu", wire.editor), field_key(&wire.editor, m.block))
         .anchored(field_key(&wire.editor, m.block), Side::Bottom, Align::Start, 6.0)
-        .width(260.0)
-        .max_height(340.0)
+        .width(280.0)
+        .max_height(420.0)
         .items(items)
         .active(Some(m.active))
         .empty_message("No matching blocks")

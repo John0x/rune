@@ -20,6 +20,11 @@
 //! (`![alt](src)`, added with [`Blocks::insert_image`]), and [`BlockEditor::on_paste`] takes
 //! what's pasted first, an image say.
 //!
+//! [`Blocks::set_slash_items`] replaces what `/` offers: rows with marks and shortcuts, some of them
+//! the app's ([`BlockEditor::on_slash`]). [`BlockEditor::preview`] draws code blocks (a diagram, a
+//! formula) in place of their source, which a press brings back. Beside Notion's ⌘⌥ digits, the
+//! field reads Linear's ⌘⇧6–9, ⌘⇧\\ and ⌥⇧. .
+//!
 //! The app owns a [`Blocks`] and binds a [`BlockEditor`] to it, mounting the slash menu's
 //! layer at its root like any overlay:
 //!
@@ -55,6 +60,7 @@ use rune::{Mark, MarkRange, TextEdit};
 pub use handle::GUTTER;
 pub use marquee::selection_area;
 pub use mention::MentionItem;
+pub use menu::{SlashDoes, SlashItem};
 pub use view::BlockEditor;
 
 /// What a block is.
@@ -157,6 +163,10 @@ pub struct Blocks {
     /// Blocks selected whole, from `anchor` to `head` (ids), after Escape or a drag.
     selection: Option<Selection>,
     menu: Option<menu::SlashMenu>,
+    /// What the slash menu offers.
+    slash: &'static [SlashItem],
+    /// The app's row of the menu that was just taken, for it to hear.
+    slash_action: Option<&'static str>,
     /// The `@` menu, open, and what the app offers in it.
     mention: Option<mention::MentionMenu>,
     mention_items: Vec<MentionItem>,
@@ -203,6 +213,11 @@ impl Blocks {
         Blocks::from_parts(markdown::parse(markdown))
     }
 
+    /// What the slash menu offers, in order.
+    pub fn set_slash_items(&mut self, items: &'static [SlashItem]) {
+        self.slash = items;
+    }
+
     /// The document as Markdown.
     pub fn to_markdown(&self) -> String {
         markdown::write(&self.list)
@@ -225,6 +240,8 @@ impl Blocks {
             next_id: 1,
             selection: None,
             menu: None,
+            slash: &menu::CHOICES,
+            slash_action: None,
             mention: None,
             mention_items: Vec::new(),
             drag: None,

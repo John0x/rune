@@ -1,6 +1,8 @@
 //! The slash menu: `/` typed at a block's start or after a space lists the kinds of block,
 //! filtered by what follows it, to turn the block into one (or add one below it).
 
+use rune::Icon;
+
 use super::{Blocks, Kind};
 
 /// The open menu: the block it's in, where its `/` is, and the highlighted choice.
@@ -11,55 +13,69 @@ pub(super) struct SlashMenu {
     pub(super) active: usize,
 }
 
-/// A kind the menu offers.
-pub(super) struct Choice {
-    pub(super) id: &'static str,
-    /// The Markdown shortcut that makes it, shown beside its name.
-    pub(super) shortcut: &'static str,
-    words: &'static str,
+/// What a slash menu's row does.
+#[derive(Clone, Copy, Debug)]
+pub enum SlashDoes {
+    /// Turns the block into this kind, or adds one below it.
+    Turn(fn() -> Kind),
+    /// The app's: [`BlockEditor::on_slash`](super::BlockEditor::on_slash) hears its id.
+    Action,
 }
 
-pub(super) const CHOICES: [Choice; 11] = [
-    Choice { id: "text", shortcut: "", words: "text paragraph plain" },
-    Choice { id: "h1", shortcut: "#", words: "heading 1 h1 title" },
-    Choice { id: "h2", shortcut: "##", words: "heading 2 h2 subtitle" },
-    Choice { id: "h3", shortcut: "###", words: "heading 3 h3" },
-    Choice { id: "bullet", shortcut: "-", words: "bulleted list bullet ul unordered" },
-    Choice { id: "numbered", shortcut: "1.", words: "numbered list ordered ol" },
-    Choice { id: "todo", shortcut: "[]", words: "to-do list todo task checkbox" },
-    Choice { id: "toggle", shortcut: ">", words: "toggle list collapse expand details" },
-    Choice { id: "quote", shortcut: "\"", words: "quote blockquote citation" },
-    Choice { id: "code", shortcut: "```", words: "code snippet block" },
-    Choice { id: "divider", shortcut: "---", words: "divider rule separator line hr" },
-];
+/// A row of the slash menu.
+#[derive(Clone, Copy, Debug)]
+pub struct SlashItem {
+    pub id: &'static str,
+    pub label: &'static str,
+    /// Its mark, before its label.
+    pub icon: Option<&'static Icon>,
+    /// What's shown on its end: the keys or Markdown shortcut that make it.
+    pub shortcut: &'static str,
+    /// More words it's found by.
+    pub words: &'static str,
+    pub does: SlashDoes,
+    /// A line above it, starting a group.
+    pub group_start: bool,
+}
 
-impl Choice {
+impl SlashItem {
+    const fn turn(id: &'static str, label: &'static str, shortcut: &'static str, words: &'static str, kind: fn() -> Kind) -> Self {
+        SlashItem { id, label, icon: None, shortcut, words, does: SlashDoes::Turn(kind), group_start: false }
+    }
+
+    /// What it turns a block into (a row of the app's: a paragraph).
     pub(super) fn kind(&self) -> Kind {
-        match self.id {
-            "h1" => Kind::Heading(1),
-            "h2" => Kind::Heading(2),
-            "h3" => Kind::Heading(3),
-            "bullet" => Kind::Bullet,
-            "numbered" => Kind::Numbered,
-            "todo" => Kind::Todo { checked: false },
-            "toggle" => Kind::Toggle { open: false },
-            "quote" => Kind::Quote,
-            "code" => Kind::Code { language: String::new() },
-            "divider" => Kind::Divider,
-            _ => Kind::Paragraph,
+        match self.does {
+            SlashDoes::Turn(kind) => kind(),
+            SlashDoes::Action => Kind::Paragraph,
         }
     }
 
     fn matches(&self, query: &str) -> bool {
-        let label = self.kind().label().to_lowercase();
+        let label = self.label.to_lowercase();
         query.split_whitespace().all(|q| label.contains(q) || self.words.split(' ').any(|w| w.starts_with(q)))
     }
 }
 
-/// The choices `query` (lowercased) matches.
-pub(super) fn matching(query: &str) -> Vec<&'static Choice> {
+/// What the menu offers unless the app says otherwise ([`Blocks::set_slash_items`]).
+pub(super) const CHOICES: [SlashItem; 11] = [
+    SlashItem::turn("text", "Text", "", "text paragraph plain", || Kind::Paragraph),
+    SlashItem::turn("h1", "Heading 1", "#", "heading 1 h1 title", || Kind::Heading(1)),
+    SlashItem::turn("h2", "Heading 2", "##", "heading 2 h2 subtitle", || Kind::Heading(2)),
+    SlashItem::turn("h3", "Heading 3", "###", "heading 3 h3", || Kind::Heading(3)),
+    SlashItem::turn("bullet", "Bulleted list", "-", "bulleted list bullet ul unordered", || Kind::Bullet),
+    SlashItem::turn("numbered", "Numbered list", "1.", "numbered list ordered ol", || Kind::Numbered),
+    SlashItem::turn("todo", "To-do list", "[]", "to-do list todo task checkbox", || Kind::Todo { checked: false }),
+    SlashItem::turn("toggle", "Toggle list", ">", "toggle list collapse expand details", || Kind::Toggle { open: false }),
+    SlashItem::turn("quote", "Quote", "\"", "quote blockquote citation", || Kind::Quote),
+    SlashItem::turn("code", "Code", "```", "code snippet block", || Kind::Code { language: String::new() }),
+    SlashItem::turn("divider", "Divider", "---", "divider rule separator line hr", || Kind::Divider),
+];
+
+/// Those of `items` that `query` (lowercased) matches.
+pub(super) fn matching(items: &'static [SlashItem], query: &str) -> Vec<&'static SlashItem> {
     let query = query.to_lowercase();
-    CHOICES.iter().filter(|c| c.matches(&query)).collect()
+    items.iter().filter(|c| c.matches(&query)).collect()
 }
 
 impl Blocks {
@@ -81,7 +97,7 @@ impl Blocks {
                 text.as_bytes().get(m.slash) == Some(&b'/')
                     && q.len() <= 24
                     && !q.contains('\n')
-                    && !(q.ends_with(' ') && matching(q).is_empty())
+                    && !(q.ends_with(' ') && matching(self.slash, q).is_empty())
             });
             if !keep {
                 self.menu = None;
@@ -98,7 +114,7 @@ impl Blocks {
 
     /// Moves the highlight `by` choices, wrapping.
     pub(super) fn menu_step(&mut self, by: isize) {
-        let n = self.menu_query().map_or(0, |(_, q)| matching(q).len()) as isize;
+        let n = self.menu_query().map_or(0, |(_, q)| matching(self.slash, q).len()) as isize;
         if let Some(m) = &mut self.menu
             && n > 0
         {
@@ -112,9 +128,9 @@ impl Blocks {
             self.menu = None;
             return false;
         };
-        let choices = matching(query);
+        let choices = matching(self.slash, query);
         let choice = match id {
-            Some(id) => CHOICES.iter().find(|c| c.id == id),
+            Some(id) => self.slash.iter().find(|c| c.id == id),
             None => choices.get(menu.active).copied(),
         };
         let (block, slash) = (menu.block, menu.slash);
@@ -124,7 +140,11 @@ impl Blocks {
         let caret = edit.range().1;
         edit.set_selection(slash, caret);
         edit.insert("");
-        let kind = choice.kind();
+        let SlashDoes::Turn(kind) = choice.does else {
+            self.slash_action = Some(choice.id);
+            return true;
+        };
+        let kind = kind();
         if self.list[i].edit.text.is_empty() {
             self.turn_into(i, kind);
         } else {
