@@ -17,6 +17,7 @@ impl<S: 'static> Runtime<S> {
         }
         self.text.begin_frame_pinned(pinned_pages);
         self.marks.clear();
+        self.icon_aprons.clear();
         self.surfaces.clear();
         self.materials.clear();
         self.hits.clear();
@@ -102,6 +103,10 @@ impl<S: 'static> Runtime<S> {
         self.pixel_snap.begin_frame(self.t, [vp[2], vp[3]]);
         for paint_index in 0..n_nodes {
             let i = if tree_order { self.layer_paint_order[paint_index] } else { paint_index };
+            if let Some(rank) = self.paint_rank.as_mut() {
+                rank.resize(n_nodes, 0);
+                rank[i] = paint_index as u32;
+            }
             let node_id = self.nodes[i].id;
             let node_parent = self.nodes[i].parent;
             // A flight paints outside every ancestor's layer, above the whole window.
@@ -656,7 +661,7 @@ impl<S: 'static> Runtime<S> {
             // image over its placeholder fill, a label over its bubble) the one beneath shows
             // through the fade, and the stack brightens or darkens towards the edge. A stack that
             // reaches into a soft edge composites as one layer, which takes the fade once.
-            if !isolate && visible && effective_opacity > 0.001 && fade.iter().any(|&f| f > 0.0)
+            if !isolate && visible && effective_opacity > 0.001 && fade.iter().any(|&f| f != 0.0)
                 && in_fade([r[0], r[1], r[0] + w, r[1] + h], clip, fade, fade_origin)
             {
                 let v = &n.vis;

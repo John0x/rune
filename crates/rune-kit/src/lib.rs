@@ -46,6 +46,7 @@ pub mod popover;
 mod popup_list;
 mod radio;
 mod rolling_text;
+mod scroll_bar;
 mod segmented;
 mod select;
 pub mod shell;
@@ -94,6 +95,8 @@ pub use list::List;
 pub use list::ListItem;
 #[cfg(feature = "markdown")]
 pub use markdown::Case;
+#[cfg(feature = "mermaid")]
+pub use markdown::DiagramFrame;
 #[cfg(feature = "markdown")]
 pub use markdown::Highlight;
 #[cfg(feature = "markdown")]
@@ -122,6 +125,9 @@ pub use popup_list::PopupList;
 pub use radio::RadioGroup;
 pub use radio::RadioItem;
 pub use rolling_text::RollingText;
+pub use scroll_bar::ScrollBar;
+pub use scroll_bar::ScrollBarStyle;
+pub use scroll_bar::scroll_bar;
 pub use segmented::SegmentedControl;
 pub use select::Select;
 pub use select::SelectAppearance;

@@ -283,6 +283,7 @@ impl<S: 'static> Host<S> {
         l.native.materials.present(&rt.materials, rt.env.scale, || gpu.queue.present(frame));
         #[cfg(not(target_os = "macos"))]
         gpu.queue.present(frame);
+        crate::render::gpu_events::presented();
         #[cfg(target_os = "macos")]
         if let Some(shadow) = &l.native.shadow { shadow.presented(); }
         // The frame landed with this present; later ones needn't wait for a transaction.
@@ -291,6 +292,12 @@ impl<S: 'static> Host<S> {
         if !l.first_frame.ready
             && gpu.device.poll(wgpu::PollType::wait_indefinitely()).is_ok() {
             l.first_frame.ready = true;
+        }
+        // The window shows once the GPU has finished the frame it presents.
+        #[cfg(target_os = "windows")]
+        if l.native.cloak.held() {
+            let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            l.native.cloak.lift(&l.window);
         }
         let submitted = Instant::now();
         self.meter.presented();

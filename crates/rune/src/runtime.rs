@@ -98,7 +98,7 @@ mod key_index;
 mod system_settings;
 #[path = "runtime/commit/prune.rs"]
 mod prune;
-pub(crate) use blend::{glyph, icon_inst, premul};
+pub(crate) use blend::{apron_key, glyph, icon_inst, premul};
 
 #[path = "runtime/input/focus.rs"]
 mod focus;
@@ -157,10 +157,19 @@ pub use motion_elements::MotionElement;
 mod live_latch;
 #[path = "runtime/motion/loop_clock.rs"]
 mod loop_clock;
+#[path = "runtime/motion/rewind.rs"]
+mod rewind_record;
 #[path = "runtime/scroll/watch.rs"]
 mod scroll_watch;
+#[doc(hidden)]
+pub use scroll_watch::scroll_watch_state;
 #[path = "runtime/input/gesture.rs"]
 mod gesture_dispatch;
+#[path = "runtime/input/touch.rs"]
+mod touch_input;
+pub use touch_input::TouchPhase;
+#[path = "runtime/scroll/touch.rs"]
+mod scroll_touch;
 #[path = "runtime/motion/flights.rs"]
 mod flights;
 #[path = "runtime/paint/text_flights.rs"]
@@ -182,6 +191,8 @@ mod secondary;
 mod app_ime;
 #[path = "runtime/input/press_clicks.rs"]
 mod press_clicks;
+#[path = "runtime/input/press_repeat.rs"]
+mod press_repeat;
 #[path = "runtime/input/titlebar.rs"]
 mod titlebar;
 #[path = "runtime/window_requests.rs"]
@@ -288,6 +299,20 @@ mod fold_hold;
 #[path = "runtime/motion/content_slide.rs"]
 mod content_slide;
 mod elements;
+#[path = "a11y/tree.rs"]
+pub(crate) mod a11y_tree;
+#[path = "a11y/node.rs"]
+mod a11y_node;
+#[path = "a11y/text.rs"]
+mod a11y_text;
+#[path = "a11y/actions.rs"]
+mod a11y_actions;
+use a11y_actions::A11yAct;
+#[cfg(test)]
+#[path = "a11y/tests.rs"]
+mod a11y_tests;
+#[path = "runtime/paint_probe.rs"]
+mod paint_probe;
 pub use elements::{ElementInfo, Pick, Picked, Pose};
 #[path = "runtime/paint/cache_layer.rs"]
 mod cache_layer;
@@ -362,6 +387,7 @@ pub struct Runtime<S: 'static> {
     system_reduced_motion: bool,
     titlebar_inset: f32,
     system_accent: crate::SystemAccent,
+    scroll_bars: system_settings::ScrollBarHost,
     pub time_scale: f32,
     /// Called at the start of every frame with the clock; return true when state changed (new data).
     pub poll: Option<fn(&mut S, f64, &mut Tx) -> bool>,
@@ -491,11 +517,13 @@ pub struct Runtime<S: 'static> {
     scrolls: HashMap<NodeId, ScrollState>,
     /// The axis the current wheel or trackpad gesture scrolls (`runtime/scroll/x.rs`).
     wheel_lock: scroll_x::WheelLock,
-    #[cfg(any(test, target_arch = "wasm32"))]
-    web_scroll: Option<web_runtime::TouchScroll>,
+    /// The finger that is down and the viewport a touch holds (`runtime/input/touch.rs`).
+    touch: touch_input::Touch,
     grows: HashMap<NodeId, GrowTrack>,
     stacks: HashMap<NodeId, Stack>,
     pub(crate) virtuals: HashMap<String, crate::el::virtual_list::VirtualList>,
+    /// The recorder `Tx::record_rewind` attached (`runtime/motion/rewind.rs`).
+    rewind: Option<crate::rewind::Rewind>,
     /// The memo pass the current commit's first view build was. Memos none of its builds used
     /// go once it applies.
     memo_since: u64,
@@ -508,6 +536,8 @@ pub struct Runtime<S: 'static> {
     /// Fresh view accessors for focused text fields omitted by virtualization.
     virtual_inputs: HashMap<String, Box<InputSpec>>,
     reveals: HashMap<NodeId, RevealState>,
+    /// When the newest streamed word of any text starts fading: the next text's words follow it.
+    reveal_chain: f64,
     flights: Vec<TextFlight>,
     /// Per node index this frame: presented row top dy, row height override, and bottom feather mask.
     row_dy: Vec<f32>,
@@ -665,6 +695,12 @@ pub struct Runtime<S: 'static> {
     pub(crate) anim_sources: u16,
     /// Why this frame committed, as [`commit_why::CommitWhy`] bits, until the frame log takes them.
     pub(crate) commit_why: u16,
+    /// Each node's place in the paint order, kept by the frame build while `Some` (the motion
+    /// gate's `z-order`).
+    pub(crate) paint_rank: Option<Vec<u32>>,
+    /// While `paint_rank` is kept: this frame's icons drawn through their transparent one-texel
+    /// apron (`icon_inst` off the pixel grid), by atlas place (`apron_key`), for the gate's raster.
+    pub(crate) icon_aprons: Vec<[u32; 3]>,
     /// This frame's commit landed every track (`Tx::settle`): a deliberate cut.
     pub settled: bool,
     /// Input markers for traces and headless tests, at most `event_log::CAP` of them unread.
@@ -717,6 +753,8 @@ pub struct Runtime<S: 'static> {
     double_armed: bool,
     /// The presses counted into `Drag::clicks`.
     press_clicks: press_clicks::PressClicks,
+    /// The held press's drag repeat (`Tx::drag_repeat_after`).
+    press_repeat: press_repeat::PressRepeat,
     press_down_t: f64,
     /// The held press has travelled past the click slop: it isn't a click of a double press.
     press_moved: bool,
@@ -741,6 +779,8 @@ pub struct Runtime<S: 'static> {
     drag_ends: crate::drag_out::DragEnds,
     /// Drag-outs whose `on_drag_start` ran and whose `on_drag_end` hasn't yet.
     drags_open: usize,
+    /// The accessibility tree, while an assistive client listens (`a11y/tree.rs`).
+    a11y: Option<Box<a11y_tree::A11yTree>>,
 }
 
 impl<S: 'static> Runtime<S> {
@@ -774,6 +814,7 @@ impl<S: 'static> Runtime<S> {
             system_reduced_motion: false,
             titlebar_inset: 0.0,
             system_accent: crate::SystemAccent::DEFAULT,
+            scroll_bars: Default::default(),
             time_scale: 1.0,
             poll: None,
             clock: 0.0,
@@ -858,11 +899,11 @@ impl<S: 'static> Runtime<S> {
             seen: Vec::new(),
             scrolls: HashMap::default(),
             wheel_lock: Default::default(),
-            #[cfg(any(test, target_arch = "wasm32"))]
-            web_scroll: None,
+            touch: Default::default(),
             grows: HashMap::default(),
             stacks: HashMap::default(),
             virtuals: HashMap::default(),
+            rewind: None,
             virtual_culled: HashSet::default(),
             memo_since: 0,
             virtual_fill: 0,
@@ -870,6 +911,7 @@ impl<S: 'static> Runtime<S> {
             reuse: Default::default(),
             virtual_inputs: HashMap::default(),
             reveals: HashMap::default(),
+            reveal_chain: 0.0,
             flights: Vec::new(),
             launches: Default::default(),
             pixel_snap: Default::default(),
@@ -958,6 +1000,8 @@ impl<S: 'static> Runtime<S> {
             animating: false,
             anim_sources: 0,
             commit_why: 0,
+            paint_rank: None,
+            icon_aprons: Vec::new(),
             settled: false,
             events: Vec::new(),
             record_events: true,
@@ -990,6 +1034,7 @@ impl<S: 'static> Runtime<S> {
             last_press: None,
             double_armed: false,
             press_clicks: Default::default(),
+            press_repeat: Default::default(),
             press_down_t: 0.0,
             press_moved: false,
             press_cancelled: false,
@@ -1001,6 +1046,7 @@ impl<S: 'static> Runtime<S> {
             drag_out_request: None,
             drag_ends: Default::default(),
             drags_open: 0,
+            a11y: None,
         }
     }
 }

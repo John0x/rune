@@ -1,6 +1,7 @@
 #!/bin/sh
 # Records a motion trace of every element (--trace-all) for each scenario below, at 120 fps on
-# the virtual clock, plus the final element tree. Then scripts/motion-audit/analyze.py reads them.
+# the virtual clock, plus the final element tree and what rune::motion_gate finds (<name>.gate.txt).
+# Then scripts/motion-audit/analyze.py reads them.
 # Run from the repo root: scripts/motion-audit/run.sh [out-dir] (default target/motion-audit).
 set -e
 O=${1:-target/motion-audit}
@@ -20,7 +21,7 @@ run() {
   name=$1; secs=$2; shift 2
   frames=$(python3 -c "print(int($secs * $FPS))")
   echo "== $name ($frames frames)"
-  "$@" --fps $FPS --frames "$frames" --trace-all --trace "$O/$name.jsonl" --tree "$O/$name-end.json"
+  RUNE_MOTION_GATE="$O/$name.gate.txt" "$@" --fps $FPS --frames "$frames" --trace-all --trace "$O/$name.jsonl" --tree "$O/$name-end.json"
 }
 
 run todo-add-remove   4.4 $B/todo --script $S/todo-add-remove.json
@@ -30,6 +31,9 @@ run settings-slider   3.0 $B/settings --script examples/settings/scripts/slider.
 run settings-hover    3.0 $B/settings --script examples/settings/scripts/hover.json
 run gallery-combobox  3.0 $B/kit-gallery --scene rune-combobox--searchable --script examples/kit-gallery/scripts/combobox.json
 run gallery-combobox-animated 3.0 $B/kit-gallery --scene rune-combobox--animated-filter --script examples/kit-gallery/scripts/combobox-animated-filter.json
+run gallery-scroll-bar 4.0 $B/kit-gallery --scene rune-scroll-bar--basic --script $S/gallery-scroll-bar.json
+run gallery-scroll-bar-hover 3.2 $B/kit-gallery --scene rune-scroll-bar--basic --script $S/gallery-scroll-bar-hover.json
+run gallery-scroll-bar-grow 2.4 $B/kit-gallery --scene rune-scroll-bar--grow --scroll-bars always --script $S/gallery-scroll-bar-grow.json
 run gallery-modal     5.5 $B/kit-gallery --scene motion-focus-modal --script examples/kit-gallery/scripts/motion-focus-modal.json
 run gallery-stagger-list 3.0 $B/kit-gallery --scene motion-stagger-list --script examples/kit-gallery/scripts/motion-stagger-list.json
 run gallery-mermaid-stream 4.5 $B/kit-gallery --scene rune-markdown--mermaid-streaming --size 1100x1400 --script $S/gallery-mermaid-stream.json

@@ -1,6 +1,8 @@
 //! View-to-scene commit orchestration (`Runtime::commit`, `Measurement`, `Measured`).
 use super::*;
 
+pub(super) mod remount;
+
 /// Measurement capabilities: text/layout caches and virtual geometry only. In particular this
 /// type has no Scene, growth tracks, reveal tracks, draw instances, or mutable app state.
 pub(super) struct Measurement<'a, S: 'static> {
@@ -13,6 +15,7 @@ pub(super) struct Measurement<'a, S: 'static> {
     pub(super) system_reduced_motion: bool,
     pub(super) titlebar_inset: f32,
     pub(super) system_accent: crate::SystemAccent,
+    pub(super) system_scroll_bars: crate::platform::scroll_bars::SystemScrollBars,
     pub(super) reduced_motion: bool,
     pub(super) time_scale: f32,
     pub(super) commits: u64,
@@ -57,6 +60,7 @@ pub(super) struct Measured {
     pub(super) layout_reads: layout_read::LayoutReads,
     pub(super) memo_flattened: Option<Vec<memo_reuse::PendingFlat>>,
     pub(super) memo_reused: Vec<memo_reuse::ReusedSpan>,
+    pub(super) taken_paths: Vec<(u32, u32)>,
     /// The selection as the measure began, before reused `memo` subtrees left the last
     /// commit's nodes.
     pub(super) selection: Vec<layout_read::SelectedRange>,
@@ -68,6 +72,7 @@ impl<S: 'static> Runtime<S> {
         let _first_view = crate::tooling::perf_warn::launch::FirstView::start(self.commits == 0);
         let budget = crate::tooling::perf_warn::budget::Commit::start();
         self.apply_playground();
+        let _history = crate::memo::snapshot::enter();
         COMMITS.set(COMMITS.get() + 1);
         self.last_commit_clock = self.clock;
         self.memo_since = self.memo.next_pass();
@@ -104,7 +109,7 @@ impl<S: 'static> Runtime<S> {
     /// Restores any nodes moved out of `self.nodes` and recycles `measured`'s buffers before a
     /// commit pass re-measures.
     pub(super) fn discard_measured(&mut self, mut measured: Measured) {
-        memo_reuse::restore_moved_nodes(&mut self.nodes, &mut measured.nodes, &measured.memo_reused);
+        memo_reuse::restore_moved_nodes(&mut self.nodes, &mut measured.nodes, &measured.memo_reused, &measured.taken_paths);
         measured.nodes.clear();
         self.spare_nodes = measured.nodes;
         if let Some(mut pending) = measured.memo_flattened {
@@ -113,6 +118,8 @@ impl<S: 'static> Runtime<S> {
         }
         measured.memo_reused.clear();
         self.memo.reused_scratch = measured.memo_reused;
+        measured.taken_paths.clear();
+        self.memo.taken_paths_scratch = measured.taken_paths;
         self.layout = measured.layout;
     }
 }

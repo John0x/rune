@@ -132,6 +132,11 @@ impl Pose {
 }
 
 impl<S: 'static> Runtime<S> {
+    /// Authored geometry goals, before scroll and spring sampling, in parent space.
+    pub(crate) fn trace_goals(&self) -> impl Iterator<Item = (&str, [f32; 7])> {
+        self.nodes.iter().map(|n| (n.path.as_str(), [n.local.x, n.local.y, n.local.w, n.local.h, n.vis.offset[0], n.vis.offset[1], n.static_scale]))
+    }
+
     /// Tracks the last tick sampled, by element path and property name: what spent this
     /// frame animating. Tracks of nodes no longer in the tree report their node id.
     pub(crate) fn touched_tracks(&self) -> Vec<(String, &'static str, bool)> {
@@ -179,7 +184,7 @@ impl<S: 'static> Runtime<S> {
 
     /// What a move of `v` points inside node `i` (a scroll viewport's offset) comes to in the
     /// window: scaled and turned as its children draw.
-    fn content_to_window(&self, i: usize, v: [f32; 2]) -> [f32; 2] {
+    pub(super) fn content_to_window(&self, i: usize, v: [f32; 2]) -> [f32; 2] {
         let Some(h) = self.inh_scratch.get(i) else { return v };
         let [x, y] = v.map(|c| c * h.scale);
         match h.turn.checked_sub(1).and_then(|k| self.turn_scratch.get(k as usize)) {
@@ -194,7 +199,7 @@ impl<S: 'static> Runtime<S> {
                 crate::live::Property::Offset => 1,
                 crate::live::Property::Scale | crate::live::Property::Rect => 1 | 2,
                 crate::live::Property::Opacity => 4,
-                crate::live::Property::Fill | crate::live::Property::Blur => 0,
+                crate::live::Property::Fill | crate::live::Property::Blur | crate::live::Property::Trim => 0,
             })
         }
         let store = self.scene.store();

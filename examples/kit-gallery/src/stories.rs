@@ -1,7 +1,7 @@
 //! The stories, one function per `@opencode/ui` Storybook story id (title + export name).
 //! Layout wrappers copy each story's own inline styles.
 
-use rune::{Edge, El, Stagger, TextEdit, TextStyle, Transition, Tx, col, row, text};
+use rune::{Edge, El, Stagger, TextEdit, TextStyle, Transition, Tx, col, el, row, text};
 use rune_kit::*;
 use rune_theme_opencode::icons as ic;
 
@@ -199,6 +199,8 @@ stories! {
     "rune-text--truncate-middle" => text_truncate_middle,
     "rune-dialog--fit" => dialog_fit,
     "rune-popup-list--composer" => popup_list_composer,
+    "rune-scroll-bar--basic" => scroll_bar_basic,
+    "rune-scroll-bar--grow" => scroll_bar_grow,
 }
 
 fn popup_list_composer(s: &G, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -384,4 +386,51 @@ fn text_truncate_middle(_: &G, k: &Kit, _: &mut Vec<El>) -> El {
         .child(path(160.0, El::truncate_middle, "Middle"))
         .child(path(240.0, El::truncate, "End"))
         .child(path(240.0, El::truncate_head, "Head"))
+}
+
+fn scroll_bar_basic(_: &G, k: &Kit, _: &mut Vec<El>) -> El {
+    scroll_feed(k, 24, None)
+}
+
+/// A feed whose button lengthens or shortens what follows its rows, so its thumb glides to each
+/// new length.
+fn scroll_bar_grow(s: &G, k: &Kit, _: &mut Vec<El>) -> El {
+    col().gap(8.0)
+        .child(Button::new("Change rows").on_press(flip("more")).build(k).key("more"))
+        .child(scroll_feed(k, 12, Some(if s.is("more") { 600.0 } else { 0.0 })))
+}
+
+fn scroll_feed(k: &Kit, rows: usize, tail: Option<f32>) -> El {
+    col()
+        .key("panel")
+        .w(360.0)
+        .h(260.0)
+        .radius(k.radius.md)
+        .fill(k.c.layer_01)
+        .border(1.0, k.c.border_weak)
+        .clip_soft(k.radius.md)
+        .child(
+            col()
+                .key("feed")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .padding(8.0)
+                .gap(4.0)
+                .scroll(rune::ScrollSpec { stick_bottom: false })
+                .children((0..rows).map(|i| {
+                    row()
+                        .key(format!("item-{i}"))
+                        .w_full()
+                        .h(32.0)
+                        .px(10.0)
+                        .center_y()
+                        .justify_between()
+                        .radius(k.radius.sm)
+                        .child(text(format!("Build step {:02}", i + 1)).font(k.ty.ui_compact).color(k.c.text_base))
+                        .child(text(format!("{} ms", 12 + i * 7)).font(k.ty.small).color(k.c.text_muted))
+                }))
+                .children(tail.map(|h| el().key("tail").w_full().h(h)))
+                .scroll_bar(k),
+        )
 }

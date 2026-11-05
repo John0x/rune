@@ -123,6 +123,31 @@ label element in the button's font and ink. The text stays the button's accessib
 A `RollingText` reads as its whole label wherever text is looked up: its row's `text` in
 `--tree` and `ElementInfo::text`, so tests find it by text as they find a plain `text`.
 
+### Accessibility
+
+Every component reports what a screen reader needs through Rune's accessibility tree (Rune's
+README, "Accessibility"): its role, a name, a value where it has one, its states and the actions
+assistive technology runs through the same handlers as pointer and keys.
+
+- **Names**: a control's label, else the text it shows. Give every `IconButton` a `.label` (or
+  a `.help`, which names it when unlabelled). `Select`, `Combobox`, `SegmentedControl`,
+  `TextInput`, `TextArea`, `ShortcutRecorder`, `ProgressCircle` and `Popover` take `.label` for
+  the name when no visible label says it; a text field falls back to its placeholder.
+- **Values**: a select or combobox reads its chosen option, progress its percentage, a pane's
+  grip its width (increment and decrement resize it), a shortcut recorder its keys.
+- **States**: checked (checkbox, switch, radio, segment, checked menu item, task), expanded or
+  collapsed (accordion, collapsible, menu and popover triggers given `.expanded`, select,
+  combobox, submenu, tree row, sidebar section, sidebar toggle, diff file), selected and place
+  in the set (list, select, popup list, table, tree and sidebar rows), disabled, modal
+  (dialog, open menu and select).
+- **Descriptions and live regions**: tooltips and help text describe their control; a field's
+  error describes it and is announced; toasts and badges are polite live regions.
+- **Hidden**: decorative icons, dots, rules, guides and the words a control's name already
+  says stay out of the tree.
+
+`tests/a11y` checks each component's tree, by assertion and against a golden under
+`tests/a11y/golden/` (`RUNE_BLESS=1` rewrites them).
+
 ## App shell
 
 `rune_kit::shell` is a desktop window's frame: a resizable, collapsible sidebar, the main pane
@@ -259,7 +284,7 @@ draws Markdown tables with the same font, padding and rules.
 ## Markdown
 
 Feature `markdown`: `Markdown::new(src).build(&kit)`, or without a kit
-`Markdown::new(src).render(&MarkdownStyle::neutral(dark))` (also `MarkdownStyle::from_seed`).
+`Markdown::new(src).render(&MarkdownStyle::neutral(dark))`.
 It renders CommonMark plus GFM tables, and is built for streaming: re-render with the longer
 source each time, and earlier blocks stay mounted.
 
@@ -347,8 +372,7 @@ DiffView::new(|s: &App| &s.diff, |s: &mut App| &mut s.diff)
   under them (`rune_kit::syntax`, swappable with `set_highlighter`). Tabs line up at
   four-column stops and copy as tabs.
 - **Unchanged ranges** between hunks fold into a row that opens 20 lines up, 20 down, or all
-  (`expand`). A parsed patch has no whole files, so its folds only open after
-  `FileDiff::with_texts`.
+  (`expand`). A parsed patch has no whole files, so only diffs built from two texts have folds that open.
 - **Files** have a header with the path, a rename arrow, +/− counts, a collapse chevron and
   an app slot (`header_actions`). The header of the file in view sticks to the top.
 - **Annotations** are the app's widgets under a line, keyed by file, side and line, such as

@@ -5,9 +5,20 @@
 //! drives its panel from the integrated GPU and offloads to the discrete one gets the integrated
 //! GPU, as before.
 //!
+//! On Windows, a window's or overlay's surface gets the adapter that drives the primary display
+//! (the one with the taskbar), else the next display's; offscreen work keeps the lowest-power
+//! one. On a hybrid laptop whose monitors hang off the discrete GPU, that's the discrete GPU,
+//! for the main window and the HUD alike: an AMD integrated GPU presenting the HUD across to
+//! them grew the process by gigabytes over an hour of dictation (hex#1268). A swapchain on a GPU
+//! that drives none (a desktop's unused integrated GPU beside the discrete card the monitors
+//! hang off) is presented across adapters: each one costs the display GPU's driver a device of
+//! its own (about 37 threads with the NVIDIA driver, one of them waking 64 times a second) and
+//! about 100 MB per full-screen surface on each GPU, and takes 50 to 160 ms to make instead of
+//! 6 ms. A laptop whose panel is on its integrated GPU still gets the integrated GPU.
+//!
 //! `WGPU_ADAPTER_NAME` (a case-insensitive part of the adapter's name) and `WGPU_POWER_PREF`
 //! (`low`, `high` or `none`) override the choice. Without them, and without a compositor device
-//! to match, Rune takes the lowest-power adapter. `RUNE_GPU_LOG=1` prints the choice and its
+//! or a display's GPU to match, Rune takes the lowest-power adapter. `RUNE_GPU_LOG=1` prints the choice and its
 //! reason; a machine with more than one GPU prints it anyway, once per process.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,6 +26,7 @@ pub(crate) enum Reason {
     EnvName,
     EnvPower,
     Compositor,
+    Display,
     LowPower,
 }
 
@@ -24,6 +36,7 @@ impl Reason {
             Reason::EnvName => "WGPU_ADAPTER_NAME",
             Reason::EnvPower => "WGPU_POWER_PREF",
             Reason::Compositor => "the compositor's GPU",
+            Reason::Display => "the GPU driving the primary display",
             Reason::LowPower => "lowest power",
         }
     }
@@ -46,11 +59,22 @@ impl Pick {
     pub fn on_compositor_device(&self, info: &wgpu::AdapterInfo) -> bool {
         self.compositor.as_deref().is_some_and(|pci| same_pci(pci, &info.device_pci_bus_id))
     }
+
+    /// Whether the compositor can show `info`'s buffers: any adapter's when it named no device,
+    /// otherwise only its own device's.
+    pub fn shows(&self, info: &wgpu::AdapterInfo) -> bool {
+        shows(self.compositor.as_deref(), &info.device_pci_bus_id)
+    }
 }
 
-/// The adapter for `surface` (or for offscreen work without one), by the order in the module
-/// docs.
-pub(crate) fn pick(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Result<Pick, String> {
+/// `Pick::shows` for an adapter on PCI device `pci`.
+fn shows(compositor: Option<&str>, pci: &str) -> bool {
+    compositor.is_none_or(|compositor| same_pci(compositor, pci))
+}
+
+/// The adapter for `surface` (or for offscreen work without one, unless it's for a surface not
+/// made yet: `presented`), by the order in the module docs.
+pub(crate) fn pick(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, presented: bool) -> Result<Pick, String> {
     let usable = |adapter: &wgpu::Adapter| surface.is_none_or(|s| adapter.is_surface_supported(s));
     let compositor = compositor_pci();
     let mut enumerated = None;
@@ -75,6 +99,17 @@ pub(crate) fn pick(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>
         if let Some(index) = by_pci(pci, &infos) {
             let adapter = adapters.into_iter().nth(index).expect("index from this list");
             return Ok(log(Pick { adapter, reason: Reason::Compositor, compositor }, enumerated));
+        }
+    }
+    // Only a surface is presented; offscreen work (tests, snapshots) keeps the lowest-power GPU.
+    let displays = if surface.is_some() || presented { display_devices() } else { Vec::new() };
+    if !displays.is_empty() {
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        let infos: Vec<_> = adapters.iter().map(|a| (a.get_info(), usable(a))).collect();
+        enumerated = Some(infos.iter().filter(|(info, _)| info.device_type != wgpu::DeviceType::Cpu).count());
+        if let Some(index) = by_display(&displays, &infos) {
+            let adapter = adapters.into_iter().nth(index).expect("index from this list");
+            return Ok(log(Pick { adapter, reason: Reason::Display, compositor }, enumerated));
         }
     }
     let adapter = request(instance, surface, wgpu::PowerPreference::LowPower)?;
@@ -103,6 +138,65 @@ fn by_pci(pci: &str, adapters: &[(wgpu::AdapterInfo, bool)]) -> Option<usize> {
     adapters.iter().position(|a| on(a) && a.0.backend == wgpu::Backend::Vulkan).or_else(|| adapters.iter().position(on))
 }
 
+/// The usable hardware adapter for the first of `displays` (PCI vendor and device IDs, the
+/// primary display's first) that has one.
+fn by_display(displays: &[(u32, u32)], adapters: &[(wgpu::AdapterInfo, bool)]) -> Option<usize> {
+    displays.iter().find_map(|ids| {
+        adapters.iter().position(|(info, usable)| *usable && info.device_type != wgpu::DeviceType::Cpu && (info.vendor, info.device) == *ids)
+    })
+}
+
+/// `PowerPreference::LowPower`'s order; a software adapter comes last.
+pub(crate) fn power_rank(device: wgpu::DeviceType) -> u8 {
+    match device {
+        wgpu::DeviceType::IntegratedGpu => 0,
+        wgpu::DeviceType::DiscreteGpu => 1,
+        wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Other => 3,
+        wgpu::DeviceType::Cpu => 4,
+    }
+}
+
+/// The PCI vendor and device IDs of the GPUs driving a display on the desktop, the primary
+/// display's first.
+#[cfg(target_os = "windows")]
+fn display_devices() -> Vec<(u32, u32)> {
+    use windows_sys::Win32::Graphics::Gdi::{DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_PRIMARY_DEVICE, DISPLAY_DEVICEW, EnumDisplayDevicesW};
+    let mut found = Vec::new();
+    for index in 0.. {
+        let mut device = DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..unsafe { std::mem::zeroed() } };
+        // SAFETY: `device` is a DISPLAY_DEVICEW with `cb` set, as the call requires.
+        if unsafe { EnumDisplayDevicesW(std::ptr::null(), index, &mut device, 0) } == 0 { break; }
+        if device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP == 0 { continue; }
+        let len = device.DeviceID.iter().position(|&c| c == 0).unwrap_or(device.DeviceID.len());
+        let Some(ids) = pci_ids(&String::from_utf16_lossy(&device.DeviceID[..len])) else { continue };
+        if device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0 {
+            found.retain(|other| *other != ids);
+            found.insert(0, ids);
+        } else if !found.contains(&ids) {
+            found.push(ids);
+        }
+    }
+    found
+}
+
+#[cfg(not(target_os = "windows"))]
+fn display_devices() -> Vec<(u32, u32)> {
+    Vec::new()
+}
+
+/// The vendor and device IDs in a PnP hardware ID (`PCI\VEN_10DE&DEV_2C05&SUBSYS_…`); None for
+/// a display that isn't on a PCI GPU (a remote or indirect display).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn pci_ids(id: &str) -> Option<(u32, u32)> {
+    let rest = id.get(..4).filter(|p| p.eq_ignore_ascii_case("PCI\\")).and_then(|_| id.get(4..))?;
+    let field = |key: &str| rest.split('&').find_map(|part| {
+        let value = part.get(..key.len()).filter(|k| k.eq_ignore_ascii_case(key)).and_then(|_| part.get(key.len()..))?;
+        u32::from_str_radix(value, 16).ok()
+    });
+    Some((field("VEN_")?, field("DEV_")?))
+}
+
 fn same_pci(a: &str, b: &str) -> bool {
     !a.is_empty() && a.eq_ignore_ascii_case(b)
 }
@@ -114,7 +208,7 @@ fn log(pick: Pick, adapters: Option<usize>) -> Pick {
             let info = pick.adapter.get_info();
             let pci = if info.device_pci_bus_id.is_empty() { String::new() } else { format!(", {}", info.device_pci_bus_id) };
             let compositor = pick.compositor.as_deref().map(|c| format!("; compositor on {c}")).unwrap_or_default();
-            eprintln!("rune: GPU {:?} ({}; {:?}, {:?}{pci}): {}{compositor}", info.name, crate::gpu::backend::label(), info.backend, info.device_type, pick.reason.describe());
+            eprintln!("rune: GPU {:?} ({}; {:?}, {:?}{pci}): {}{compositor}", info.name, crate::gpu::backend::label(&pick.adapter), info.backend, info.device_type, pick.reason.describe());
         });
     }
     pick

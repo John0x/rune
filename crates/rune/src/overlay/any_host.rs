@@ -23,8 +23,12 @@ impl<T: 'static> AnyHost for Overlay<T> {
         let deadline = deadline.filter(|_| !self.live.as_ref().and_then(|l| l.pacing.as_ref()).is_some_and(|p| p.running()));
         #[cfg(target_os = "macos")]
         let deadline = deadline.into_iter().chain(self.panel.as_ref().filter(|_| !self.occluded).and_then(|p| p.pointer_deadline())).min();
+        // A Windows fade-out steps its alpha once a frame.
+        #[cfg(target_os = "windows")]
+        let deadline = deadline.into_iter().chain(self.fading_out.map(|end| end.min(Instant::now() + crate::window::TIMER_FRAME))).min();
         deadline.into_iter().chain(self.retry.filter(|_| self.drawing())).chain(self.fading_out)
-            .chain(self.hidden_pace.deadline().filter(|_| !self.drawing())).min()
+            .chain(self.hidden_pace.deadline().filter(|_| !self.drawing()))
+            .chain(self.release_at.filter(|_| !self.drawing())).min()
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -44,7 +48,7 @@ impl<T: 'static> AnyHost for Overlay<T> {
     }
 
     fn owns(&self, id: WindowId) -> bool {
-        let window = match self.live.as_ref().map(|l| &l.backing) {
+        let window = match self.live.as_ref().map(|l| &l.backing).or(self.parked.as_ref()) {
             Some(Backing::Window(w)) => Some(w),
             _ => None,
         };
@@ -97,8 +101,9 @@ impl<T: 'static> AnyHost for Overlay<T> {
                 }
             }
             WindowEvent::RedrawRequested | WindowEvent::Resized(_) => {
-                // A new accent asks every window to redraw (`accent::watch`).
+                // A new accent or scroller style asks every window to redraw (`accent::watch`, `scroll_bars::watch`).
                 self.accent_changed(crate::system_accent());
+                self.scroll_bars_changed(crate::platform::scroll_bars::current());
                 self.dirty = true;
             }
             WindowEvent::CursorMoved { position, .. } if self.options.input.resolved(self.interactive) != OverlayInput::None => {
@@ -116,6 +121,7 @@ impl<T: 'static> AnyHost for Overlay<T> {
             }
             WindowEvent::Focused(focused) => {
                 self.rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
+                self.scroll_bars_changed(crate::platform::scroll_bars::reread());
                 if !focused { self.rt.cancel_composition(); }
                 self.dirty = true;
             }
@@ -158,7 +164,8 @@ impl<T: 'static> AnyHost for Overlay<T> {
         // A fading-out overlay takes no input; it only draws its exit.
         if !self.visible {
             self.hidden_input();
-            return self.draw();
+            let more = self.draw();
+            return self.a11y_turn() || more;
         }
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if let Some(live) = &self.live && let Some(x11) = &self.x11 && let Some((point, desktop)) = x11.take_pointer(live.scale) {
@@ -194,7 +201,7 @@ impl<T: 'static> AnyHost for Overlay<T> {
         }
         let more = self.draw();
         self.apply_cursor();
-        more
+        self.a11y_turn() || more
     }
 
     fn keeps_loop(&self) -> bool {
@@ -202,6 +209,20 @@ impl<T: 'static> AnyHost for Overlay<T> {
     }
 
     fn cancel_menus(&mut self) { self.popup.cancel(&mut self.rt); }
+}
+
+impl<T: 'static> Overlay<T> {
+    /// Answers what assistive clients asked of the overlay and sends its tree's changes. An
+    /// action draws the frame that runs it.
+    fn a11y_turn(&mut self) -> bool {
+        let Some(adapter) = self.live.as_mut().and_then(|l| l.a11y.as_mut()) else { return false };
+        let queued = adapter.service(&mut self.rt, self.name);
+        if queued {
+            self.dirty = true;
+            self.idle = false;
+        }
+        queued
+    }
 }
 
 impl<T: 'static> PendingOverlay for Overlay<T> {

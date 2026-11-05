@@ -163,8 +163,7 @@ impl<S: 'static> Runtime<S> {
             if axes.x() { moving |= self.step_scroll_x(i, dt); }
             // A horizontal viewport doesn't move vertically, even with content taller than it.
             let overflow = if axes.y() { self.scroll_overflow(i) } else { 0.0 };
-            #[cfg(target_arch = "wasm32")]
-            if let Some(active) = self.web_step_scroll(id, overflow, dt, false) {
+            if let Some(active) = self.step_touch_scroll(id, overflow, dt, false) {
                 moving |= active;
                 continue;
             }
@@ -176,6 +175,7 @@ impl<S: 'static> Runtime<S> {
             let laid = if axes.y() { self.ease_to_shrunk_end(i, overflow) } else { None };
             let Some(st) = self.scrolls.get_mut(&id) else { continue };
             st.scrolling = st.direct || st.v.abs() > 1.0 || st.x.v.abs() > 1.0;
+            st.by_hand |= st.scrolling;
             st.direct = false;
             st.max = overflow.max(0.0);
             if st.pinned && sp.stick_bottom {

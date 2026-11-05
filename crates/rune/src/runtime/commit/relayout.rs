@@ -34,37 +34,59 @@ pub(super) fn root_size(viewport: (f32, f32), fit_height: bool) -> Size<Dimensio
 }
 
 /// Whether a commit can lay `n` out again as it is. Layout rewrites the styles of
-/// `aspect_fit` elements and fitted anchored overlays, and live bindings and pictures change
-/// their nodes between commits.
-fn reusable(n: &Node) -> bool {
+/// `aspect_fit` elements and fitted anchored overlays, and pictures can change their aspect.
+/// Live bindings only own scene properties: moving the node retains their sources, sampled
+/// values and exact fill, while `apply` leaves their scene tracks alone.
+pub(super) fn reusable(n: &Node) -> bool {
     n.cold.get().is_none_or(|c| {
-        c.aspect_fit.is_none() && c.above.as_ref().is_none_or(|a| !a.fit) && c.live.is_empty() && c.pixel_aspect.is_none()
+        c.aspect_fit.is_none() && c.above.as_ref().is_none_or(|a| !a.fit) && c.pixel_aspect.is_none()
     })
 }
 
 impl<S: 'static> Runtime<S> {
     /// Measures a commit: lays the last tree out again when only the viewport changed since it
-    /// was built, else runs the view.
+    /// was built, remounts virtual rows alone when only their window moved, else runs the view.
     pub(super) fn measure_commit(&mut self, tx: &Tx) -> Measured {
-        if !self.resize_only(tx) {
-            self.refresh_layout_seen();
-            return self.measure(tx);
+        if self.resize_only(tx) {
+            // The view keeps what it last read; `settle_layout_reads` and the caret check run it
+            // when the new layout moves them.
+            let reads = self.layout_seen.reads.clone();
+            let caret_read = self.caret_watch;
+            let selection = self.selection_by_path();
+            let mut m = self.measurement(true);
+            m.layout_reads = reads;
+            m.caret_read = caret_read;
+            return match m.relayout() {
+                Some(measured) => Measured { selection, ..measured },
+                None => {
+                    self.refresh_layout_seen();
+                    self.measure(tx)
+                }
+            };
         }
-        // The view keeps what it last read; `settle_layout_reads` and the caret check run it
-        // when the new layout moves them.
-        let reads = self.layout_seen.reads.clone();
-        let caret_read = self.caret_watch;
-        let selection = self.selection_by_path();
-        let mut m = self.measurement(true);
-        m.layout_reads = reads;
-        m.caret_read = caret_read;
-        match m.relayout() {
-            Some(measured) => Measured { selection, ..measured },
-            None => {
-                self.refresh_layout_seen();
-                self.measure(tx)
-            }
+        if self.virtual_only(tx) {
+            let _blend = crate::theme::scope(self.srgb_blend);
+            let _bars = crate::platform::scroll_bars::scope(self.scroll_bars.state, self.scroll_bars.runtime_id);
+            let reads = self.layout_seen.reads.clone();
+            let caret_read = self.caret_watch;
+            let selection = self.selection_by_path();
+            let mut m = self.measurement(true);
+            m.layout_reads = reads;
+            m.caret_read = caret_read;
+            return match m.remount_virtuals() {
+                commit::remount::RemountOutcome::Measured(measured) => Measured { selection, ..measured },
+                commit::remount::RemountOutcome::Retry => {
+                    self.refresh_layout_seen();
+                    self.measure_retry(tx)
+                }
+                commit::remount::RemountOutcome::Fallback => {
+                    self.refresh_layout_seen();
+                    self.measure(tx)
+                }
+            };
         }
+        self.refresh_layout_seen();
+        self.measure(tx)
     }
 
     /// Whether this commit only resized the window: nothing the view reads changed since the
@@ -84,18 +106,33 @@ impl<S: 'static> Measurement<'_, S> {
     /// virtual list's window has to move, which only the view can build.
     fn relayout(mut self) -> Option<Measured> {
         self.anchor_virtuals();
-        let quiet = self.quiet_rows();
+        let len = self.nodes.len();
         let mut taffy = std::mem::replace(self.layout, LayoutEngine::with_capacity(0));
         let mut nodes = std::mem::take(self.spare_nodes);
         nodes.clear();
-        nodes.reserve(self.nodes.len());
-        nodes.extend(self.nodes.iter_mut().zip(quiet).map(|(n, quiet)| {
-            // The new nodes lay their text out again; the cache then holds the only reference.
-            n.text_layout = None;
-            let mut copy = Node { elided: None, virtual_mount: quiet, ..n.clone() };
-            copy.clear_run_layout();
-            copy
-        }));
+        nodes.reserve(len);
+        for slot in self.nodes.iter_mut() {
+            if slot.input.is_some() || slot.is_secure() {
+                // The new nodes lay their text out again; the cache then holds the only reference.
+                slot.text_layout = None;
+                let mut copy = Node { elided: None, virtual_mount: false, ..slot.clone() };
+                copy.clear_run_layout();
+                nodes.push(copy);
+            } else {
+                let stub = Node::moved_stub(slot);
+                let mut n = std::mem::replace(slot, stub);
+                n.text_layout = None;
+                n.elided = None;
+                n.clear_run_layout();
+                n.virtual_mount = false;
+                nodes.push(n);
+            }
+        }
+        self.mark_quiet_rows(&mut nodes);
+        let mut reused = std::mem::take(&mut self.memo.reused_scratch);
+        let mut split = std::mem::take(&mut self.memo.split_scratch);
+        build_relayout_spans(self.nodes, &nodes, self.virtuals, self.path_ids, self.node_index, &mut split, &mut reused);
+        self.memo.split_scratch = split;
         let root = nodes[0].taffy;
         let mut style = taffy.style(root).clone();
         style.set_size(root_size(self.viewport, self.fit_height));
@@ -109,6 +146,9 @@ impl<S: 'static> Measurement<'_, S> {
         }
         let (layout, mut nodes) = self.solve(taffy, root, nodes);
         if self.measure_virtuals(&nodes, false) || self.windows_move() {
+            memo_reuse::restore_moved_nodes(self.nodes, &mut nodes, &reused, &[]);
+            reused.clear();
+            self.memo.reused_scratch = reused;
             nodes.clear();
             *self.spare_nodes = nodes;
             *self.layout = layout;
@@ -124,7 +164,8 @@ impl<S: 'static> Measurement<'_, S> {
             caret_read: self.caret_read,
             layout_reads: self.layout_reads,
             memo_flattened: None,
-            memo_reused: Vec::new(),
+            memo_reused: reused,
+            taken_paths: Vec::new(),
             selection: Vec::new(),
         })
     }
@@ -141,16 +182,17 @@ impl<S: 'static> Measurement<'_, S> {
         }
     }
 
-    /// Which nodes mount quietly, as `populate_virtual_children` marks a virtual list's rows.
-    fn quiet_rows(&mut self) -> Vec<bool> {
-        let mut quiet = vec![false; self.nodes.len()];
+    /// Marks which nodes mount quietly, as `populate_virtual_children` marks a virtual list's rows.
+    fn mark_quiet_rows(&mut self, nodes: &mut [Node]) {
+        if self.virtuals.is_empty() {
+            return;
+        }
         for (path, v) in self.virtuals.iter_mut() {
             let Some(&list) = self.path_ids.get(path).and_then(|id| self.node_index.get(id)) else { continue };
-            for (i, n) in self.nodes.iter().enumerate().skip(list + 1).filter(|(_, n)| n.parent == Some(list)) {
-                quiet[i] = n.key.as_deref().and_then(|k| v.index_of(k)).is_some_and(|row| v.mounts_quietly(row, self.commits));
+            for n in nodes.iter_mut().skip(list + 1).filter(|n| n.parent == Some(list)) {
+                n.virtual_mount = n.key.as_deref().and_then(|k| v.index_of(k)).is_some_and(|row| v.mounts_quietly(row, self.commits));
             }
         }
-        quiet
     }
 
     /// Whether a virtual list's viewport came near the edge of its mounted rows, or its rows grew
@@ -205,6 +247,75 @@ impl<S: 'static> Measurement<'_, S> {
         }
 
         (taffy, nodes)
+    }
+}
+
+/// Partitions the moved nodes of a `relayout` pass into disjoint subtree [`ReusedSpan`]s so
+/// `clear_old_nodes` skips dropping every `moved_stub` and `clean_apply_spans` skips unchanged
+/// subtrees (such as fixed-width sidebars or blocks that did not rewrap).
+fn build_relayout_spans(
+    old_nodes: &[Node],
+    nodes: &[Node],
+    virtuals: &HashMap<String, crate::el::virtual_list::VirtualList>,
+    path_ids: &HashMap<String, NodeId>,
+    node_index: &HashMap<NodeId, usize>,
+    split: &mut Vec<bool>,
+    out: &mut Vec<memo_reuse::ReusedSpan>,
+) {
+    let len = nodes.len();
+    out.clear();
+    split.clear();
+    split.resize(len, false);
+    let mark_up = |mut cur: Option<usize>, split: &mut [bool]| {
+        while let Some(p) = cur {
+            if split[p] {
+                break;
+            }
+            split[p] = true;
+            cur = nodes[p].parent;
+        }
+    };
+    for path in virtuals.keys() {
+        if let Some(&list) = path_ids.get(path).and_then(|id| node_index.get(id))
+            && list < len
+        {
+            mark_up(Some(list), split);
+        }
+    }
+    for i in 0..len {
+        if !old_nodes[i].is_moved_stub() {
+            mark_up(Some(i), split);
+            continue;
+        }
+        let has_children = nodes.get(i + 1).is_some_and(|c| c.parent == Some(i));
+        let shallow = i == 0 || nodes[i].parent.is_some_and(|p| p == 0 || nodes[p].parent == Some(0));
+        if has_children && shallow {
+            split[i] = true;
+        }
+    }
+    let mut i = 0usize;
+    while i < len {
+        if !old_nodes[i].is_moved_stub() {
+            i += 1;
+            continue;
+        }
+        let span_len = if split[i] {
+            1
+        } else {
+            let mut sub_end = i + 1;
+            while sub_end < len && nodes[sub_end].parent.is_some_and(|p| p >= i) {
+                sub_end += 1;
+            }
+            sub_end - i
+        };
+        out.push(memo_reuse::ReusedSpan {
+            new_start: i,
+            old_start: i,
+            len: span_len,
+            same_path: true,
+            moved: true,
+        });
+        i += span_len;
     }
 }
 

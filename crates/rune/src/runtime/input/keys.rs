@@ -50,7 +50,8 @@ impl<S: 'static> Runtime<S> {
         }
         if self.focus_key(ev, shown, one) { return true; }
         let input_handles = match &ev.key {
-            crate::edit::Key::Function(_) | crate::edit::Key::ContextMenu | crate::edit::Key::Tab | crate::edit::Key::PageUp | crate::edit::Key::PageDown => false,
+            crate::edit::Key::Function(_) | crate::edit::Key::ContextMenu | crate::edit::Key::Tab | crate::edit::Key::PageUp | crate::edit::Key::PageDown
+            | crate::edit::Key::Insert | crate::edit::Key::PrintScreen | crate::edit::Key::ScrollLock | crate::edit::Key::Pause => false,
             crate::edit::Key::Command(c) => {
                 matches!(c, 'a' | 'c' | 'x' | 'z')
                     || (matches!(c, 'b' | 'i' | 'u') && self.focused_input().is_some_and(|i| i.edit.format_chord(ev).is_some()))
@@ -113,10 +114,13 @@ impl<S: 'static> Runtime<S> {
             std::iter::successors(Some(path), |p| p.rsplit_once('/').map(|(head, _)| head))
                 .find_map(|p| self.nodes.iter().position(|n| n.path == p))
         });
-        let around = |from: usize| std::iter::successors(Some(from), |&i| self.nodes[i].parent).find(|&i| self.pageable(i));
+        // A step's key (`Play::press`) pages only the stage, never the playground around it.
+        let staged = self.playground.as_ref().is_some_and(|p| p.pressing);
+        let pageable = |i: usize| self.pageable(i) && (!staged || self.under(i, crate::playground::is_stage));
+        let around = |from: usize| std::iter::successors(Some(from), |&i| self.nodes[i].parent).find(|&i| pageable(i));
         let i = focused.and_then(around)
             .or_else(|| self.pointer.and_then(|(x, y)| self.scroll_at(x, y)).and_then(|id| self.node_index.get(&id).copied()).and_then(around))
-            .or_else(|| (0..self.nodes.len()).find(|&i| self.pageable(i)));
+            .or_else(|| (0..self.nodes.len()).find(|&i| pageable(i)));
         let Some(i) = i else { return false };
         if !self.page_to(i, |offset, max, page| match ev.key { PageUp => offset - page, PageDown => offset + page, Home => 0.0, _ => max }) { return false; }
         log_event!(self, "page {:?}", ev.key);

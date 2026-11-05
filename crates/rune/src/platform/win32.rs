@@ -13,7 +13,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_TRANSPARENT,
 };
 
+mod cloak;
+mod dpi_drag;
 mod pointer;
+
+pub(crate) use cloak::Cloak;
+pub(crate) use dpi_drag::follow_suggested_rect;
 
 fn hwnd(window: &winit::window::Window) -> Option<HWND> {
     let RawWindowHandle::Win32(h) = window.window_handle().ok()?.as_raw() else { return None };
@@ -35,6 +40,8 @@ struct Input {
     input: Cell<OverlayInput>,
     follow: Cell<bool>,
     level: OverlayLevel,
+    /// Fading out (`OverlayWindow::fade`): every click goes through.
+    fading: Cell<bool>,
 }
 impl Input {
     fn track(&self) -> bool { self.input.get() == OverlayInput::Regions || self.follow.get() }
@@ -43,11 +50,11 @@ impl Input {
         (point.x as f32 / self.scale.get(), point.y as f32 / self.scale.get())
     }
     fn hit(&self, point: (f32, f32)) -> bool {
-        self.captured.get() || match self.input.get() {
+        !self.fading.get() && (self.captured.get() || match self.input.get() {
             OverlayInput::All => true,
             OverlayInput::Regions => self.regions.borrow().iter().any(|r| crate::overlay::options::contains(*r, point.0, point.1)),
             _ => false,
-        }
+        })
     }
     fn observe(&self, point: POINT) {
         if !self.visible.get() { return; }
@@ -102,7 +109,7 @@ impl OverlayWindow {
         let exclusion = if options.exclude_from_capture {
             if unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } != 0 { OverlaySupport::Requested } else { OverlaySupport::Failed }
         } else { OverlaySupport::Unknown };
-        let input = Rc::new(Input { hwnd, regions: RefCell::default(), scale: Cell::new(window.scale_factor() as f32), clicks: RefCell::default(), captured: Cell::new(false), visible: Cell::new(false), input: Cell::new(mode), follow: Cell::new(options.follow_pointer), level: options.level });
+        let input = Rc::new(Input { hwnd, regions: RefCell::default(), scale: Cell::new(window.scale_factor() as f32), clicks: RefCell::default(), captured: Cell::new(false), visible: Cell::new(false), input: Cell::new(mode), follow: Cell::new(options.follow_pointer), level: options.level, fading: Cell::new(false) });
         if unsafe { SetWindowSubclass(hwnd, Some(subclass), 0x52554e45, Rc::as_ptr(&input) as usize) } == 0 {
             return Err(format!("SetWindowSubclass failed: {}", last_error()));
         }
@@ -154,6 +161,8 @@ impl OverlayWindow {
     /// visibility change would also reset these styles. Errs when Windows leaves it hidden.
     pub fn show(&mut self) -> Result<(), String> {
         let hwnd = self.input.hwnd;
+        // Opaque again, after any fade-out.
+        self.input.fading.set(false);
         overlay_styles(hwnd, self.input.input.get())?;
         // SAFETY: Win32 calls on a live window owned by this thread.
         let visible = unsafe {
@@ -176,6 +185,14 @@ impl OverlayWindow {
         self.observing = true;
         if let Some((x, y)) = pointer_position() { self.input.observe(POINT { x, y }); }
         Ok(())
+    }
+    /// Keeps the shown window up at `alpha` (255 opaque) while it fades out, taking no clicks.
+    pub fn fade(&self, alpha: u8) {
+        if !self.input.fading.replace(true) && let Some((x, y)) = pointer_position() {
+            self.input.observe(POINT { x, y });
+        }
+        // SAFETY: a Win32 call on a live layered window owned by this thread.
+        unsafe { SetLayeredWindowAttributes(self.input.hwnd, 0, alpha, LWA_ALPHA); }
     }
     pub fn hide(&mut self) {
         // SAFETY: a Win32 call on a live window owned by this thread.

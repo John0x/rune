@@ -29,7 +29,14 @@ pub(crate) fn serves(gpu: &crate::render::Gpu, surface: &wgpu::Surface<'_>, want
 
 /// `pick`'s adapter when it composites translucent pixels on `surface`; otherwise the adapter
 /// on `instance` that does on the compositor's GPU (`gpu_pick`), then the lowest-power one that
-/// does, or `pick`'s adapter when none can.
+/// does, or `pick`'s adapter when none can. When the compositor named its GPU, adapters on
+/// others are never candidates, however their drivers answer: on GNOME with an NVIDIA card, whose
+/// XWayland surfaces are opaque only, RADV and lavapipe claim premultiplied alpha for an overlay's
+/// XWayland window but can't make its swapchain (hex#979, #982). It draws opaque there instead.
+/// A software adapter never replaces a hardware one: on X11 with NVIDIA, whose surfaces are
+/// opaque only, lavapipe claims premultiplied alpha, but its swapchain sends DRI3 requests
+/// NVIDIA's Xorg refuses, and the X error lands in whichever window is next (hex#1216). The
+/// hardware adapter draws opaque there, and an X compositor still blends its ARGB window.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn prefer(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>, pick: &crate::gpu::pick::Pick) -> wgpu::Adapter {
     if mode(surface, &pick.adapter).is_some() {
@@ -37,34 +44,39 @@ pub(crate) fn prefer(instance: &wgpu::Instance, surface: &wgpu::Surface<'_>, pic
     }
     let mut able: Vec<_> = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
         .into_iter()
-        .filter(|candidate| candidate.is_surface_supported(surface) && mode(surface, candidate).is_some())
+        .filter(|candidate| {
+            let info = candidate.get_info();
+            pick.shows(&info) && takes_over(pick.adapter.get_info().device_type, info.device_type)
+                && candidate.is_surface_supported(surface) && mode(surface, candidate).is_some()
+        })
         .collect();
     able.sort_by_key(|candidate| {
         let info = candidate.get_info();
-        (!pick.on_compositor_device(&info), power_rank(info.device_type))
+        (!pick.on_compositor_device(&info), crate::gpu::pick::power_rank(info.device_type))
     });
     able.into_iter().next().unwrap_or_else(|| pick.adapter.clone())
 }
 
-/// `PowerPreference::LowPower`'s order; a software adapter comes last.
+/// Whether an adapter of type `candidate` may draw a translucent surface in place of `pick`'s:
+/// any but a software adapter, which may only stand in for another.
 #[cfg(not(target_arch = "wasm32"))]
-fn power_rank(device: wgpu::DeviceType) -> u8 {
-    match device {
-        wgpu::DeviceType::IntegratedGpu => 0,
-        wgpu::DeviceType::DiscreteGpu => 1,
-        wgpu::DeviceType::VirtualGpu => 2,
-        wgpu::DeviceType::Other => 3,
-        wgpu::DeviceType::Cpu => 4,
-    }
+fn takes_over(pick: wgpu::DeviceType, candidate: wgpu::DeviceType) -> bool {
+    candidate != wgpu::DeviceType::Cpu || pick == wgpu::DeviceType::Cpu
 }
 
 #[cfg(test)]
 mod tests {
+    /// lavapipe never takes a translucent overlay from a hardware adapter (hex#1216), but a
+    /// hardware adapter may still take one from software, and GPUs from each other.
     #[test]
-    fn low_power_order_puts_integrated_first_and_software_last() {
+    fn software_never_takes_over_from_hardware() {
+        use super::takes_over;
         use wgpu::DeviceType::*;
-        let mut devices = [Cpu, DiscreteGpu, Other, IntegratedGpu, VirtualGpu];
-        devices.sort_by_key(|d| super::power_rank(*d));
-        assert_eq!(devices, [IntegratedGpu, DiscreteGpu, VirtualGpu, Other, Cpu]);
+        for hardware in [DiscreteGpu, IntegratedGpu, VirtualGpu, Other] {
+            assert!(!takes_over(hardware, Cpu), "{hardware:?}");
+            assert!(takes_over(Cpu, hardware), "{hardware:?}");
+        }
+        assert!(takes_over(DiscreteGpu, IntegratedGpu));
+        assert!(takes_over(Cpu, Cpu));
     }
 }

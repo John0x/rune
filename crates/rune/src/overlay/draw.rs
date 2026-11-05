@@ -7,10 +7,46 @@ impl<T: 'static> Overlay<T> {
     /// Draws a frame if one is due; true while it needs more (animating).
     pub(super) fn draw(&mut self) -> bool {
         self.end_fade_out(Instant::now());
-        if !self.drawing() { return false; }
+        if !self.drawing() {
+            self.drain_hidden();
+            return false;
+        }
         let more = self.draw_frame(false);
         self.open_popup();
         more
+    }
+
+    /// A layer surface kept while hidden (prewarmed, not shown yet) still hears the compositor.
+    fn drain_hidden(&mut self) {
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if let Some(Live { backing: Backing::Layer(layer), .. }) = self.live.as_mut() && layer.drain() {
+            self.hide();
+        }
+    }
+
+    /// One input event a layer or XWayland surface read on its own connection.
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+    fn surface_input(&mut self, input: crate::platform::layer_shell::Input) {
+        use crate::platform::layer_shell::Input;
+        match input {
+            Input::Move(x, y) => { self.dirty |= self.rt.observe_pointer(x, y); return; }
+            Input::Leave => self.rt.pointer_leave(),
+            Input::Button(down) => if let Some((x, y)) = self.rt.pointer() {
+                if down { self.rt.pointer_down(x, y); } else { self.rt.pointer_up(x, y); }
+            },
+            Input::Secondary(down) => if let Some((x, y)) = self.rt.pointer() { if down { self.rt.secondary_down(x, y) } else { self.rt.secondary_up(x, y) } },
+            Input::Key(key) => self.rt.key(key),
+            Input::KeyUp(key) => {
+                self.dirty |= self.rt.key_up(key);
+                return;
+            }
+            Input::Physical(event, fallback) => {
+                let keep = matches!(event, crate::PhysicalInput::Key { pressed: true, .. }) || self.rt.wants_key_up();
+                self.dirty |= self.rt.physical_with_fallback(event, fallback.filter(|_| keep));
+                return;
+            }
+        }
+        self.dirty = true;
     }
 
     /// Opens the pop-up menu a handler asked for over the overlay's panel. A hidden or occluded
@@ -33,28 +69,7 @@ impl<T: 'static> Overlay<T> {
                 self.hide();
                 return false;
             }
-            for input in changes.input {
-                use crate::platform::layer_shell::Input;
-                match input {
-                    Input::Move(x, y) => { self.dirty |= self.rt.observe_pointer(x, y); continue; }
-                    Input::Leave => self.rt.pointer_leave(),
-                    Input::Button(down) => if let Some((x, y)) = self.rt.pointer() {
-                        if down { self.rt.pointer_down(x, y); } else { self.rt.pointer_up(x, y); }
-                    },
-                    Input::Secondary(down) => if let Some((x, y)) = self.rt.pointer() { if down { self.rt.secondary_down(x, y) } else { self.rt.secondary_up(x, y) } },
-                    Input::Key(key) => self.rt.key(key),
-                    Input::KeyUp(key) => {
-                        self.dirty |= self.rt.key_up(key);
-                        continue;
-                    }
-                    Input::Physical(event, fallback) => {
-                        let keep = matches!(event, crate::PhysicalInput::Key { pressed: true, .. }) || self.rt.wants_key_up();
-                        self.dirty |= self.rt.physical_with_fallback(event, fallback.filter(|_| keep));
-                        continue;
-                    }
-                }
-                self.dirty = true;
-            }
+            for input in changes.input { self.surface_input(input); }
             if let Some((w, h)) = changes.size {
                 let size = (if w == 0 { self.at.size.0 } else { w as f32 }, if h == 0 { self.at.size.1 } else { h as f32 });
                 if size != self.at.size {
@@ -73,7 +88,10 @@ impl<T: 'static> Overlay<T> {
             }
         }
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        if let Some(Live { backing: Backing::Xwayland(surface), .. }) = self.live.as_ref() { surface.drain(); }
+        if let Some(Live { backing: Backing::Xwayland(surface), .. }) = self.live.as_mut() {
+            let input = surface.dispatch();
+            for input in input { self.surface_input(input); }
+        }
         self.apply_input();
         if self.live.is_none() || self.renderer.is_none() || self.gpu.is_none() {
             return false;
@@ -144,11 +162,12 @@ impl<T: 'static> Overlay<T> {
         // The present queue's vsync paces redraws where no display link does.
         if !prewarm { self.meter.redraw(paced || !cfg!(target_os = "macos")); }
         if renderer.srgb_blend() != self.rt.srgb_blend() {
-            if !crate::window::reblend(&live.surface, gpu, &mut live.config, renderer, &mut live.alpha, &mut self.rt) { return false }
+            if !crate::window::reblend(&live.surface, gpu, &mut live.config, renderer, &mut live.alpha, &mut self.rt) { self.surface_refused("its GPU surface refused a new configuration".into()); return false }
         }
         let frame = match crate::window::acquire_checked(&live.surface, &gpu.device, &live.config, if prewarm { 2 } else { 1 }, &mut self.meter, !read_occlusion) {
             Ok(frame) => frame,
             Err(missed) => {
+                if missed == crate::window::Missed::Unconfigured { self.surface_refused("its GPU surface refused a new configuration".into()); return false; }
                 if !prewarm {
                     #[cfg(target_os = "macos")]
                     if missed == crate::window::Missed::Occluded { self.set_occluded(true); }
@@ -184,6 +203,7 @@ impl<T: 'static> Overlay<T> {
                     Ok(frame) => frame,
                     // Returning true turned the loop with ControlFlow::Poll; wait like any miss.
                     Err(missed) => {
+                        if missed == crate::window::Missed::Unconfigured { self.surface_refused("its GPU surface refused a new configuration".into()); return false; }
                         if !prewarm {
                             if missed == crate::window::Missed::Occluded { self.set_occluded(true); }
                             self.missed(missed, paced, true);
@@ -196,10 +216,11 @@ impl<T: 'static> Overlay<T> {
         // A handler switched blending (`Tx::set_srgb_blend`): this drawable has the old format.
         let frame = if renderer.srgb_blend() != self.rt.srgb_blend() {
             drop(frame);
-            if !crate::window::reblend(&live.surface, gpu, &mut live.config, renderer, &mut live.alpha, &mut self.rt) { return false }
+            if !crate::window::reblend(&live.surface, gpu, &mut live.config, renderer, &mut live.alpha, &mut self.rt) { self.surface_refused("its GPU surface refused a new configuration".into()); return false }
             match crate::window::acquire_checked(&live.surface, &gpu.device, &live.config, if prewarm { 2 } else { 1 }, &mut self.meter, !read_occlusion) {
                 Ok(frame) => frame,
                 Err(missed) => {
+                    if missed == crate::window::Missed::Unconfigured { self.surface_refused("its GPU surface refused a new configuration".into()); return false; }
                     if !prewarm {
                         #[cfg(target_os = "macos")]
                         if missed == crate::window::Missed::Occluded { self.set_occluded(true); }
@@ -238,6 +259,7 @@ impl<T: 'static> Overlay<T> {
             alpha.draw(&mut enc, &view);
         }
         frame::submit_and_present(live, renderer, gpu, &self.rt, enc, frame, prewarm);
+        crate::render::gpu_events::presented();
         if !prewarm { self.meter.presented(); }
         self.dirty = false;
         #[cfg(target_os = "macos")]
@@ -278,6 +300,11 @@ impl<T: 'static> Overlay<T> {
     fn unchanged_frame(&mut self) -> bool {
         super::input::drop_window_requests(&mut self.rt);
         self.clipboard.flush(&mut self.rt);
+        // Hit regions paint nothing, so a frame can change only them (a full-screen drawing
+        // surface turning on); no presentation follows to commit them.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if self.publish_regions() && let Some(Live { backing: Backing::Layer(layer), .. }) = &mut self.live { layer.commit(); }
+        #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
         self.publish_regions();
         self.meter.redraw(true);
         self.dirty = false;

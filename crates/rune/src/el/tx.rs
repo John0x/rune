@@ -7,6 +7,7 @@ use rune_motion::{Anim, Spring};
 use crate::el::*;
 
 mod keys;
+mod press;
 mod scroll;
 
 /// What a handler may say about the commit it causes.
@@ -14,6 +15,10 @@ mod scroll;
 pub struct Tx {
     pub(crate) shortcut_activation_token: Option<String>,
     pub(crate) key_repeat: bool,
+    /// `Tx::drag_repeat`.
+    pub(crate) drag_repeat: bool,
+    /// `Tx::drag_repeat_after`.
+    pub(crate) drag_repeat_after: Option<std::time::Duration>,
     /// `Tx::input_time`.
     pub(crate) input_time: Option<crate::time::Instant>,
     pub(crate) physical_key: Option<crate::PhysicalKeyCode>,
@@ -64,6 +69,8 @@ pub struct Tx {
     /// Modifier keys held as the handler runs.
     pub(crate) mods: crate::Mods,
     pub(crate) srgb_blend: Option<bool>,
+    /// `Tx::record_rewind`.
+    pub(crate) rewind: Option<Option<crate::rewind::Rewind>>,
     pub(crate) font_smoothing: Option<crate::text::FontSmoothing>,
     pub(crate) font_families: Option<(String, String)>,
     pub(crate) blur: bool,
@@ -306,6 +313,12 @@ impl Tx {
     /// Windows, overlays, the web canvas and headless runs all follow.
     pub fn set_srgb_blend(&mut self, enabled: bool) {
         self.srgb_blend = Some(enabled);
+    }
+
+    /// Record this window's presented frames into `rewind` from the next frame, or stop with
+    /// `None` (see [`crate::rewind`]). Nothing records until a handler asks.
+    pub fn record_rewind(&mut self, rewind: Option<&crate::rewind::Rewind>) {
+        self.rewind = Some(rewind.cloned());
     }
 
     /// Rasterise and place this window's glyphs in `mode` from the next frame, as if it had

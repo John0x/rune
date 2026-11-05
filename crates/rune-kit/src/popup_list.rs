@@ -65,9 +65,6 @@ impl PopupItem {
     pub fn label(&self) -> &str {
         &self.label
     }
-    pub fn is_disabled(&self) -> bool {
-        self.disabled
-    }
 }
 
 impl From<&PopupItem> for PopupItem {
@@ -251,6 +248,8 @@ impl<S: 'static> PopupList<S> {
                 .key(format!("{}-option-{}", self.key, id))
                 .role("option")
                 .label(&option.label)
+                .description(option.description.clone().unwrap_or_default())
+                .position_in_set(i + 1, self.items.len())
                 .focus_selected(is_active)
                 .w_full()
                 .h(28.0)
@@ -268,16 +267,16 @@ impl<S: 'static> PopupList<S> {
             }
             if let Some(desc) = option.description.as_deref().filter(|d| !d.is_empty()) {
                 item = item
-                    .child(text(&option.label).font(k.ty.ui_compact).color(k.c.text_base).shrink().truncate())
-                    .child(text(desc).key("description").font(k.ty.ui_compact).color(k.c.text_weak).grow(1.0).shrink().truncate());
+                    .child(text(&option.label).font(k.ty.ui_compact).color(k.c.text_base).shrink().truncate().a11y_hidden())
+                    .child(text(desc).key("description").font(k.ty.ui_compact).color(k.c.text_weak).grow(1.0).shrink().truncate().a11y_hidden());
             } else {
-                item = item.child(text(&option.label).font(k.ty.ui_compact).color(k.c.text_base).grow(1.0).shrink().truncate());
+                item = item.child(text(&option.label).font(k.ty.ui_compact).color(k.c.text_base).grow(1.0).shrink().truncate().a11y_hidden());
             }
             if let Some(trailing) = &option.trailing {
                 item = item.child(trailing.clone());
             }
             if option.disabled {
-                item = item.dim(0.5).on_press(|_: &mut S| {});
+                item = item.dim(0.5).disabled(true).on_press(|_: &mut S| {});
             } else {
                 if let Some(on_active) = &self.on_active {
                     let on_active = on_active.clone();
@@ -317,7 +316,7 @@ impl<S: 'static> PopupList<S> {
             .w_full()
             .shrink()
             .min_h(0.0)
-            .child(viewport)
+            .child(crate::scroll_bar(k, &format!("{}-scroll-area", self.key), "viewport", viewport).w_full().shrink().min_h(0.0))
             .child(
                 el().key("empty")
                     .h(if empty { 28.0 } else { 0.0 })

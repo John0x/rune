@@ -473,3 +473,64 @@ fn drag_region_policy_preserves_titled_windows_and_panels() {
         }
     }
 }
+
+/// A GPU-free wgpu instance.
+#[cfg(target_os = "linux")]
+fn noop_instance() -> wgpu::Instance {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = wgpu::Backends::NOOP;
+    descriptor.backend_options.noop.enable = true;
+    wgpu::Instance::new(descriptor)
+}
+
+/// A surface that refuses its configuration reports it as an error its owner can drop, not a
+/// panic in wgpu's default handler that takes the app's every window with it (hex#979).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_surface_configuration_is_an_error_not_a_panic() {
+    use std::num::NonZeroU32;
+    use std::ptr::NonNull;
+    use winit::raw_window_handle::{RawDisplayHandle, RawWindowHandle, XcbDisplayHandle, XcbWindowHandle};
+    let instance = noop_instance();
+    // The noop backend takes any handle and reports no capabilities, so configuring fails.
+    let surface = unsafe {
+        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(RawDisplayHandle::Xcb(XcbDisplayHandle::new(Some(NonNull::dangling()), 0))),
+            raw_window_handle: RawWindowHandle::Xcb(XcbWindowHandle::new(NonZeroU32::new(1).unwrap())),
+        })
+    }
+    .unwrap();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
+    let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: wgpu::TextureFormat::Bgra8UnormSrgb,
+        width: 200,
+        height: 80,
+        present_mode: wgpu::PresentMode::AutoVsync,
+        desired_maximum_frame_latency: 2,
+        alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+        view_formats: vec![],
+        color_space: Default::default(),
+    };
+    let error = configure(&surface, &device, &config).unwrap_err();
+    assert!(error.starts_with("Validation Error: In Surface::configure"), "{error}");
+    assert!(error.ends_with("(200x80, Bgra8UnormSrgb, PreMultiplied, AutoVsync)"), "{error}");
+}
+
+/// Each Rune GPU has its own wgpu instance, and wgpu compares devices by an id each instance
+/// numbers from the start, so a new GPU's device equals the old one's. A renderer's device key
+/// tells them apart, so a compositor keeping resources by it remakes them (hex#982).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_new_gpus_device_equals_the_old_one_but_its_key_differs() {
+    let device = || {
+        let adapter = pollster::block_on(noop_instance().request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap().0
+    };
+    let (old, new) = (device(), device());
+    assert!(old == new, "wgpu tells devices of separate instances apart by now: device equality may do");
+    let format = wgpu::TextureFormat::Bgra8Unorm;
+    let (old, new) = (crate::render::Renderer::new(&old, format), crate::render::Renderer::new(&new, format));
+    assert_ne!(old.device_key(), new.device_key());
+}

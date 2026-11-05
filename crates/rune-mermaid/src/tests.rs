@@ -165,3 +165,19 @@ pub(crate) fn assert_prefixes_never_panic(src: &str, dark: bool) {
     }
     assert!(scene(src, &paint, None).is_some());
 }
+
+/// Seven lanes with long names: wider than a 420-point column even at 60%.
+const WIDE_SEQUENCE: &str = "sequenceDiagram\n  autonumber\n  participant B as Browser on a laptop\n  participant E as Edge cache in front\n  participant A as Auth service cluster\n  participant P as Payments API server\n  participant W as Billing worker pool\n  participant S as Search index shard\n  participant L as Long-running audit log\n  B->>E: a request arrives at the edge\n  E->>A: is this session token still valid?\n  A-->>E: yes, here is the account scope\n  E->>P: forward the call with its scope\n  P->>W: enqueue the invoice with the scope\n  W->>S: index the invoice\n  S-->>W: ok\n  W->>L: record the change\n  W-->>P: done\n  P-->>E: the response";
+
+#[test]
+fn min_scale_zero_fits_any_width() {
+    let narrow = DiagramStyle { max_width: 420.0, ..DiagramStyle::neutral(true) };
+    let room = super::canvas::room(&narrow);
+    let floored = scene(WIDE_SEQUENCE, &narrow, None).expect("draws");
+    assert!((floored.scale - 0.6).abs() < 1e-4 && floored.size[0] > room, "by default it stops at 60%: {} at {}", floored.size[0], floored.scale);
+    let fits = scene(WIDE_SEQUENCE, &narrow.min_scale(0.0), None).expect("draws");
+    assert!(fits.size[0] <= room + 2.01, "min_scale 0 fits the room {room}: {}", fits.size[0]);
+    assert!(fits.scale < 0.6 && (fits.full[1] * fits.scale - fits.size[1]).abs() < 0.01, "it shrinks evenly: {}", fits.scale);
+    let roomy = DiagramStyle { max_width: 4000.0, ..narrow }.min_scale(0.0);
+    assert_eq!(scene(WIDE_SEQUENCE, &roomy, None).expect("draws").scale, 1.0, "never grows past full size");
+}

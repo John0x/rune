@@ -110,21 +110,28 @@ pub struct OverlayOptions {
     pub follow_pointer: bool,
     pub level: OverlayLevel,
     /// Native best effort, not a security boundary. Use the window number in capture filters.
-    /// Applies only while the overlay is shown: on macOS a hidden prewarmed panel stays ordered
-    /// in at alpha zero on every Space, and an excluded window there would blank every Space's
-    /// Mission Control thumbnail, so it turns capturable once a hide's fade-out finishes and
-    /// excluded again before the next show's alpha rises.
+    /// Applies only while shown, including the exit fade. On macOS, hidden panels order out
+    /// before restoring sharing, even when prewarmed: alpha zero and a sharing reset alone
+    /// must not leave an excluded window on every Space. Exclusion resumes before ordering in.
     /// `OverlayHandle::set_exclude_from_capture` changes it later.
     pub exclude_from_capture: bool,
     pub keys: KeyPolicy,
     pub input: OverlayInput,
     /// Create and warm a hidden native host on the event thread at startup. Desktop hosts
-    /// retain their window and GPU surface across hide/show; Wayland must recreate on hide.
-    /// macOS keeps the pre-rendered panel ordered in at alpha zero, with input disabled.
+    /// retain their window and GPU surface across hide/show (unless
+    /// `ConfiguredOverlay::release_gpu_when_hidden`); Wayland must recreate on hide.
+    /// macOS orders the panel in at alpha zero only for a scoped prewarm, then orders it out.
     /// Initial preparation settles the view. Later reveals refresh content, geometry and
     /// live values while preserving motion elapsed since each hidden commit. Hidden motion
     /// catches up on poll/reveal without driving a frame loop.
     pub prewarm: bool,
+    /// Wayland without layer-shell (GNOME): lets an overlay that takes pointer input show on
+    /// XWayland, as an override-redirect window that takes clicks in its input shape and never
+    /// keyboard focus. Off by default: connecting starts XWayland on GNOME, so a host opts in
+    /// explicitly, having checked that it already runs. `KeyPolicy::OnDemand` overlays still
+    /// can't use it. Read when the surface is made, at each show on Wayland;
+    /// `OverlayHandle::set_xwayland_input` changes it.
+    pub xwayland_input: bool,
 }
 
 /// Keeps existing exhaustive `OverlaySpec` literals source compatible.
@@ -132,7 +139,7 @@ pub struct ConfiguredOverlay<T: 'static> {
     pub spec: OverlaySpec<T>,
     pub options: OverlayOptions,
     pub on_key: Option<fn(&mut T, &crate::KeyEvent, &mut crate::Tx) -> bool>,
-    pub on_created: Option<Box<dyn FnOnce(OverlayCreated)>>,
+    pub on_created: Option<Box<dyn FnMut(OverlayCreated)>>,
     pub(crate) poll: Option<fn(&mut T, f64, &mut crate::Tx) -> bool>,
     pub(crate) on_focus: Option<fn(&mut T, bool, &mut crate::Tx)>,
     pub(crate) compositor: Option<Box<dyn crate::compose::Compositor<T>>>,
@@ -141,6 +148,7 @@ pub struct ConfiguredOverlay<T: 'static> {
     pub(crate) macos_level: Option<isize>,
     pub(crate) modifier_keys: bool,
     pub(crate) animate_reveal: bool,
+    pub(crate) release_after: Option<std::time::Duration>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -179,13 +187,35 @@ impl<T: 'static> ConfiguredOverlay<T> {
     /// Waking a shown overlay draws a frame, which polls; a hidden one runs a frame without
     /// drawing. Headless runs don't create overlays, so they don't call it.
     pub fn setup(mut self, f: fn(&mut T, crate::Waker)) -> Self { self.setup = Some(f); self }
-    /// Called once on the event thread after native creation, before the first show.
+    /// Called on the event thread after native creation, before the first show, and again for
+    /// each window made later (Windows and macOS make a new one for each show with
+    /// `release_gpu_when_hidden`), so a window number in a capture filter stays current.
     /// Use `prewarm: true` to create at startup rather than waiting for `show()`.
-    pub fn on_created(mut self, f: impl FnOnce(OverlayCreated) + 'static) -> Self { self.on_created = Some(Box::new(f)); self }
+    pub fn on_created(mut self, f: impl FnMut(OverlayCreated) + 'static) -> Self { self.on_created = Some(Box::new(f)); self }
     /// Showing doesn't settle motion: what the state started while hidden plays from the
     /// first visible frame, such as a notification stack's first card entering. By default
     /// an unretained overlay shows settled, at its target.
     pub fn animate_reveal(mut self) -> Self { self.animate_reveal = true; self }
+    /// While hidden, the overlay holds no GPU surface, swapchain or renderer. Each show makes the
+    /// surface, and each hide drops it. Away from macOS, the GPU device and renderer then wait
+    /// five minutes for the next surface (a window's or overlay's) before they go, so an overlay
+    /// shown often (a HUD on each dictation) keeps one device rather than making one per show
+    /// (hex#1268). On Windows and macOS the window comes and goes with the surface, and a
+    /// prewarmed one makes nothing at startup, so a hidden overlay there has no window at all
+    /// (NVIDIA's Instant Replay took a hidden display-sized window for a game on Windows, and
+    /// macOS 27's Mission Control lost its Space thumbnails to hidden screen-sized panels). On X11
+    /// a prewarmed one makes only its window at startup and keeps it. A show then waits for the
+    /// surface (a few milliseconds), and with no device to take, for a new device and its
+    /// pipelines too (over half a second on some Windows PCs). For overlays that show rarely and
+    /// cover a display, such as a drawing layer or a picker: hidden, their swapchains hold tens
+    /// of megabytes. By default a prewarmed overlay makes its surface at startup and keeps it,
+    /// so it shows at once.
+    pub fn release_gpu_when_hidden(mut self) -> Self { self.release_after = Some(std::time::Duration::ZERO); self }
+    /// `release_gpu_when_hidden`, once the overlay has stayed hidden for `after`: shows in
+    /// a burst (a HUD across a few dictations) keep their surface and show at once, and an app
+    /// at rest gives the device back. A prewarmed one still makes its surface only to show.
+    /// macOS ignores it: a prewarmed panel retains its pixels at alpha zero.
+    pub fn release_gpu_after(mut self, after: std::time::Duration) -> Self { self.release_after = Some(after); self }
     /// The macOS window level (`NSWindow.Level`, e.g. 3 for `.floating`), in place of
     /// `OverlayOptions::level`; `OverlayHandle::set_macos_level` changes it later. At any
     /// level a macOS overlay goes exactly where it's placed, over the menu bar too.
@@ -198,7 +228,7 @@ impl<T: 'static> OverlaySpec<T> {
     }
 
     pub fn options(self, options: OverlayOptions) -> ConfiguredOverlay<T> {
-        ConfiguredOverlay { spec: self, options, on_key: None, on_created: None, poll: None, on_focus: None, compositor: None, setup: None, srgb_blend: true, macos_level: None, modifier_keys: false, animate_reveal: false }
+        ConfiguredOverlay { spec: self, options, on_key: None, on_created: None, poll: None, on_focus: None, compositor: None, setup: None, srgb_blend: true, macos_level: None, modifier_keys: false, animate_reveal: false, release_after: None }
     }
 }
 

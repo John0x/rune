@@ -142,8 +142,6 @@ pub struct SplitView {
     frame: f32,
     in_panel: bool,
     padding: [f32; 2],
-    slide: bool,
-    header: Option<El>,
     motion: PaneMotion,
     peek: Option<SidebarPeek>,
     reduced: bool,
@@ -163,8 +161,6 @@ impl SplitView {
             frame: 8.0,
             in_panel: false,
             padding: [0.0; 2],
-            slide: false,
-            header: None,
             motion: PaneMotion::new(),
             peek: None,
             reduced: false,
@@ -228,19 +224,6 @@ impl SplitView {
         self.padding = [start.max(0.0), end.max(0.0)];
         self
     }
-    /// The sidebar's contents keep their place against its trailing edge as it opens and
-    /// closes, so they slide with it instead of being uncovered in place. A peeking sidebar
-    /// always slides.
-    pub fn slide_sidebar_contents(mut self) -> Self {
-        self.slide = true;
-        self
-    }
-    /// An element in the sidebar's title bar row, past the traffic lights: an account or
-    /// workspace switcher, say.
-    pub fn sidebar_header(mut self, e: El) -> Self {
-        self.header = Some(e);
-        self
-    }
     /// How the panes open and close. Both move on the spring for the sidebar's width (the
     /// inspector's without one), so they move as one.
     pub fn pane_motion(mut self, m: PaneMotion) -> Self {
@@ -262,7 +245,7 @@ impl SplitView {
         self
     }
 
-    pub fn build(mut self, k: &Kit) -> El {
+    pub fn build(self, k: &Kit) -> El {
         let c = &k.c;
         let t = self.toggle;
         let side = t.side();
@@ -281,7 +264,6 @@ impl SplitView {
         let mut overlay = None;
         let mut zones = Vec::new();
         let mut clears = Vec::new();
-        let header = self.header.take();
         let sidebar = self.sidebar.map(|mut p| {
             let s = p.state;
             let open = s.is_open();
@@ -347,14 +329,11 @@ impl SplitView {
                 .pt(top)
                 .center_y()
                 .window_drag()
-                .child(el().key("sidebar-titlebar-clear").w((clear - self.padding[0]).max(0.0)).motion(spring));
-            if let Some(h) = header {
-                band = band.child(row().key("sidebar-header-slot").grow(1.0).min_w(0.0).center_y().child(h));
-            }
+                .child(el().key("sidebar-titlebar-clear").w((clear - self.padding[0]).max(0.0)).motion(spring).a11y_hidden());
             if toggle && t.in_header {
-                band = band.child(el().key("sidebar-spacer").grow(1.0)).child(el().key("sidebar-toggle-slot").w(side).ml(8.0));
+                band = band.child(el().key("sidebar-spacer").grow(1.0).a11y_hidden()).child(el().key("sidebar-toggle-slot").w(side).ml(8.0).a11y_hidden());
             }
-            let content = Contents { pad: self.padding, slide: self.slide || peek.is_some(), peek, band: Some(band) };
+            let content = Contents { pad: self.padding, slide: peek.is_some(), peek, band: Some(band) };
             dock(&d, "sidebar-pane", p, true, content)
         });
         let toolbar = self
@@ -366,6 +345,7 @@ impl SplitView {
         let (toolbar, above) = if self.in_panel { (Some(toolbar), None) } else { (None, Some(toolbar)) };
         let card = col()
             .key("main-pane")
+            .role("main")
             .grow(1.0)
             .min_w(0.0)
             .min_h(0.0)
@@ -379,7 +359,7 @@ impl SplitView {
             .motion(spring)
             .children(toolbar)
             .child(self.main.grow(1.0).min_h(0.0));
-        let card = match self.footer.take() {
+        let card = match self.footer {
             Some(footer) => {
                 let (left, right) = (if sidebar_open { 0.0 } else { self.frame }, if inspector_open { 0.0 } else { self.frame });
                 let footer = footer.ml(left).mr(right).motion(spring);
@@ -524,6 +504,10 @@ fn pane<S: 'static>(state: PaneState, access: fn(&mut S) -> &mut PaneState, cont
             }
         })
         .on_double_press(move |s: &mut S| access(s).reset_width())
+        .on_step(move |s: &mut S, steps, _| {
+            let p = access(s);
+            p.set_width(p.width() + steps as f32 * GRIP_STEP);
+        })
     });
     let toggle: Option<Apply> =
         toggle.then(|| Box::new(move |e: El| e.on_press(move |s: &mut S| access(s).toggle())) as Apply);
@@ -555,6 +539,8 @@ fn pane<S: 'static>(state: PaneState, access: fn(&mut S) -> &mut PaneState, cont
 }
 
 const DOT_FADE: f32 = 0.15;
+/// Points one increment from assistive technology widens a pane by.
+const GRIP_STEP: f32 = 8.0;
 
 /// What the panes share.
 struct Dock<'a> {
@@ -639,20 +625,24 @@ fn dock(d: &Dock, key: &str, p: Pane, leading: bool, content: Contents) -> El {
     let body = body
         .children(content.band)
         .child(col().key("pane-body").w_full().grow(1.0).min_h(0.0).child(p.content.w_full().h_full()));
-    let mut slot = el().key(key).w(s.shown_width()).h_full().motion(spring).child(body);
+    let mut slot = el().key(key).role("region").label(if leading { "Sidebar" } else { "Inspector" })
+        .w(s.shown_width()).h_full().motion(spring).child(body);
     if !floating {
         slot = slot.clip_soft(0.0);
+    }
+    if !open && !floating && !s.is_resizing() {
+        slot = slot.a11y_hidden();
     }
     if open {
         let instant = Transition::none();
         if leading {
             slot = slot
-                .child(el().key("pane-open-main").size(0.0, 0.0).transition(instant).focus_return("main-column"))
-                .child(el().key("pane-open").size(0.0, 0.0).transition(instant).focus_return("sidebar-toggle"));
+                .child(el().key("pane-open-main").size(0.0, 0.0).a11y_hidden().transition(instant).focus_return("main-column"))
+                .child(el().key("pane-open").size(0.0, 0.0).a11y_hidden().transition(instant).focus_return("sidebar-toggle"));
         } else {
             slot = slot
-                .child(el().key("pane-open").size(0.0, 0.0).transition(instant).focus_return("sidebar-toggle"))
-                .child(el().key("pane-open-main").size(0.0, 0.0).transition(instant).focus_return("main-pane"));
+                .child(el().key("pane-open").size(0.0, 0.0).a11y_hidden().transition(instant).focus_return("sidebar-toggle"))
+                .child(el().key("pane-open-main").size(0.0, 0.0).a11y_hidden().transition(instant).focus_return("main-pane"));
         }
     }
     if open || s.is_resizing() {
@@ -660,6 +650,9 @@ fn dock(d: &Dock, key: &str, p: Pane, leading: bool, content: Contents) -> El {
             .key(if leading { "sidebar-grip" } else { "inspector-grip" })
             .role("separator")
             .label(if leading { "Resize sidebar" } else { "Resize inspector" })
+            // Its value is the pane's width; a reader's increment and decrement step it.
+            .range_value(f64::from(s.width()), f64::from(s.min_width()), f64::from(s.max_width()))
+            .range_step(f64::from(GRIP_STEP))
             .w(GRIP)
             .cursor(Cursor::ResizeColumn)
             .fill(Color::TRANSPARENT)
@@ -672,7 +665,8 @@ fn dock(d: &Dock, key: &str, p: Pane, leading: bool, content: Contents) -> El {
         for h in p.handlers {
             grip = h(grip);
         }
-        slot = slot.child(grip);
+        // Not a Tab stop: AppKit's dividers aren't either.
+        slot = slot.child(grip.focusable(false));
     }
     slot
 }

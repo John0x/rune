@@ -67,7 +67,11 @@ impl<S: 'static> Runtime<S> {
                 Some([vw, vh]) => ([r[0], r[1]], [w / vw, h / vh]),
                 None => ([r[0] + (w - w_exact) * 0.5, r[1] + (h - h_exact) * 0.5], [k_px, k_px]),
             };
-            if draw < 1.0 {
+            if let Some(t) = self.scene.get(node_id, P_TRIM) {
+                // A presence draw traces the trimmed span on from its start.
+                let end = t.x + (t.y - t.x) * draw;
+                push_shape(&mut self.instances, &shape.trimmed(t.x, end), origin, k, k_px, o, srgb, clip, fade);
+            } else if draw < 1.0 {
                 push_shape(&mut self.instances, &shape.drawn(draw), origin, k, k_px, o, srgb, clip, fade);
             } else {
                 push_shape(&mut self.instances, shape, origin, k, k_px, o, srgb, clip, fade);
@@ -122,7 +126,7 @@ impl<S: 'static> Runtime<S> {
             };
             let pos = [(r[0] + r[2] - drawn) * 0.5, (r[1] + r[3] - drawn) * 0.5];
             if drawn > 1e-4 && let Some(q) = self.text.icon_quad(ic, px, pos) {
-                self.instances.push(icon_inst(&q, pos, drawn, turn, premul(color, o, srgb), clip, fade));
+                self.push_icon(icon_inst(&q, pos, drawn, turn, premul(color, o, srgb), clip, fade));
             }
         } else if let (Some(spec), Some(layout)) = (&n.text, &n.text_layout) {
             let link_fx = link_fx.unwrap();
@@ -293,7 +297,9 @@ impl<S: 'static> Runtime<S> {
                 let drawn = px as f32 * tk;
                 let px_r = (px as f32 * raster).round().max(1.0) as u32;
                 if let Some(q) = self.text.icon_quad(icon, px_r, at) {
-                    self.instances.push(icon_inst(&q, at, drawn, 0.0, premul(pill_fg, o, srgb), clip, fade));
+                    let inst = icon_inst(&q, at, drawn, 0.0, premul(pill_fg, o, srgb), clip, fade);
+                    if self.paint_rank.is_some() && inst.uv[2] > 0.0 { self.icon_aprons.push(apron_key(&inst)); }
+                    self.instances.push(inst);
                 }
             }
             if spec.selectable && let Some((a, b)) = selectable::range_in(sel_ranges, i) {
@@ -376,6 +382,11 @@ impl<S: 'static> Runtime<S> {
                 self.instances.push(rect_inst(c, premul(inp.caret, o, srgb), 0.0, clip, fade));
             }
         }
+    }
+
+    fn push_icon(&mut self, inst: Instance) {
+        if self.paint_rank.is_some() && inst.uv[2] > 0.0 { self.icon_aprons.push(apron_key(&inst)); }
+        self.instances.push(inst);
     }
 
     /// Text-only clipping leaves the box's fill/border and descendants untouched.

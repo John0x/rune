@@ -71,7 +71,7 @@ impl crate::cold::Empty for NodeCold {
         sticky: None,
         growth: None,
         glide: None,
-        a11y: crate::el::A11y { level: None, expanded: None, secure: false },
+        a11y: crate::el::A11y::EMPTY,
         pixel_aspect: None,
         aspect_fit: None,
         material: None,
@@ -337,6 +337,9 @@ pub(super) struct ScrollState {
     pub(super) max: f64,
     pub(super) direct: bool,
     pub(super) scrolling: bool,
+    /// A hand (the wheel, keys, a drag, their momentum) or an app's instant jump moved it since
+    /// `El::on_scroll_offset` was last told; not following its bottom, a glide or an anchor.
+    pub(super) by_hand: bool,
     /// Velocity of a glide to the bottom (`Tx::scroll_to_bottom`) or to `glide_to`
     /// (`Tx::scroll_to`) while one runs.
     pub(super) glide: Option<f32>,
@@ -363,6 +366,9 @@ pub(super) struct ScrollState {
     pub(super) x: AxisScroll,
     /// What `El::on_scroll_offset` was last told (`runtime/scroll/watch.rs`).
     pub(super) told: Option<crate::ScrollPos>,
+    /// The `El::on_scroll_offset` handler that was told, by address: a rebuilt view's new
+    /// handler hears where the viewport stands, though it didn't move.
+    pub(super) told_by: usize,
     /// The spring `Tx::scroll_to_with` gave the running glide, on both axes; `GLIDE` when none.
     pub(super) spring: Option<rune_motion::Spring>,
     /// Frames left in which an app's instant scroll (`Tx::scroll_to_instant` and the like)

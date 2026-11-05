@@ -626,7 +626,10 @@ Staying fast afterwards is "Fast apps" (`site/src/FastApps.tsx`) and "Smooth scr
   it adds the feature). An app that opts out with `App::gpu_backend(GpuBackend::Wgpu)` calls
   `rune::prewarm_gpu_on(GpuBackend::Wgpu)` instead, which chooses the backend and then starts the thread, so it
   doesn't start on the native backend and start over when `App::gpu_backend` runs; that call afterwards changes
-  nothing. `RUNE_GPU_BACKEND=wgpu` or `=metal` overrides both without a rebuild.
+  nothing. `RUNE_GPU_BACKEND=wgpu` or `=metal` overrides both without a rebuild. A compositor whose
+  `Compositor::features` asks for more than the native backend offers (`TIMESTAMP_QUERY` and `IMMEDIATES`) draws
+  with wgpu instead, every frame: log
+  `rune::describe_gpu(frame.device)` once to see which backend a window got and why, or set `RUNE_GPU_LOG=1`.
 - **Precompiled Metal uber shader.** `crates/rune/src/uber.metallib` is loaded through wgpu's passthrough shaders,
   skipping WGSL translation and Metal's compile (`Renderer::new` 232 ms to 85 ms on a cold shader cache). The WGSL
   path is the fallback when the adapter lacks passthrough support, when `RUNE_DISABLE_METALLIB=1`, when the
@@ -1871,8 +1874,8 @@ let clip = rune::Player::audio(note.path);
   writes `.wav`), so `to_file("note.m4a").format(RecordFormat::Wav)` writes `note.wav`;
   `Recording::path` is always the file written. Dropping the last handle mid-recording stops
   it and keeps the file.
-- **Levels**: `level()` is a `Level` with `peak_db()` and `rms_db()` in dBFS, and `meter()` /
-  `peak_meter()` mapped to 0..1 (-60 dB to 0 dB). RMS rises over 30 ms and falls over 300 ms;
+- **Levels**: `level()` is a `Level` with `peak_db()` and `rms_db()` in dBFS, and `meter()`
+  mapped to 0..1 (-60 dB to 0 dB). RMS rises over 30 ms and falls over 300 ms;
   the peak falls 20 dB a second. Reads take no lock and allocate nothing. `live_level()` is a
   `Live<f32>` of `meter()` for `live_scale`, `live_opacity` and the like, so a bound meter
   redraws on its own while recording; an idle or paused recorder draws no frames.
@@ -2200,6 +2203,48 @@ drawn as one layer (`El::group_opacity`, `El::blur`, `El::cache`, a rotation) th
 what that layer has drawn so far, as in CSS. A frame without a blurred element runs the same
 passes as before and draws the same pixels. `examples/frosted-bar` scrolls a list under a
 frosted bottom bar.
+
+## Accessibility
+
+Every window and overlay exposes its elements to the OS accessibility API through
+[AccessKit](https://accesskit.dev): UI Automation on Windows (Narrator, NVDA, JAWS, Voice
+Access), NSAccessibility on macOS (VoiceOver, Voice Control), AT-SPI on Linux (Orca). The same
+tree is what automation and testing tools drive. It comes with the default `accessibility`
+feature (`crate::a11y`, `runtime/a11y`).
+
+- **Free until asked**: nothing is built until an assistive client asks for a surface's tree.
+  Then each turn that changed something the tree shows (a commit, a scroll, focus, the end of
+  an animation) rebuilds it from the last frame and sends the nodes that changed. A turn that
+  changed none of it costs one comparison.
+- **Defaults from what an element already is**: its role (`El::role`, ARIA's names), its label
+  (`El::label`, else its text; a button, list row, tab or tree row takes the text inside it),
+  its key as the automation id (UIA `AutomationId`, `AXIdentifier`), focus, `El::level`,
+  `El::expanded`, a selected item (`El::focus_selected`), a slider's steps, a text field's value,
+  caret, selection and each line's characters, inline links, scroll viewports with their
+  offsets, modal dialogs (the background leaves the tree), and secure text (never exposed).
+  Plain layout boxes with no key, label or role join their parent, so the tree reads like the
+  interface, not the layout.
+- **Builders for the rest**: `description`, `a11y_value`, `range_value` and `range_step`,
+  `checked` and `checked_mixed`, `disabled`, `read_only`, `invalid`, `sorted`, `a11y_hidden`,
+  `live_region(LiveRegion::Polite)`, `position_in_set`, `shortcut_hint` and
+  `active_descendant` (the highlighted row of a tree, table or suggestion list whose container
+  or field keeps focus). An icon-only button needs `.label("Close")`. An `El::help` tooltip
+  describes its element unless it repeats the name; `description("")` turns that off.
+- **Actions** run the handlers a pointer or keyboard user reaches: click presses
+  (`on_press`), focus focuses, increment and decrement step (`on_step`), set value and text
+  selection edit through the field's editor (so `on_input_change` runs), set value on a slider
+  with a `range_step` steps it that many times toward the number, expand and collapse
+  press a disclosure, show context menu calls `on_secondary_press`, and scroll requests move
+  the viewport. They skip hit testing, so a test that wants the pointer's path posts pointer
+  input instead.
+- **Virtual lists** expose their mounted rows only; the list reports how many rows it has and
+  each row its index.
+- **Tools**: `--tree` writes the tree under `"accessibility"` (role, key, name, value, states,
+  actions, bounds in window points), `Runtime::accessibility_json` returns it to tests, and
+  `Runtime::accessibility_tree` returns AccessKit's whole `TreeUpdate`, and
+  `Runtime::accessibility_action(key, action, data)` runs an assistive action in a test.
+  `RUNE_A11Y_LOG=1` logs when a client activates a surface's tree, each action, and each
+  update's size and cost.
 
 ## Run
 
@@ -2549,7 +2594,7 @@ grouped list, and a knobs column) maps onto `App::playground` like this:
 | `group()` and `name()`                      | one path, `"Group/Name"` or `"Group/Subgroup/Name"`; groups keep the order they first appear in, or `Playground::group_order` |
 | the story's keys (`Action`s)                | `Story::trigger(key, label, step)`, or `trigger_tx` for a `Fn(&mut S, &mut Tx)`; `'r'` runs after each replay |
 | timed steps after a key                     | `Play::after(secs, step)`, on the logical clock                        |
-| a step that presses a key                   | `Play::press(Key::Down)`: through focus and `on_key`, counted as input |
+| a step that presses a key                   | `Play::press(Key::Down)`: through focus and `on_key`, counted as input; a letter reaches the app, not the story's triggers |
 | the knobs column                            | `.side(view)`: `rune_knobs::inline` fills the column's width; `actions` fits it, up to 300 pt |
 | keys for the knobs                          | `.side_keys(view, rune_knobs::side_key(groups, lens))`: ↑↓ pick a knob, ←→ step it, Esc leaves |
 | a choice knob flipped with 1–9              | `Story::variant(name, apply)`; 1–9 pick, and picking remakes the state |

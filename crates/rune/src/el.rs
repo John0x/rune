@@ -20,6 +20,7 @@ use crate::tok::TextStyle;
 pub use crate::el::tx::{Shell, Tx};
 pub(crate) use crate::el::tx::{SelectRequest, TraceCalls};
 
+mod a11y;
 mod anchor;
 mod backdrop;
 mod child_exit;
@@ -33,7 +34,7 @@ mod handler_set;
 mod handlers;
 mod layout;
 pub(crate) mod layout_watch;
-mod motion;
+pub mod motion;
 mod pills;
 mod pixel_snap;
 mod ride_trailing;
@@ -128,13 +129,8 @@ pub(crate) type DragOutFn = Rc<dyn Fn(crate::states::StatesRef<'_>) -> Option<cr
 pub(crate) type DragEndFn = Rc<dyn Fn(crate::states::States<'_>, crate::DragOutcome, &mut Tx)>;
 pub(crate) type EditFn = Rc<dyn for<'a> Fn(crate::states::States<'a>) -> &'a mut TextEdit>;
 
-/// Accessibility state beyond role and label (`El::level`, `El::expanded`, `El::secure`).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct A11y {
-    pub level: Option<u32>,
-    pub expanded: Option<bool>,
-    pub secure: bool,
-}
+pub(crate) use crate::el::a11y::{A11y, Checked};
+pub use crate::el::a11y::LiveRegion;
 
 pub(crate) use crate::el::focus::FocusSpec;
 pub(crate) use crate::el::handler_set::Handlers;
@@ -854,6 +850,12 @@ impl El {
     /// at the scale rounded to 1/32, so a dragged value doesn't fill the glyph atlas.
     pub fn live_scale(mut self, value: impl Into<crate::live::Binding<f32>>) -> Self {
         self.bind_live(crate::live::Bound::new(value, crate::live::Property::Scale)); self
+    }
+    /// Bind the [start, end] span of a shape's strokes that draws, as fractions (0 to 1) of
+    /// their combined length, as [`Shape::trimmed`](crate::Shape::trimmed) cuts them. A
+    /// [`Tween`](crate::Tween) runs a countdown ring or a travelling dash without rebuilding.
+    pub fn live_trim(mut self, value: impl Into<crate::live::Binding<[f32; 2]>>) -> Self {
+        self.bind_live(crate::live::Bound::new(value, crate::live::Property::Trim)); self
     }
     pub fn live_fill(mut self, value: impl Into<crate::live::Binding<Color>>) -> Self {
         self.bind_live(crate::live::Bound::new(value, crate::live::Property::Fill)); self

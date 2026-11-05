@@ -18,14 +18,13 @@ pub struct Toolbar {
     center: Option<El>,
     title: Option<String>,
     trailing: Vec<El>,
-    inset: f32,
     pad: Option<f32>,
     material: Option<SystemMaterial>,
 }
 
 impl Toolbar {
     pub fn new() -> Toolbar {
-        Toolbar { leading: Vec::new(), center: None, title: None, trailing: Vec::new(), inset: 0.0, pad: None, material: None }
+        Toolbar { leading: Vec::new(), center: None, title: None, trailing: Vec::new(), pad: None, material: None }
     }
     pub fn leading(mut self, e: El) -> Self {
         self.leading.push(e);
@@ -47,12 +46,6 @@ impl Toolbar {
         self.center = None;
         self
     }
-    /// Clears the traffic lights: pass `Cx::titlebar_inset`, which is 0 in full screen and off
-    /// macOS. A toolbar given to a `SplitView` gets this from the split view instead.
-    pub fn leading_inset(mut self, points: f32) -> Self {
-        self.inset = points.max(0.0);
-        self
-    }
     /// Backs the band with a system material (macOS blurs what's behind a transparent
     /// window). Elsewhere, and headless, the kit's base background draws instead.
     pub fn material(mut self, m: SystemMaterial) -> Self {
@@ -68,9 +61,12 @@ impl Toolbar {
 
     pub fn build(self, k: &Kit) -> El {
         let c = &k.c;
-        let pl = self.pad.unwrap_or(if self.inset > 0.0 { self.inset + PAD } else { PAD });
+        let pl = self.pad.unwrap_or(PAD);
         let mut band =
             row().key("toolbar").role("toolbar").w_full().h(TOOLBAR_HEIGHT).pl(pl).pr(PAD).gap(8.0).center_y().window_drag();
+        if let Some(t) = &self.title {
+            band = band.label(t.clone());
+        }
         let center = match (self.center, self.title) {
             (Some(e), _) => Some(e),
             (None, Some(t)) => Some(text(t).key("title").font(k.ty.ui_medium).color(c.text_base).truncate()),
@@ -87,7 +83,7 @@ impl Toolbar {
             // The leading slot gives way first, so a long title truncates instead of pushing the
             // trailing controls off the band.
             .child(row().key("leading").gap(4.0).center_y().shrink().min_w(0.0).children(self.leading))
-            .child(row().key("spacer").grow(1.0))
+            .child(row().key("spacer").grow(1.0).a11y_hidden())
             .child(row().key("trailing").gap(4.0).center_y().children(self.trailing));
         if let Some(m) = self.material {
             band = band.system_material(m).fill(c.bg_base);

@@ -53,6 +53,7 @@ mod autolink;
 mod cache;
 mod find;
 mod highlight;
+mod interrupt;
 mod links;
 mod parser;
 mod render;
@@ -67,7 +68,7 @@ pub use style::MarkdownStyle;
 use crate::budget::Budget;
 use crate::syntax::{Highlighter, SyntaxTheme};
 pub use crate::syntax::Syntax;
-use links::{LinkLook, LinkRing, LinkWire};
+use links::{LinkHelp, LinkLook, LinkRing, LinkWire};
 pub use cache::parse_cached;
 pub use highlight::{Highlight, HighlightItem};
 pub use parser::parse;
@@ -131,6 +132,22 @@ pub struct Table {
 }
 
 type TaskWire = Rc<dyn Fn(El, Rc<str>, usize, bool) -> El>;
+#[cfg(feature = "mermaid")]
+type FrameWire = Rc<dyn Fn(El, &DiagramFrame<'_>) -> El>;
+
+/// A diagram [`Markdown::diagram_frame`] is wrapping.
+#[cfg(feature = "mermaid")]
+#[non_exhaustive]
+pub struct DiagramFrame<'a> {
+    /// Its place among the document's fenced blocks (code and diagrams), counted from 0. A
+    /// stream only adds blocks after it, so this stays put while the reply arrives.
+    pub index: usize,
+    /// The lines it draws: the whole fence, or while the fence is still arriving, its
+    /// complete lines.
+    pub source: &'a str,
+    /// The fence is still arriving.
+    pub open: bool,
+}
 
 /// Markdown source as an element. See the module docs for cost and keys.
 pub struct Markdown {
@@ -144,6 +161,7 @@ pub struct Markdown {
     on_link: Option<LinkWire>,
     on_link_secondary: Option<LinkWire>,
     link_look: Option<LinkLook>,
+    link_help: Option<LinkHelp>,
     on_task: Option<TaskWire>,
     tasks_read_only: bool,
     link_ring: Option<LinkRing>,
@@ -151,12 +169,21 @@ pub struct Markdown {
     copy_source: bool,
     scroll_wide: bool,
     highlighter: Highlighter,
+    #[cfg(feature = "mermaid")]
+    diagram_frame: Option<FrameWire>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RENDERS: Cell<usize> = const { Cell::new(0) };
 }
 
 impl Markdown {
     pub fn new(src: impl Into<String>) -> Markdown {
-        Markdown { src: src.into(), style: None, block_keys: Vec::new(), highlights: Vec::new(), autolink: true, reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_ring: None,
-            on_task: None, tasks_read_only: false, selectable: false, copy_source: false, scroll_wide: false, highlighter: Highlighter::builtin() }
+        Markdown { src: src.into(), style: None, block_keys: Vec::new(), highlights: Vec::new(), autolink: true, reveal: -1.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_help: None, link_ring: None,
+            on_task: None, tasks_read_only: false, selectable: false, copy_source: false, scroll_wide: false, highlighter: Highlighter::builtin(),
+            #[cfg(feature = "mermaid")]
+            diagram_frame: None }
     }
     /// Highlight UTF-8 byte ranges of the Markdown source string (see [`find`]).
     ///
@@ -212,7 +239,7 @@ impl Markdown {
     }
     /// Streaming word reveal in seconds (see [`El::reveal`]); 0 shows words at once.
     pub fn reveal(mut self, word_fade: f32) -> Self {
-        self.reveal = word_fade;
+        self.reveal = word_fade.max(0.0);
         self
     }
     /// The source is still arriving: a table's last row, with no newline after it yet, is left
@@ -282,6 +309,19 @@ impl Markdown {
         self
     }
 
+    /// Draws `f(card, frame)` in place of each diagram's card, so an app can put its own
+    /// controls on it (a button that opens it larger) or key it. Fences that draw as their
+    /// source, or nothing yet while streaming, don't come here.
+    ///
+    /// ```ignore
+    /// Markdown::new(src).diagram_frame(|card, d| col().key(format!("diagram-{}", d.index)).child(card).child(open_button(d.source)))
+    /// ```
+    #[cfg(feature = "mermaid")]
+    pub fn diagram_frame(mut self, f: impl Fn(El, &DiagramFrame<'_>) -> El + 'static) -> Self {
+        self.diagram_frame = Some(Rc::new(f));
+        self
+    }
+
     /// Colours code blocks with `f` instead of the built-in scanners: it gets a fence's language
     /// as written (its info string's first word; `None` for an indented block or a bare fence)
     /// and the code, and returns byte ranges of the code with a token kind, which the style's
@@ -309,9 +349,38 @@ impl Markdown {
         self.render(&style)
     }
 
-    /// Builds with `style`, for apps without a [`Kit`] (see [`MarkdownStyle::neutral`] and
-    /// [`MarkdownStyle::from_seed`]).
+    /// Builds with `style`, for apps without a [`Kit`] (see [`MarkdownStyle::neutral`]).
     pub fn render(self, style: &MarkdownStyle) -> El {
+        let can_cache = !self.streaming
+            && self.on_link.is_none()
+            && self.on_link_secondary.is_none()
+            && self.link_look.is_none()
+            && self.link_help.is_none()
+            && self.link_ring.is_none()
+            && self.on_task.is_none()
+            && !(self.selectable && self.copy_source)
+            && self.highlighter.is_builtin()
+            && !(cfg!(feature = "mermaid") && self.src.contains("mermaid"));
+        if can_cache {
+            let h = rune::memo::digest(&(
+                &self.src,
+                style,
+                &self.block_keys,
+                &self.highlights,
+                self.autolink,
+                self.reveal.to_bits(),
+                self.tasks_read_only,
+                self.selectable,
+                self.scroll_wide,
+            ));
+            return rune::memo::cached(h, || self.render_uncached(style));
+        }
+        self.render_uncached(style)
+    }
+
+    fn render_uncached(self, style: &MarkdownStyle) -> El {
+        #[cfg(test)]
+        RENDERS.with(|n| n.set(n.get() + 1));
         let (blocks, sources, tasks, starts, maps) = match (self.autolink, self.streaming) {
             (true, false) => doc_cached(&self.src),
             (true, true) => stream_cached(&self.src),
@@ -324,10 +393,12 @@ impl Markdown {
             starts.iter().map(|at| self.block_keys.iter().find(|(offset, _)| offset == at)
                 .map_or_else(String::new, |(_, key)| key.clone())).collect::<Vec<_>>()
         };
-        let r = Renderer { s: style.clone(), highlights: self.highlights, reveal: self.reveal, streaming: self.streaming, on_link: self.on_link, on_link_secondary: self.on_link_secondary, link_look: self.link_look, link_ring: self.link_ring,
+        let r = Renderer { s: style.clone(), highlights: self.highlights, reveal: self.reveal, streaming: self.streaming, on_link: self.on_link, on_link_secondary: self.on_link_secondary, link_look: self.link_look, link_help: self.link_help, link_ring: self.link_ring,
             on_task: self.on_task, tasks_read_only: self.tasks_read_only, selectable: self.selectable, scroll_wide: self.scroll_wide,
             highlighter: self.highlighter, sources, next_source: Cell::new(0), tasks, next_task: Cell::new(0),
-            current_block_key: RefCell::new("b0".into()) };
+            current_block_key: RefCell::new("b0".into()),
+            #[cfg(feature = "mermaid")]
+            diagram_frame: self.diagram_frame };
         let root = r.blocks(&blocks, &maps, &keys, true).selection_group(self.selectable);
         if !(self.selectable && self.copy_source) { return root; }
         let names: Rc<[String]> = rendered_keys(blocks.len(), &keys).into();

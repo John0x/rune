@@ -86,6 +86,10 @@ pub(crate) enum WakeEvent {
     /// The app was reopened (macOS: its Dock icon clicked); for `Windows`, not one host.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Reopen,
+    /// An assistive client asked something of a surface's accessibility tree (`crate::a11y`):
+    /// the host answers at the end of the turn this wakes.
+    #[cfg_attr(not(feature = "accessibility"), allow(dead_code))]
+    A11y(usize),
 }
 
 /// What `Windows` needs of a host, whatever its state type: an app window or an overlay.
@@ -263,7 +267,8 @@ impl ApplicationHandler<WakeEvent> for Windows {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WakeEvent) {
         let slot = match &event {
             WakeEvent::DisplayTick(i) | WakeEvent::App(i) | WakeEvent::Live(i) | WakeEvent::Window(i, _) | WakeEvent::Focus(i)
-                | WakeEvent::Position(i, _) | WakeEvent::Level(i, _) | WakeEvent::Place(i, _) | WakeEvent::Frame(i, _) => *i,
+                | WakeEvent::Position(i, _) | WakeEvent::Level(i, _) | WakeEvent::Place(i, _) | WakeEvent::Frame(i, _)
+                | WakeEvent::A11y(i) => *i,
             WakeEvent::Reopen => {
                 self.reopen(event_loop);
                 self.cleanup(event_loop);
@@ -441,6 +446,8 @@ impl<S: 'static> Host<S> {
         rt.set_tab_visits_controls(tab_visits_controls);
         crate::platform::accent::watch();
         rt.set_system_accent(crate::system_accent());
+        crate::platform::scroll_bars::watch();
+        rt.set_system_scroll_bars_state(crate::platform::scroll_bars::current().with_override(args.scroll_bars));
         rt.trace_channels = args.trace.as_ref().map(|_| Default::default());
         rt.set_live_waker(Arc::new(move || { let _ = live_proxy.send_event(WakeEvent::Live(slot)); }));
         rt.set_live_visible(false);
@@ -569,6 +576,32 @@ pub(crate) fn surface_config(surface: &wgpu::Surface, adapter: &wgpu::Adapter, (
     Some((config, crate::render::translucency::mode(surface, adapter)))
 }
 
+/// Configures `surface`, returning wgpu's error instead of panicking in its default handler,
+/// so a surface the driver refuses (an overlay's XWayland window on NVIDIA, hex#979) costs
+/// only its owner. The message names the configuration for logs.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn configure(surface: &wgpu::Surface, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Result<(), String> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    surface.configure(device, config);
+    let error = pollster::block_on(internal.pop()).or(pollster::block_on(validation.pop()));
+    match error {
+        None => Ok(()),
+        Some(error) => {
+            let text = error.to_string();
+            let cause = text.lines().map(str::trim).filter(|line| !line.is_empty() && *line != "Caused by:").collect::<Vec<_>>().join(": ");
+            Err(format!("{cause} ({}x{}, {:?}, {:?}, {:?})", config.width, config.height, config.format, config.alpha_mode, config.present_mode))
+        }
+    }
+}
+
+/// The browser reports surface errors asynchronously; there is nothing to catch here.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn configure(surface: &wgpu::Surface, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Result<(), String> {
+    surface.configure(device, config);
+    Ok(())
+}
+
 /// Follows a blend switch (`Tx::set_srgb_blend`) on a configured surface: reconfigures it for
 /// `rt`'s mode at its size and alpha mode, rebuilds `renderer` when its target format changes,
 /// and rebuilds the `alpha` pass (when there is one) for the new format. Returns false when the
@@ -580,7 +613,10 @@ pub(crate) fn reblend<S: 'static>(surface: &wgpu::Surface, gpu: &Gpu, config: &m
     let Some((next, _)) = surface_config(surface, &gpu.adapter, (config.width, config.height), srgb) else { return false };
     if (config.format, &config.view_formats) != (next.format, &next.view_formats) {
         (config.format, config.view_formats) = (next.format, next.view_formats);
-        surface.configure(&gpu.device, config);
+        if let Err(error) = configure(surface, &gpu.device, config) {
+            eprintln!("rune: could not reconfigure a surface for a blend switch: {error}");
+            return false;
+        }
     }
     let target = if srgb { config.format.remove_srgb_suffix() } else { config.format };
     rebuild_renderer(&gpu.device, renderer, target, rt);
@@ -682,6 +718,20 @@ fn gesture_phase(phase: TouchPhase) -> crate::GesturePhase {
     }
 }
 
+/// Hands a winit touch (a finger, or a pen where the system reports it as one) to the runtime
+/// in window points, timed on a clock that starts with the first touch.
+pub(crate) fn touch<S: 'static>(rt: &mut crate::Runtime<S>, touch: &winit::event::Touch, scale: f32) {
+    static START: std::sync::OnceLock<crate::time::Instant> = std::sync::OnceLock::new();
+    let phase = match touch.phase {
+        TouchPhase::Started => crate::TouchPhase::Started,
+        TouchPhase::Moved => crate::TouchPhase::Moved,
+        TouchPhase::Ended => crate::TouchPhase::Ended,
+        TouchPhase::Cancelled => crate::TouchPhase::Cancelled,
+    };
+    let time = START.get_or_init(crate::time::Instant::now).elapsed().as_secs_f64();
+    rt.touch(touch.id, phase, touch.location.x as f32 / scale, touch.location.y as f32 / scale, time);
+}
+
 impl<S: 'static> Host<S> {
 
     #[cfg_attr(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))), allow(unused_variables))]
@@ -713,7 +763,25 @@ impl<S: 'static> Host<S> {
             use winit::platform::macos::WindowAttributesExtMacOS;
             attrs = attrs.with_titlebar_transparent(true).with_title_hidden(true).with_fullsize_content_view(true);
         }
+        // Windows opens it hidden, then shows it cloaked until its first frame lands
+        // (`Cloak`), so it never comes on screen empty.
+        #[cfg(target_os = "windows")]
+        let attrs = attrs.with_visible(false);
         let window = Arc::new(event_loop.create_window(attrs).map_err(|e| e.to_string())?);
+        #[cfg(target_os = "windows")]
+        crate::platform::win32::follow_suggested_rect(&window);
+        #[cfg(target_os = "windows")]
+        let cloak = crate::platform::win32::Cloak::default();
+        #[cfg(target_os = "windows")]
+        if visible {
+            cloak.hold(&window, Instant::now() + win::READY_FALLBACK);
+            window.set_visible(true);
+        }
+        // First, before anything observes the view (macOS) or an assistive client asks.
+        let a11y = {
+            let handle = self.native_handle.clone();
+            crate::a11y::Adapter::new(&window, Arc::new(move || handle.send(WakeEvent::A11y)))
+        };
         #[cfg(target_os = "macos")]
         crate::native_menu::adopt_standard_view();
         #[cfg(target_os = "macos")]
@@ -768,6 +836,7 @@ impl<S: 'static> Host<S> {
                     prewarmed = renderer;
                     let gpu = Arc::new(gpu);
                     *self.gpu_pool.borrow_mut() = Arc::downgrade(&gpu);
+                    crate::render::surface_gpu(&gpu);
                     (gpu, surface)
                 };
                 (Some(gpu), surface)
@@ -848,9 +917,15 @@ impl<S: 'static> Host<S> {
             launch_drawables,
             _spot: crate::platform::macos::traffic_lights::Spot::new(&window),
         };
-        #[cfg(not(target_os = "macos"))]
+        // Making the GPU and surface took part of the cloak's wait; the frame gets all of it.
+        #[cfg(target_os = "windows")]
+        cloak.extend(Instant::now() + win::READY_FALLBACK);
+        #[cfg(target_os = "windows")]
+        let native = Native { cloak };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let native = Native::default();
         self.win = Some(Win {
+            a11y,
             native,
             first_frame: FirstFrame::opened(Instant::now()),
             surface,

@@ -100,8 +100,15 @@ impl<T: 'static> Overlay<T> {
         if self.frameless() { self.advance(); }
     }
 
-    pub(super) fn publish_regions(&mut self) {
-        let Some(live) = &self.live else { return };
+    /// True when a layer surface's input region changed and waits for a commit.
+    pub(super) fn publish_regions(&mut self) -> bool {
+        // An X11 window's input shape applies at once, with no commit to wait for.
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+        if let Some(Live { backing: Backing::Xwayland(surface), .. }) = &mut self.live {
+            surface.regions(self.rt.hit_regions());
+            return false;
+        }
+        let Some(live) = &self.live else { return false };
         #[cfg(target_os = "macos")]
         if let Some(panel) = &self.panel { panel.set_regions(self.rt.hit_regions()); }
         #[cfg(target_os = "windows")]
@@ -109,8 +116,9 @@ impl<T: 'static> Overlay<T> {
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if self.options.input.resolved(self.interactive) == OverlayInput::Regions && let Some(x11) = &mut self.x11 { x11.regions(self.rt.hit_regions(), live.scale); }
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-        if let Backing::Layer(layer) = &live.backing { layer.input_regions(self.rt.hit_regions(), self.interactive); }
+        if let Backing::Layer(layer) = &live.backing { return layer.input_regions(self.rt.hit_regions(), self.interactive); }
         let _ = live;
+        false
     }
 
     pub(super) fn apply_input(&mut self) {
@@ -129,7 +137,11 @@ impl<T: 'static> Overlay<T> {
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         {
             if let Some(x11) = &mut self.x11 { x11.set_input(resolved); }
-            if let Some(Live { backing: Backing::Layer(layer), .. }) = &mut self.live { layer.set_input(resolved); }
+            match &mut self.live {
+                Some(Live { backing: Backing::Layer(layer), .. }) => layer.set_input(resolved),
+                Some(Live { backing: Backing::Xwayland(surface), .. }) => surface.set_input(resolved),
+                _ => {}
+            }
         }
         self.publish_regions();
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
@@ -236,6 +248,7 @@ impl<T: 'static> Overlay<T> {
 
     pub(super) fn wake_due(&mut self, now: Instant) {
         self.end_fade_out(now);
+        self.release_due(now);
         // Paced to a frame interval: a hidden or covered overlay's poll that keeps asking for
         // the next frame runs once a frame, however often other events turn the loop.
         let deadline = crate::window::timer_deadline(&self.rt);
@@ -310,6 +323,7 @@ impl<T: 'static> Overlay<T> {
         if let Some(input) = requests.input { self.pending_input = Some(input); }
         self.apply_input();
         if let Some(exclude) = requests.exclude_from_capture { self.set_capture_exclusion(exclude); }
+        if let Some(allow) = requests.xwayland_input { self.options.xwayland_input = allow; }
         if let Some(follow) = requests.follow_pointer {
             self.options.follow_pointer = follow;
             #[cfg(target_os = "macos")]
@@ -361,7 +375,7 @@ impl<T: 'static> Overlay<T> {
                 }
             }
         }
-        if self.options.prewarm && self.shared.availability.load(Ordering::Acquire) == 0 { self.prepare(event_loop); }
+        if self.options.prewarm && self.shared.availability.load(Ordering::Acquire) == 0 { self.prepare(event_loop, false); }
         if let Some(level) = requests.macos_level {
             self.macos_level = Some(level);
             #[cfg(target_os = "macos")]
@@ -376,7 +390,7 @@ impl<T: 'static> Overlay<T> {
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
         if recreate_layer && self.live.is_none() {
             if layer_was_visible && requests.visible != Some(false) { self.show_fading(event_loop, Duration::ZERO); }
-            else if self.options.prewarm { self.prepare(event_loop); }
+            else if self.options.prewarm { self.prepare(event_loop, false); }
         }
         if requests.refollow && self.visible && let Some(point) = Self::sample_pointer(event_loop) {
             self.refollow(event_loop, point);

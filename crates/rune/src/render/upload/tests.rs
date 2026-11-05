@@ -223,15 +223,22 @@ fn a_device_asked_for_immediates_draws_with_them() {
     let device = &gpu.device;
     if !device.features().contains(wgpu::Features::IMMEDIATES) { return; }
     assert!(device.limits().max_immediate_size >= 16, "the limit came with the feature");
-    assert_eq!(Gpu::headless().device.limits().max_immediate_size, 0, "only when asked");
+    let plain = Gpu::headless();
+    if crate::gpu::backend::native(&plain.device) {
+        assert!(plain.device.features().contains(wgpu::Features::IMMEDIATES), "free on the native backend, so always there");
+    } else {
+        assert_eq!(plain.device.limits().max_immediate_size, 0, "only when asked");
+    }
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
         source: wgpu::ShaderSource::Wgsl("
-            var<immediate> fill: vec4<f32>;
+            // A struct: naga's HLSL output has no immediates of other types (wgpu#5683).
+            struct Fill { colour: vec4<f32> }
+            var<immediate> fill: Fill;
             @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
                 return vec4<f32>(vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0, 0.0, 1.0);
             }
-            @fragment fn fs() -> @location(0) vec4<f32> { return fill; }
+            @fragment fn fs() -> @location(0) vec4<f32> { return fill.colour; }
         ".into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[], immediate_size: 16 });

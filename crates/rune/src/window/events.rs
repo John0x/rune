@@ -135,7 +135,36 @@ impl<S: 'static> Host<S> {
                 if let Some(w) = self.win.as_ref().filter(|w| w.visible) { w.window.request_redraw(); }
                 self.shell(event_loop);
             }
+            WakeEvent::A11y(_) => self.a11y_receive(),
             WakeEvent::Reopen => {}
+        }
+    }
+
+    /// Runs what assistive clients asked; an action draws the frame that runs it.
+    fn a11y_receive(&mut self) {
+        let Some(w) = self.win.as_mut() else { return };
+        let Some(adapter) = w.a11y.as_mut() else { return };
+        if adapter.receive(&mut self.rt, self.spec.title) { w.window.request_redraw(); }
+    }
+
+    /// Sends the tree's changes at the end of the turn, after its frames.
+    pub(super) fn a11y_turn(&mut self) {
+        let Some(adapter) = self.win.as_mut().and_then(|w| w.a11y.as_mut()) else { return };
+        adapter.sync(&mut self.rt);
+    }
+
+    /// The window's focus and place, which the accessibility adapter reports.
+    fn a11y_window_event(&mut self, event: &WindowEvent) {
+        let Some(w) = self.win.as_mut() else { return };
+        let Some(adapter) = w.a11y.as_mut() else { return };
+        match event {
+            WindowEvent::Focused(focused) => adapter.focus(*focused),
+            WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                let rect = |p: winit::dpi::PhysicalPosition<i32>, s: winit::dpi::PhysicalSize<u32>| [f64::from(p.x), f64::from(p.y), f64::from(s.width), f64::from(s.height)];
+                let (Ok(outer), Ok(inner)) = (w.window.outer_position(), w.window.inner_position()) else { return };
+                adapter.bounds(rect(outer, w.window.outer_size()), rect(inner, w.window.inner_size()));
+            }
+            _ => {}
         }
     }
 
@@ -143,6 +172,7 @@ impl<S: 'static> Host<S> {
         if self.win.as_ref().is_none_or(|w| w.window.id() != id) {
             return;
         }
+        self.a11y_window_event(&event);
         if !matches!(event, WindowEvent::RedrawRequested) && let Some(w) = &mut self.win { w.quiet = false; }
         #[cfg(target_os = "macos")]
         if matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Occluded(_))
@@ -174,8 +204,9 @@ impl<S: 'static> Host<S> {
             WindowEvent::DroppedFile(path) => { self.files.file(path, true); return; }
             WindowEvent::HoveredFileCancelled => { self.files.steps.push(FileStep::Leave); return; }
             WindowEvent::RedrawRequested => {
-                // A new accent or light/dark preference asks every window to redraw (`accent::watch`, `window_dark`).
+                // A new accent, scroller style or light/dark preference asks every window to redraw.
                 self.rt.set_system_accent(crate::system_accent());
+                self.rt.set_system_scroll_bars_state(crate::platform::scroll_bars::current().with_override(self.args.scroll_bars));
                 if self.args.theme.is_none() && let Some(dark) = self.win.as_ref().and_then(|l| crate::platform::preferences::desktop_dark(&l.window)) {
                     self.rt.set_system_dark(dark);
                 }
@@ -201,6 +232,10 @@ impl<S: 'static> Host<S> {
         let rt = &mut self.rt;
         let scale = l.window.scale_factor() as f32;
         let chrome = self.chrome;
+        // A finger presses through `WindowEvent::Touch`; the mouse events a system makes up
+        // from it (Windows promotes touches) would press a second time.
+        if matches!(event, WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. } | WindowEvent::MouseInput { .. })
+            && (rt.touching() || touch_promoted()) { return; }
         match event {
             WindowEvent::Moved(_) => {
                 // winit queues `ScaleFactorChanged` in `kCFRunLoopDefaultMode`, which waits
@@ -257,6 +292,12 @@ impl<S: 'static> Host<S> {
                 if let Some(shadow) = &l.native.shadow { shadow.redraw(); }
                 let scale = scale_factor as f32;
                 let size = l.window.inner_size();
+                // Still the old scale's size: Windows resizes the window after this event.
+                #[cfg(target_os = "windows")]
+                let size = {
+                    let (width, height) = crate::window::frame::rescaled((size.width, size.height), f64::from(rt.env.scale), scale_factor);
+                    winit::dpi::PhysicalSize::new(width, height)
+                };
                 if size.width > 0 && size.height > 0 {
                     let resized = l.resize_surface(&gpu.device, size);
                     let viewport = (size.width as f32 / scale, size.height as f32 / scale);
@@ -311,6 +352,7 @@ impl<S: 'static> Host<S> {
             WindowEvent::Focused(focused) => {
                 rt.set_system_reduced_motion(crate::platform::preferences::reduced_motion());
                 rt.set_full_keyboard_access(crate::platform::preferences::full_keyboard_access());
+                rt.set_system_scroll_bars_state(crate::platform::scroll_bars::reread().with_override(self.args.scroll_bars));
                 self.secure_input.set(focused && l.visible && !l.occluded && rt.has_secure_focus());
                 rt.set_titlebar_inset(place_chrome(&l.window, chrome));
                 if !focused {
@@ -421,6 +463,10 @@ impl<S: 'static> Host<S> {
                 rt.pointer_leave();
                 l.window.request_redraw();
             }
+            WindowEvent::Touch(touch) => {
+                crate::window::touch(rt, &touch, scale);
+                l.window.request_redraw();
+            }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 if state == ElementState::Pressed {
                     self.control_click = cfg!(target_os = "macos") && self.mods.control_key();
@@ -471,3 +517,18 @@ impl<S: 'static> Host<S> {
         }
     }
 }
+
+/// Whether the mouse message being handled is one Windows made up from a touch or a pen
+/// (`GetMessageExtraInfo` carries `MI_WP_SIGNATURE`). winit handles the message inside the
+/// window procedure, so the extra info is still the message's own.
+#[cfg(target_os = "windows")]
+fn touch_promoted() -> bool {
+    const MI_WP_SIGNATURE: u32 = 0xFF51_5700;
+    // SAFETY: reads the calling thread's current message info; no pointers involved.
+    let info = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo() } as u32;
+    info & 0xFFFF_FF00 == MI_WP_SIGNATURE
+}
+
+#[cfg(not(target_os = "windows"))]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+fn touch_promoted() -> bool { false }

@@ -24,6 +24,9 @@ pub struct StreamEdge {
     pub duration: f32,
     /// Clip the row at its presented height (else content overflows while it grows).
     pub clip: bool,
+    /// A streaming row, and its catch-up once the stream ends, draws past its presented height,
+    /// unclipped and unmasked, into space the app keeps below it; other rows still clip.
+    pub overflow: bool,
     /// Word fade-in duration in seconds (0 = words appear at once).
     pub word_fade: f32,
 }
@@ -38,6 +41,7 @@ pub mod edge {
         catch_up: 1.0,
         duration: 1.0,
         clip: true,
+        overflow: false,
         word_fade: 0.18,
     };
     pub const FAST_FEATHER: StreamEdge = StreamEdge {
@@ -48,6 +52,7 @@ pub mod edge {
         catch_up: 2.4,
         duration: 0.55,
         clip: true,
+        overflow: false,
         word_fade: 0.18,
     };
     pub const NO_MASK: StreamEdge = StreamEdge {
@@ -58,6 +63,7 @@ pub mod edge {
         catch_up: 1.0,
         duration: 1.0,
         clip: false,
+        overflow: false,
         word_fade: 0.0,
     };
     pub const WORD_FADE: StreamEdge = StreamEdge {
@@ -68,6 +74,7 @@ pub mod edge {
         catch_up: 1.0,
         duration: 1.0,
         clip: false,
+        overflow: false,
         word_fade: 0.36,
     };
     pub const ALL: [StreamEdge; 4] = [FEATHER, FAST_FEATHER, NO_MASK, WORD_FADE];
@@ -102,6 +109,29 @@ pub mod caps {
     /// every row decays into its target (Rune's addition, for the same reason).
     pub const APPROACH: f32 = 14.0;
     pub const APPROACH_MIN: f32 = 3.0;
+}
+
+/// A streaming row's climb (`El::streaming`): one critically damped follower whose stiffness
+/// tracks how fast its target has been rising, so a slow stream creeps on steadily between
+/// words and lines, a fast one keeps up, and the speed never kicks up from rest per arrival.
+/// It trails by `2 × rate / ω` (`2 × TRAIL` once the rate sets ω), held back under the feather.
+pub mod pace {
+    /// Seconds the arrival rate is averaged over.
+    pub const WINDOW: f32 = 0.5;
+    /// Half the points a steady stream's climb trails its text by.
+    pub const TRAIL: f32 = 4.0;
+    /// Least stiffness (1/s) while the stream runs: a slow one creeps rather than stopping.
+    pub const MIN: f32 = 2.5;
+    /// Least stiffness once the stream has ended, reached over [`LAND_RAMP`] seconds, so the
+    /// last of it lands in under half a second.
+    pub const LAND: f32 = 18.0;
+    pub const LAND_RAMP: f32 = 0.15;
+    /// Least speed (points per second) once the stream has ended: it stops rather than creeps.
+    pub const LAND_MIN: f32 = 8.0;
+    /// Most stiffness, for the fastest stream.
+    pub const MAX: f32 = 40.0;
+    /// Hardest change of speed (points per second squared).
+    pub const ACCEL: f32 = 6000.0;
 }
 
 pub const SUBSTEP: f32 = 1.0 / 240.0;
@@ -153,11 +183,17 @@ pub struct GrowTrack {
     /// The share of each point it shuts by that a header held over it comes down, when the
     /// viewport's end will stop its bottom short (`Runtime::give_way`).
     pub(crate) give: Option<f32>,
+    /// Climbing on the stream's [`pace`]: from its first streaming frame until it rests.
+    pub(crate) paced: bool,
+    /// Points per second the target has been rising at, averaged over [`pace::WINDOW`].
+    pub(crate) rate: f32,
+    /// Seconds a paced climb has gone on since its stream ended.
+    pub(crate) ended: f32,
 }
 
 impl GrowTrack {
     pub fn settled(h: f32) -> GrowTrack {
-        GrowTrack { h, v: 0.0, target: h, age: 0.0, mask: 0.0, streaming: false, whole: false, duration: 0.0, span: 0.0, glide: None, feather: None, limit: f32::INFINITY, stage: None, slide: None, restore: 0.0, give: None }
+        GrowTrack { h, v: 0.0, target: h, age: 0.0, mask: 0.0, streaming: false, whole: false, duration: 0.0, span: 0.0, glide: None, feather: None, limit: f32::INFINITY, stage: None, slide: None, restore: 0.0, give: None, paced: false, rate: 0.0, ended: 0.0 }
     }
 
     pub fn moving(&self) -> bool {
@@ -169,6 +205,9 @@ impl GrowTrack {
             let lift = self.lift();
             if !self.moving() {
                 self.age = 0.0;
+            }
+            if self.streaming {
+                self.rate += (target - self.target).max(0.0) / pace::WINDOW;
             }
             self.target = target;
             self.span = (target - self.h).abs();
@@ -232,8 +271,14 @@ impl GrowTrack {
     /// overrides) with the height at which its bottom leaves the window.
     pub(crate) fn set_kind(&mut self, streaming: bool, whole: bool, glide: Option<(FoldGlide, f32)>) {
         self.streaming = streaming;
+        self.paced |= streaming;
         self.whole = whole;
         let glide = glide.filter(|_| !streaming);
+        if glide.is_none() {
+            // A glide's stop at the window's edge goes with it: the row it hands over to carries
+            // on from where it is, rather than landing the rest at once.
+            self.stage = None;
+        }
         self.glide = glide.map(|g| g.0.spring);
         self.feather = glide.and_then(|g| g.0.feather);
         self.limit = glide.map_or(f32::INFINITY, |g| g.1);
@@ -256,6 +301,8 @@ impl GrowTrack {
         } else if rem.abs() <= 1.0 / 128.0 && self.v.abs() < 0.5 {
             self.h = self.target;
             self.v = 0.0;
+        } else if self.paced && rem > 0.0 {
+            self.climb(rem, carrying_tail);
         } else if let Some(own) = self.glide.filter(|_| !self.streaming) {
             // A fold: its own spring for its own time, however far, from the velocity it has.
             let (x, v) = own.sample(self.h, self.v, aim, dt);
@@ -322,9 +369,40 @@ impl GrowTrack {
         } else {
             self.mask = (self.mask - edge.shrink * dt).max(aim);
         }
+        self.rate *= (-dt / pace::WINDOW).exp();
         if !self.moving() {
             self.slide = None;
+            if !self.streaming {
+                self.paced = false;
+                self.rate = 0.0;
+                self.ended = 0.0;
+            }
         }
+    }
+
+    /// One substep of a streaming row's climb `rem` points short of its target (see [`pace`]).
+    fn climb(&mut self, rem: f32, carrying_tail: bool) {
+        let dt = SUBSTEP;
+        self.ended = if self.streaming { 0.0 } else { self.ended + dt };
+        let landing = (self.ended / pace::LAND_RAMP).min(1.0);
+        let w = (self.rate / pace::TRAIL).clamp(pace::MIN + (pace::LAND - pace::MIN) * landing, pace::MAX);
+        let a = (w * w * rem - 2.0 * w * self.v).clamp(-pace::ACCEL, pace::ACCEL);
+        let mut cap = if rem > caps::LONG_DISTANCE { caps::MAX_LONG } else { caps::MAX };
+        if carrying_tail {
+            cap = cap.min(caps::CARRYING_TAIL);
+        }
+        // No faster than braking at ACCEL still stops on the target. Once the stream has ended,
+        // no slower than LAND_MIN, so the last of it lands rather than crawling; while it runs,
+        // no floor, which would outrun a reveal rising a fraction of a point a word.
+        let v = (self.v + a * dt).max(pace::LAND_MIN * landing).min(cap.min((2.0 * pace::ACCEL * rem).sqrt()));
+        if v * dt >= rem {
+            self.h = self.target;
+            self.v = 0.0;
+        } else {
+            self.h += v * dt;
+            self.v = v;
+        }
+        self.age += dt;
     }
 }
 
@@ -490,6 +568,24 @@ mod tests {
         assert!(hs[jump - 1].1 > 898.0 && hs[jump].1 == 3040.0, "{:?}", &hs[jump - 2..=jump]);
         assert!(at(&hs, FOLD.duration) > 900.0 - 18.0, "{}", at(&hs, FOLD.duration));
         assert!(hs[jump].0 < 0.3, "lands in the spring's own time: {}", hs[jump].0);
+    }
+
+    #[test]
+    fn a_glide_handed_to_a_whole_row_mid_way_carries_on() {
+        let mut t = GrowTrack { whole: true, ..GrowTrack::settled(40.0) };
+        t.set_kind(false, true, Some((FoldGlide { spring: FOLD, feather: None }, 200.0)));
+        t.retarget(640.0);
+        for _ in 0..10 {
+            t.step(GROWTH, &edge::FEATHER, false);
+        }
+        t.set_kind(false, true, None);
+        let mut prev = t.h;
+        while t.moving() {
+            t.step(GROWTH, &edge::FEATHER, false);
+            assert!(t.h - prev < 20.0, "a step of {} pt at {}", t.h - prev, t.h);
+            prev = t.h;
+        }
+        assert!((t.h - 640.0).abs() < 0.01, "{}", t.h);
     }
 
     #[test]

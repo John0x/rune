@@ -19,9 +19,10 @@ fn spans_with(src: &str, style: &MarkdownStyle, highlighter: Highlighter) -> Vec
         }
     }
     let (blocks, sources, tasks, _, _) = doc_cached(src);
-    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_ring: None, on_task: None,
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_help: None, link_ring: None, on_task: None,
         tasks_read_only: false, selectable: false, scroll_wide: false, highlighter, sources: sources.clone(),
-        next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()) };
+        next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
+        #[cfg(feature = "mermaid")] diagram_frame: None };
     let mut found = Vec::new();
     codes(&blocks, &mut found);
     assert_eq!(found.len(), sources.len(), "one source per code block");
@@ -271,13 +272,110 @@ fn link_spans_come_before_inner_inline_styles_so_bold_em_and_code_keep_theirs() 
     });
     let (blocks, sources, tasks, _, _) = doc_cached("[**bold** *em* `code` plain](session:1)");
     let Block::Para(inl) = &blocks[0] else { panic!() };
-    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_ring: None, on_task: None,
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_help: None, link_ring: None, on_task: None,
         tasks_read_only: false, selectable: false, scroll_wide: false, highlighter: Highlighter::builtin(), sources,
-        next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()) };
+        next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
+        #[cfg(feature = "mermaid")] diagram_frame: None };
     let spans = r.spans(inl, style.body.size);
     // The link span is first so `flatten_spans` applies inner Strong/Em/Code over it.
     assert_eq!((spans[0].start, spans[0].end, spans[0].color, spans[0].weight, spans[0].bg, spans[0].bg_pad), (0, inl.text.len() as u32, Some(Color::WHITE), Some(500.0), Some(bg), 3.0));
     assert!(spans.iter().any(|s| &inl.text[s.start as usize..s.end as usize] == "bold" && s.weight == Some(style.strong_weight)));
     assert!(spans.iter().any(|s| &inl.text[s.start as usize..s.end as usize] == "em" && s.italic && s.color.is_none()));
     assert!(spans.iter().any(|s| &inl.text[s.start as usize..s.end as usize] == "code" && s.mono && s.size == Some(style.body.size * style.inline_code_scale) && s.bg.is_none()));
+}
+
+#[test]
+fn pure_markdown_caches_its_built_subtree_keeps_paths_and_invalidates_on_change() {
+    use rune::{Cx, Env, Runtime};
+
+    struct State {
+        tick: u32,
+        a: String,
+        b: String,
+        query: &'static str,
+        accent: Color,
+    }
+
+    fn view(s: &State, _: &mut Cx<State>) -> El {
+        let _ = s.tick;
+        let style = MarkdownStyle::neutral(true).text(s.accent);
+        let hl = if s.query.is_empty() {
+            Vec::new()
+        } else {
+            find(&s.a, s.query, Case::Insensitive).into_iter().collect()
+        };
+        col().w_full().h_full().children([
+            // Two unkeyed Markdown siblings (even with identical text initially) keep `#0` and `#1`
+            // without duplicate-key warnings, plus a `.key("third")` sibling.
+            Markdown::new(&s.a).highlights(hl).selectable(true).render(&style),
+            Markdown::new(&s.b).selectable(true).render(&style),
+            Markdown::new("Third **card** note").render(&style).key("third"),
+        ])
+    }
+
+    let mut rt = Runtime::new(
+        State {
+            tick: 0,
+            a: "Hello **world** from `rune`.".into(),
+            b: "Hello **world** from `rune`.".into(),
+            query: "",
+            accent: Color::WHITE,
+        },
+        view,
+        (480.0, 400.0),
+        Env::new(true, 1.0),
+    );
+    RENDERS.with(|n| n.set(0));
+    rt.frame(0.0);
+    assert_eq!(RENDERS.with(Cell::get), 3);
+    let paths: Vec<_> = rt.elements().into_iter().map(|e| e.path).collect();
+    assert!(paths.iter().any(|p| p == "#0/#0/b0"), "{paths:?}");
+    assert!(paths.iter().any(|p| p == "#0/#1/b0"), "{paths:?}");
+    assert!(paths.iter().any(|p| p == "#0/third/b0"), "{paths:?}");
+
+    // Unrelated state commits skip building all three Markdown subtrees.
+    RENDERS.with(|n| n.set(0));
+    for _ in 0..5 {
+        rt.update(|s, _| s.tick += 1);
+        rt.frame(1.0 / 120.0);
+    }
+    assert_eq!(RENDERS.with(Cell::get), 0);
+
+    // Changing only `b` re-renders only `b`; `a` and `third` stay cached.
+    RENDERS.with(|n| n.set(0));
+    rt.update(|s, _| s.b = "Updated *second* paragraph.".into());
+    rt.frame(1.0 / 120.0);
+    assert_eq!(RENDERS.with(Cell::get), 1);
+    assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("Updated second paragraph.")));
+
+    // Changing highlights on `a` re-renders only `a`.
+    RENDERS.with(|n| n.set(0));
+    rt.update(|s, _| s.query = "world");
+    rt.frame(1.0 / 120.0);
+    assert_eq!(RENDERS.with(Cell::get), 1);
+
+    // Changing style invalidates all three.
+    RENDERS.with(|n| n.set(0));
+    rt.update(|s, _| s.accent = Color { r: 0.2, g: 0.6, b: 1.0, a: 1.0 });
+    rt.frame(1.0 / 120.0);
+    assert_eq!(RENDERS.with(Cell::get), 3);
+}
+
+#[test]
+fn link_help_gives_each_link_its_own_tooltip() {
+    use rune::{Cx, Env, Runtime};
+
+    fn view(_: &(), _: &mut Cx<()>) -> El {
+        Markdown::new("See [the docs](https://example.com/docs) or [here](notes)")
+            .on_link(|_: &mut (), _| {})
+            .link_help(|url| url.starts_with("https:").then(|| url.trim_start_matches("https://").to_owned()))
+            .render(&MarkdownStyle::neutral(true))
+    }
+    let mut rt = Runtime::new((), view, (400.0, 200.0), Env::new(true, 2.0));
+    rt.frame(0.0);
+    let links: Vec<(Option<String>, Option<String>)> = rt.elements().into_iter().filter(|e| e.role == "link").map(|e| (e.key, e.help)).collect();
+    assert_eq!(links, [
+        (Some("https://example.com/docs".into()), Some("example.com/docs".into())),
+        (Some("notes".into()), None),
+    ]);
 }

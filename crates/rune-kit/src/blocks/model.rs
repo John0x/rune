@@ -359,13 +359,10 @@ impl Blocks {
 
 /// A block's field: rich text (with Markdown's marks) for text kinds, plain for code.
 pub(super) fn field(kind: &Kind, text: &str, marks: Vec<MarkRange>) -> TextEdit {
-    let lines = text.split('\n').count();
-    let edit = TextEdit::from_parts(text, marks, vec![Line::Paragraph; lines]).allow_blocks([Line::Paragraph]);
     if kind.is_rich() {
-        edit.allow_marks(rich_marks())
+        let lines = text.split('\n').count();
+        TextEdit::from_parts(text, marks, vec![Line::Paragraph; lines]).allow_blocks([Line::Paragraph]).allow_marks(rich_marks())
     } else {
-        let mut edit = edit.allow_marks([]);
-        edit.set_rich(false);
-        edit
+        TextEdit::new(text).allow_blocks([Line::Paragraph]).allow_marks([])
     }
 }

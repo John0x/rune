@@ -6,6 +6,7 @@
 #[cfg(all(target_arch = "wasm32", any(feature = "hot", feature = "native-file-dialog")))]
 compile_error!("web does not support Rune's hot or native-file-dialog features; disable them for wasm32");
 
+mod a11y;
 mod app;
 mod cold;
 mod cursor;
@@ -46,6 +47,7 @@ pub mod native_surface;
 pub mod playground;
 pub mod prefs;
 pub mod render;
+pub mod rewind;
 pub mod runtime;
 pub mod shape;
 pub mod text;
@@ -56,6 +58,9 @@ pub mod tooling;
 pub mod tray;
 pub mod windows;
 
+/// AccessKit's types, for [`Runtime::accessibility_tree`] and [`Runtime::accessibility_action`].
+pub use a11y::AccessibilityLink;
+pub use accesskit;
 pub use app::App;
 pub use app::AppHandle;
 pub use clipboard::ClipboardContent;
@@ -93,6 +98,7 @@ pub use el::Cycle;
 pub use el::Drag;
 pub use el::El;
 pub use el::GrowthSpec;
+pub use el::LiveRegion;
 pub use el::Outline;
 pub use el::Phase;
 pub use el::PillStyle;
@@ -113,6 +119,7 @@ pub use el::effect;
 pub use el::el;
 pub use el::icon;
 pub use el::layout_watch::ScrollPos;
+pub use el::motion::MotionIntent;
 pub use el::rich;
 pub use el::row;
 pub use el::spacer;
@@ -139,6 +146,7 @@ pub use frame::surface_stats::Pacing;
 pub use frame::surface_stats::SurfaceCounts;
 pub use frame::surface_stats::SurfaceStats;
 pub use gpu::backend::GpuBackend;
+pub use gpu::backend::describe as describe_gpu;
 #[cfg(all(target_vendor = "apple", feature = "metal-backend"))]
 #[doc(hidden)]
 pub use gpu::metal::bench::dispatch_overhead as __metal_dispatch_overhead;
@@ -195,6 +203,12 @@ pub use platform::macos::appearance as macos_appearance;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use platform::macos::panel_bridge as macos_panel_bridge;
+pub use platform::scroll_bars::ScrollBars;
+#[doc(hidden)]
+pub use platform::scroll_bars::current_runtime_id;
+pub use platform::scroll_bars::system_scroll_bars;
+pub use platform::scroll_bars::system_scroller_jumps;
+pub use platform::scroll_bars::system_scroller_overlay;
 #[cfg(target_arch = "wasm32")]
 pub use platform::web;
 pub use playground::Play;
@@ -215,8 +229,12 @@ pub use recorder::Recorder;
 pub use recorder::RecorderState;
 pub use recorder::Recording;
 pub use render::MAX_BACKDROP_BLURS;
+pub use render::gpu_events::GpuEvent;
+pub use render::gpu_events::on_gpu;
 pub use render::prewarm_gpu;
 pub use render::prewarm_gpu_on;
+pub use render::warm_gpu;
+pub use render::warm_gpu_with;
 pub use rune_motion::Anim;
 pub use rune_motion::AnimExt;
 pub use rune_motion::Beat;
@@ -257,8 +275,11 @@ pub use runtime::SelectedText;
 pub use runtime::SelectionChange;
 pub use runtime::TextSelection;
 pub use runtime::TitlebarAction;
+pub use runtime::TouchPhase;
 pub use runtime::Waker;
 pub use runtime::commit_generation;
+#[doc(hidden)]
+pub use runtime::scroll_watch_state;
 pub use shape::LineCap;
 pub use shape::Path;
 pub use shape::Shape;
@@ -337,18 +358,4 @@ pub(crate) fn with_scene_clock<T>(clock: SceneClock, f: impl FnOnce() -> T) -> T
     let out = f();
     SCENE_CLOCK.set(before);
     out
-}
-
-/// An XDG activation token from the latest pointer press on a Wayland overlay, for another app
-/// to take focus with: a notification server's `ActivationToken` before `ActionInvoked`. Call it
-/// from the press's handler. `app_id` names the app that will use it. Blocks for the
-/// compositor's answer; None off Wayland, before any press, or without `xdg_activation_v1`.
-pub fn press_activation_token(app_id: Option<&str>) -> Option<String> {
-    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
-    return platform::activation::press_token(app_id);
-    #[cfg(not(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))))]
-    {
-        let _ = app_id;
-        None
-    }
 }

@@ -36,10 +36,6 @@ impl Highlight {
         self.current = current;
         self
     }
-    /// Whether this highlight uses the active/current match style.
-    pub fn is_current(&self) -> bool {
-        self.current
-    }
     /// Overrides the rounded background colour behind the highlighted glyphs.
     pub fn bg(mut self, c: Color) -> Self {
         self.bg = Some(c);
@@ -65,6 +61,13 @@ impl Highlight {
     pub fn key(mut self, key: impl Into<String>) -> Self {
         self.key = Some(key.into());
         self
+    }
+}
+
+impl std::hash::Hash for Highlight {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Highlight { current, bg, fg, ring, key } = self;
+        (current, bg, fg, ring.map(|(c, w)| (c, if w == 0.0 { 0 } else { w.to_bits() })), key).hash(state);
     }
 }
 

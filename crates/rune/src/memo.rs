@@ -54,6 +54,9 @@ use crate::El;
 use crate::runtime::HashMap;
 use crate::runtime::layout_read::{LayoutRects, SELECTION, Same, boxes_moved, moved, note_read, seen_rect, size, window_key};
 
+pub(crate) mod snapshot;
+pub use snapshot::snapshot;
+
 /// The children a memo's placeholders share.
 #[derive(Clone)]
 pub(crate) struct Shared {
@@ -143,8 +146,8 @@ pub(crate) struct Built {
 static NEXT_BUILT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Built {
-    fn new(mut el: El, scale: f32) -> (Rc<Built>, String) {
-        let key = el.key.take().unwrap_or_default();
+    fn new(mut el: El, scale: f32) -> (Rc<Built>, Option<String>) {
+        let key = el.key.take();
         el.memo_built = None;
         let shared = if el.children.is_empty() && let Some(shared) = el.memo_children.take() {
             prekey_text_shapes(&mut el, scale);
@@ -166,9 +169,9 @@ impl Built {
     }
 
     /// The root, with its children shared rather than copied.
-    fn placeholder(self: &Rc<Self>, key: String) -> El {
+    fn placeholder(self: &Rc<Self>, key: Option<String>) -> El {
         let mut el = self.root.clone();
-        el.key = Some(key);
+        el.key = key;
         el.has_virtual |= self.children.has_virtual;
         el.memo_children = Some(self.children.clone());
         el.memo_built = Some(self.clone());
@@ -223,14 +226,18 @@ pub(crate) struct Replayed {
 }
 
 struct Entry {
+    id: Rc<str>,
     version: u64,
     built: Rc<Built>,
+    key: Option<String>,
     /// The `Cx` reads its build made, its nested memos' included.
     reads: Vec<Read>,
     /// Memos built inside this one's closure, kept while this one is reused.
     nested: Vec<Rc<str>>,
     /// The view build that last used it.
     pass: u64,
+    /// `0` when built in `view`, else [`virtual_row_tag`] of the `virtual_rows` row that built it.
+    virtual_row: u64,
 }
 
 /// One window's cached subtrees.
@@ -241,7 +248,12 @@ pub(crate) struct MemoCache {
     pub(crate) pending_scratch: Vec<crate::runtime::memo_reuse::PendingFlat>,
     pub(crate) reused_scratch: Vec<crate::runtime::memo_reuse::ReusedSpan>,
     pub(crate) skip_scratch: Vec<crate::runtime::memo_reuse::CleanApplySpan>,
+    pub(crate) split_scratch: Vec<bool>,
+    pub(crate) taken_paths_scratch: Vec<(u32, u32)>,
     pub(crate) path_scratch: String,
+    id_scratch: String,
+    pure_counts: HashMap<(u64, u64, u64), u32>,
+    nested_scratch: Vec<(Rc<str>, u64)>,
     pub(crate) present_len: usize,
     pass: u64,
     #[cfg(test)]
@@ -259,6 +271,11 @@ impl MemoCache {
     #[cfg(feature = "hot")]
     pub(crate) fn emptied(&self) -> MemoCache {
         MemoCache { pass: self.pass, ..MemoCache::default() }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
     }
 
     /// The pass the next view build will be.
@@ -284,6 +301,7 @@ struct Scope {
     cache: MemoCache,
     env: u64,
     scale: f32,
+    virtual_row: u64,
     /// The ids of the memos whose closures are running, innermost last.
     path: Vec<Rc<str>>,
     /// The memos each running closure has created so far.
@@ -322,14 +340,16 @@ pub(crate) fn enter(
     layout: LayoutRects,
 ) -> Guard {
     cache.pass += 1;
+    cache.pure_counts.clear();
     let accent = [accent.accent(env.system_dark), accent.focus(env.system_dark)].map(|c| [c.r, c.g, c.b, c.a].map(f32::to_bits));
     let scale = env.scale;
     // Theme colours resolve per blend mode (`theme::blends_srgb`), so a switch rebuilds memos.
-    let env = hash_of(&(env.system_dark, scale.to_bits(), reduced_motion, accent, srgb_blend));
+    let env = hash_of(&(env.system_dark, scale.to_bits(), reduced_motion, accent, crate::platform::scroll_bars::scoped(), srgb_blend));
     let scope = Scope {
         cache,
         env,
         scale,
+        virtual_row: 0,
         path: Vec::new(),
         nested: Vec::new(),
         reads: Vec::new(),
@@ -338,6 +358,59 @@ pub(crate) fn enter(
     };
     SCOPES.with_borrow_mut(|s| s.push(scope));
     Guard(true)
+}
+
+pub(crate) fn virtual_row_tag(list_path: &str, row_key: &str) -> u64 {
+    hash_of(&(list_path, row_key)).max(1)
+}
+
+pub(crate) fn in_virtual_row<R>(tag: u64, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            if let Some(prev) = self.0 {
+                SCOPES.with_borrow_mut(|scopes| {
+                    if let Some(s) = scopes.last_mut() {
+                        s.virtual_row = prev;
+                    }
+                });
+            }
+        }
+    }
+    let prev = SCOPES.with_borrow_mut(|scopes| {
+        scopes.last_mut().map(|s| std::mem::replace(&mut s.virtual_row, tag))
+    });
+    let _reset = Reset(prev);
+    f()
+}
+
+/// [`enter`] for a commit that skips running `view` and builds only newly entering virtual rows,
+/// keeping memos built in `view` (`virtual_row == 0`) or in rows `kept_rows` stays mounted on.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn enter_partial(
+    mut cache: MemoCache,
+    kept_rows: &crate::runtime::HashSet<u64>,
+    env: crate::Env,
+    accent: crate::SystemAccent,
+    reduced_motion: bool,
+    srgb_blend: bool,
+    caret: Option<(String, [f32; 4])>,
+    layout: LayoutRects,
+) -> Guard {
+    let next = cache.pass + 1;
+    let mut nested = std::mem::take(&mut cache.nested_scratch);
+    nested.clear();
+    for e in cache.entries.values_mut() {
+        if e.virtual_row == 0 || kept_rows.contains(&e.virtual_row) {
+            e.pass = next;
+            nested.extend(e.nested.iter().map(|id| (id.clone(), e.virtual_row)));
+        }
+    }
+    if !nested.is_empty() {
+        keep_nested_rows(&mut cache, &mut nested, next);
+    }
+    cache.nested_scratch = nested;
+    enter(cache, env, accent, reduced_motion, srgb_blend, caret, layout)
 }
 
 /// Records a `Cx::caret` read for the memo building, if any.
@@ -487,9 +560,18 @@ pub fn memo(id: impl Into<String>, version: impl Hash, build: impl FnOnce() -> E
     let step = SCOPES.with_borrow_mut(|scopes| {
         let Some(s) = scopes.last_mut() else { return Step::Plain };
         let version = hash_of(&(version, s.env));
-        let nested_id = s.path.last().map(|p| format!("{p}/{key}"));
-        let name = nested_id.as_deref().unwrap_or(&key);
+        let name: &str = if let Some(p) = s.path.last() {
+            s.cache.id_scratch.clear();
+            s.cache.id_scratch.reserve(p.len() + 1 + key.len());
+            s.cache.id_scratch.push_str(p);
+            s.cache.id_scratch.push('/');
+            s.cache.id_scratch.push_str(&key);
+            &s.cache.id_scratch
+        } else {
+            &key
+        };
         let pass = s.cache.pass;
+        let has_parent = !s.nested.is_empty();
         let mut reused = None;
         let mut store = true;
         if let Some(e) = s.cache.entries.get_mut(name) {
@@ -497,6 +579,7 @@ pub fn memo(id: impl Into<String>, version: impl Hash, build: impl FnOnce() -> E
                 store = false;
             } else if e.version == version && e.reads.iter().all(|r| s.seen.holds(r)) {
                 e.pass = pass;
+                e.virtual_row = s.virtual_row;
                 for read in &e.reads {
                     match read {
                         Read::Caret(..) => s.replayed.caret = true,
@@ -506,24 +589,25 @@ pub fn memo(id: impl Into<String>, version: impl Hash, build: impl FnOnce() -> E
                     }
                 }
                 let parent_reads = if s.reads.is_empty() || e.reads.is_empty() { Vec::new() } else { e.reads.clone() };
-                let nested = if e.nested.is_empty() { Vec::new() } else { e.nested.clone() };
-                reused = Some((e.built.clone(), nested, parent_reads));
+                s.cache.nested_scratch.extend(e.nested.iter().map(|id| (id.clone(), s.virtual_row)));
+                reused = Some((has_parent.then(|| e.id.clone()), e.built.clone(), parent_reads));
             }
         }
-        let rc_id = || -> Rc<str> { name.into() };
-        if let Some((built, nested, reads)) = reused {
-            if !nested.is_empty() {
-                keep_nested(&mut s.cache, nested, pass);
+        if let Some((parent_id, built, reads)) = reused {
+            if !s.cache.nested_scratch.is_empty() {
+                let mut scratch = std::mem::take(&mut s.cache.nested_scratch);
+                keep_nested_rows(&mut s.cache, &mut scratch, pass);
+                s.cache.nested_scratch = scratch;
             }
             if !reads.is_empty() {
                 s.note(&reads);
             }
-            if let Some(parent) = s.nested.last_mut() {
-                parent.push(rc_id());
+            if let (Some(parent), Some(id)) = (s.nested.last_mut(), parent_id) {
+                parent.push(id);
             }
             return Step::Reuse(built);
         }
-        let id = rc_id();
+        let id: Rc<str> = name.into();
         if let Some(parent) = s.nested.last_mut() {
             parent.push(id.clone());
         }
@@ -533,7 +617,7 @@ pub fn memo(id: impl Into<String>, version: impl Hash, build: impl FnOnce() -> E
         Step::Build { id, version, store }
     });
     let (id, version, store) = match step {
-        Step::Reuse(built) => return built.placeholder(key),
+        Step::Reuse(built) => return built.placeholder(Some(key)),
         Step::Plain => return keyed(build(), key),
         Step::Build { id, version, store } => (id, version, store),
     };
@@ -552,21 +636,130 @@ pub fn memo(id: impl Into<String>, version: impl Hash, build: impl FnOnce() -> E
             return el;
         }
         let (built, key) = Built::new(el, s.scale);
-        let el = built.placeholder(key);
+        let el = built.placeholder(key.clone());
         let pass = s.cache.pass;
-        s.cache.entries.insert(id, Entry { version, built, reads, nested, pass });
+        let virtual_row = s.virtual_row;
+        let entry_id = id.clone();
+        s.cache.entries.insert(id, Entry { id: entry_id, version, built, key, reads, nested, pass, virtual_row });
+        el
+    })
+}
+
+#[doc(hidden)]
+pub fn digest(input: &(impl Hash + ?Sized)) -> (u64, u64) {
+    let h1 = hash_of(&input);
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut h2);
+    (h1, h2.finish())
+}
+
+/// Caches a pure-data subtree by a 128-bit [`digest`] and its occurrence ordinal in the
+/// current view pass (or `virtual_rows` row), preserving `el.key` (`None` when unkeyed).
+#[doc(hidden)]
+pub fn cached((h1, h2): (u64, u64), build: impl FnOnce() -> El) -> El {
+    enum Step {
+        Reuse(Rc<Built>, Option<String>),
+        Build { id: Rc<str>, version: u64 },
+        Plain,
+    }
+    let step = SCOPES.with_borrow_mut(|scopes| {
+        let Some(s) = scopes.last_mut() else { return Step::Plain };
+        let occ = *s
+            .cache
+            .pure_counts
+            .entry((s.virtual_row, h1, h2))
+            .and_modify(|c| *c += 1)
+            .or_insert(0);
+        let version = hash_of(&(h1, h2, s.env));
+        {
+            use std::fmt::Write;
+            s.cache.id_scratch.clear();
+            if let Some(p) = s.path.last() {
+                s.cache.id_scratch.push_str(p);
+                s.cache.id_scratch.push('/');
+            }
+            let _ = write!(s.cache.id_scratch, "\0{}:{h1:016x}:{h2:016x}:{occ}", s.virtual_row);
+        }
+        let pass = s.cache.pass;
+        let has_parent = !s.nested.is_empty();
+        let mut reused = None;
+        if let Some(e) = s.cache.entries.get_mut(s.cache.id_scratch.as_str())
+            && e.pass != pass
+            && e.version == version
+            && e.reads.iter().all(|r| s.seen.holds(r))
+        {
+            e.pass = pass;
+            e.virtual_row = s.virtual_row;
+            for read in &e.reads {
+                match read {
+                    Read::Caret(..) => s.replayed.caret = true,
+                    Read::Layout(k, _) => note_read(&mut s.replayed.layout, k, None),
+                    Read::LayoutWith(k, same, _) => note_read(&mut s.replayed.layout, k, Some(same.clone())),
+                    Read::Selection(_) => note_read(&mut s.replayed.layout, SELECTION, None),
+                }
+            }
+            let parent_reads = if s.reads.is_empty() || e.reads.is_empty() { Vec::new() } else { e.reads.clone() };
+            s.cache.nested_scratch.extend(e.nested.iter().map(|id| (id.clone(), s.virtual_row)));
+            reused = Some((has_parent.then(|| e.id.clone()), e.built.clone(), e.key.clone(), parent_reads));
+        }
+        if let Some((parent_id, built, key, reads)) = reused {
+            if !s.cache.nested_scratch.is_empty() {
+                let mut scratch = std::mem::take(&mut s.cache.nested_scratch);
+                keep_nested_rows(&mut s.cache, &mut scratch, pass);
+                s.cache.nested_scratch = scratch;
+            }
+            if !reads.is_empty() {
+                s.note(&reads);
+            }
+            if let (Some(parent), Some(id)) = (s.nested.last_mut(), parent_id) {
+                parent.push(id);
+            }
+            return Step::Reuse(built, key);
+        }
+        let id: Rc<str> = s.cache.id_scratch.as_str().into();
+        if let Some(parent) = s.nested.last_mut() {
+            parent.push(id.clone());
+        }
+        s.path.push(id.clone());
+        s.nested.push(Vec::new());
+        s.reads.push(Vec::new());
+        Step::Build { id, version }
+    });
+    let (id, version) = match step {
+        Step::Reuse(built, key) => return built.placeholder(key),
+        Step::Plain => return build(),
+        Step::Build { id, version } => (id, version),
+    };
+    let el = build();
+    SCOPES.with_borrow_mut(|scopes| {
+        let Some(s) = scopes.last_mut() else { return el };
+        s.path.pop();
+        let nested = s.nested.pop().unwrap_or_default();
+        let reads = s.reads.pop().unwrap_or_default();
+        s.note(&reads);
+        #[cfg(test)]
+        {
+            s.cache.builds += 1;
+        }
+        let (built, key) = Built::new(el, s.scale);
+        let el = built.placeholder(key.clone());
+        let pass = s.cache.pass;
+        let virtual_row = s.virtual_row;
+        let entry_id = id.clone();
+        s.cache.entries.insert(id, Entry { id: entry_id, version, built, key, reads, nested, pass, virtual_row });
         el
     })
 }
 
 /// Marks the memos built inside a reused one as used, so they survive to its next build.
-fn keep_nested(cache: &mut MemoCache, mut ids: Vec<Rc<str>>, pass: u64) {
-    while let Some(id) = ids.pop() {
+fn keep_nested_rows(cache: &mut MemoCache, ids: &mut Vec<(Rc<str>, u64)>, pass: u64) {
+    while let Some((id, virtual_row)) = ids.pop() {
         if let Some(e) = cache.entries.get_mut(&id)
             && e.pass != pass
         {
             e.pass = pass;
-            ids.extend(e.nested.iter().cloned());
+            e.virtual_row = virtual_row;
+            ids.extend(e.nested.iter().map(|nested| (nested.clone(), virtual_row)));
         }
     }
 }
@@ -929,6 +1122,31 @@ mod tests {
         let line = line!() + 1;
         let built = memo("id", 0, el);
         assert!(built.key_location().starts_with(&format!("{}:{line}:", file!())), "{}", built.key_location());
+    }
+
+    #[test]
+    fn cached_unkeyed_siblings_keep_index_paths_and_leave_no_key_warnings() {
+        fn view(tick: &u32, _: &mut Cx<u32>) -> El {
+            let _ = *tick;
+            col().w_full().children([
+                cached(digest("same"), || counted(text("one"))),
+                cached(digest("same"), || counted(text("one"))),
+                cached(digest("other"), || counted(text("two"))).key("named"),
+            ])
+        }
+        BUILDS.set(0);
+        let mut rt = Runtime::new(0u32, view, (200.0, 200.0), Env::new(true, 1.0));
+        rt.key_warnings = Some(Vec::new());
+        rt.frame(0.0);
+        assert_eq!(BUILDS.get(), 3);
+        assert!(rt.key_warnings.as_ref().unwrap().is_empty(), "{:?}", rt.key_warnings);
+        let paths: Vec<_> = rt.elements().into_iter().map(|e| e.path).collect();
+        assert_eq!(paths, vec!["#0", "#0/#0", "#0/#1", "#0/named"]);
+
+        rt.update(|t, _| *t += 1);
+        rt.frame(1.0 / 120.0);
+        assert_eq!(BUILDS.get(), 3, "reused all three cached subtrees");
+        assert!(rt.key_warnings.as_ref().unwrap().is_empty());
     }
 
     /// `cargo test -p rune --profile perf --lib memo_build_time -- --ignored --nocapture`

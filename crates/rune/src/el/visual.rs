@@ -25,7 +25,8 @@ pub struct VisualCold {
     pub border_dash_phase: f32,
     pub shadows: Vec<Shadow>,
     pub blur_motion: Option<Box<Anim>>,
-    /// Soft clip of children to this rect: fade widths left, top, right, bottom.
+    /// Soft clip of children to this rect: fade widths left, top, right, bottom. A negative
+    /// width ramps linearly (`El::clip_fade_linear`).
     pub clip: Option<[f32; 4]>,
     /// Rounded clip of this element and its subtree, applied after subtree filters.
     pub clip_radius: Option<f32>,
@@ -73,6 +74,14 @@ pub struct VisualCold {
     pub(crate) child_exit: Option<Box<Transition>>,
     /// `El::enter_delay`: seconds a new element holds its insertion effect before entering.
     pub(crate) enter_delay: f32,
+    /// `El::motion_intent`: authored motion traits inherited by this subtree.
+    pub(crate) motion_intent: crate::el::motion::MotionIntent,
+    /// `El::motion(Spring::NONE)` written on this element itself, not inherited or from a
+    /// token: what that spring governs here lands at once by design.
+    pub(crate) instant_motion: bool,
+    /// A scroll area's wrapper (`El::wrap_scroll_area`): rectangular clips and fades set on it
+    /// go to its first child, the viewport, so what it draws beside that stays whole.
+    pub(crate) clip_to_content: bool,
 }
 
 impl Empty for VisualCold {
@@ -109,6 +118,9 @@ impl Empty for VisualCold {
         rotate_motion: None,
         child_exit: None,
         enter_delay: 0.0,
+        motion_intent: crate::el::motion::MotionIntent::NONE,
+        instant_motion: false,
+        clip_to_content: false,
     };
 }
 

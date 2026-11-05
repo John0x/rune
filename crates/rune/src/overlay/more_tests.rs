@@ -693,3 +693,87 @@ fn an_overlay_reads_its_occlusion_once_a_turn() {
     overlay.sync_occlusion();
     assert!(!overlay.occluded, "the next turn reads it again");
 }
+
+/// A hidden overlay with `release_gpu_after` gives its GPU surface back that long after the hide
+/// (macOS keeps it): the loop wakes then, and a second hide doesn't push the time back.
+#[test]
+fn release_gpu_after_counts_from_the_hide() {
+    use std::time::Duration;
+    fn view(_: &(), _: &mut Cx<()>) -> El { crate::el() }
+    let app = AppSpec::new("release after", (20.0, 20.0), || (), view);
+    let spec = OverlaySpec::new("release after", app.size, view).options(Default::default()).release_gpu_after(Duration::from_secs(5));
+    let (mut overlay, _) = Overlay::new(spec, (), &app);
+    overlay.visible = true;
+    let before = Instant::now();
+    overlay.hide();
+    if cfg!(target_os = "macos") {
+        assert_eq!(overlay.release_at, None);
+        return;
+    }
+    let at = overlay.release_at.expect("the release waits for its time");
+    assert!(at >= before + Duration::from_secs(5));
+    assert_eq!(overlay.wake_deadline(), Some(at), "the loop wakes for it");
+    overlay.hide();
+    assert_eq!(overlay.release_at, Some(at), "hiding a hidden overlay keeps the time");
+    overlay.release_due(at - Duration::from_millis(1));
+    assert_eq!(overlay.release_at, Some(at), "not before its time");
+    overlay.release_due(at);
+    assert_eq!(overlay.release_at, None);
+}
+
+#[test]
+fn only_an_opted_in_overlay_takes_the_pointer_on_xwayland() {
+    use super::xwayland::xwayland_allowed;
+    assert!(xwayland_allowed(OverlayInput::None, KeyPolicy::None, false), "a HUD always may");
+    assert!(!xwayland_allowed(OverlayInput::All, KeyPolicy::None, false), "off by default");
+    assert!(!xwayland_allowed(OverlayInput::Regions, KeyPolicy::None, false));
+    assert!(xwayland_allowed(OverlayInput::All, KeyPolicy::None, true));
+    assert!(xwayland_allowed(OverlayInput::Regions, KeyPolicy::None, true));
+    assert!(!xwayland_allowed(OverlayInput::All, KeyPolicy::OnDemand, true), "never keys");
+}
+
+/// A fade-out gives the GPU surface back only once the fade ends, so the exit plays out on the
+/// window and its last frames reach the screen before the surface (and on Windows and macOS,
+/// the window) goes; where windows don't fade, the hide releases at once.
+#[test]
+fn a_fade_out_releases_the_gpu_after_the_fade() {
+    use std::time::Duration;
+    fn view(_: &(), _: &mut Cx<()>) -> El { crate::el() }
+    let app = AppSpec::new("fade release", (20.0, 20.0), || (), view);
+    let spec = OverlaySpec::new("fade release", app.size, view).options(Default::default()).release_gpu_after(Duration::from_secs(5));
+    let (mut overlay, _) = Overlay::new(spec, (), &app);
+    if cfg!(target_os = "macos") { return; } // A prewarmed macOS panel keeps its pixels instead.
+    overlay.fading_out = Some(Instant::now() + Duration::from_millis(200));
+    overlay.hidden_release(Instant::now());
+    assert_eq!(overlay.release_at, None, "a fading overlay keeps its surface");
+    overlay.fading_out = None;
+    overlay.visible = true;
+    let before = Instant::now();
+    overlay.hide_fading(Duration::from_millis(200));
+    if !cfg!(target_os = "windows") {
+        assert!(overlay.fading_out.is_none() && overlay.release_at.is_some(), "no fade here: released at the hide");
+        return;
+    }
+    let end = overlay.fading_out.expect("fading");
+    assert!(overlay.drawing(), "frames keep drawing through the fade");
+    assert_eq!(overlay.release_at, None, "nothing is released mid-fade");
+    overlay.end_fade_out(end - Duration::from_millis(1));
+    assert_eq!(overlay.release_at, None, "not before the fade ends");
+    overlay.end_fade_out(end);
+    assert!(!overlay.drawing());
+    let at = overlay.release_at.expect("released once the fade ends");
+    assert!(at >= before + Duration::from_secs(5), "counted from the hide that ended the fade");
+}
+
+#[test]
+fn a_windows_fade_steps_alpha_down_to_zero() {
+    use std::time::Duration;
+    let now = Instant::now();
+    let length = Duration::from_millis(200);
+    let end = now + length;
+    assert_eq!(fade_alpha(end, length, now), 255);
+    assert_eq!(fade_alpha(end, length, now + Duration::from_millis(100)), 128);
+    assert_eq!(fade_alpha(end, length, end), 0);
+    assert_eq!(fade_alpha(end, length, end + Duration::from_millis(50)), 0, "past the end stays clear");
+    assert_eq!(fade_alpha(end, Duration::ZERO, now), 0);
+}

@@ -322,6 +322,15 @@ impl El {
         { self.handlers.sites.pointer_move = Some(std::panic::Location::caller()); }
         self
     }
+    /// [`El::on_pointer_move_local`] for a component that doesn't read the app's state (a scroll
+    /// bar that widens under the pointer), so it works in any app.
+    #[track_caller]
+    pub fn on_pointer_move_any(mut self, f: impl Fn(PointerEvent, &mut Tx) + 'static) -> Self {
+        self.handlers.on_pointer_move = Some(Rc::new(move |_, p, tx| f(p, tx)));
+        #[cfg(debug_assertions)]
+        { self.handlers.sites.pointer_move = Some(std::panic::Location::caller()); }
+        self
+    }
 
     /// Called once when the pointer enters this hit target, not on animation frames.
     #[track_caller]
@@ -343,6 +352,14 @@ impl El {
         { self.handlers.sites.hover_change = Some(std::panic::Location::caller()); }
         self
     }
+    /// [`El::on_hover_change`] for a component that doesn't read the app's state.
+    #[track_caller]
+    pub fn on_hover_change_any(mut self, f: impl Fn(bool, &mut Tx) + 'static) -> Self {
+        self.handlers.on_hover_change = Some(Rc::new(move |_, inside, tx| f(inside, tx)));
+        #[cfg(debug_assertions)]
+        { self.handlers.sites.hover_change = Some(std::panic::Location::caller()); }
+        self
+    }
 
     /// Delay [`Self::on_hover_change`]: `true` arrives once the pointer has rested inside for
     /// `enter`, and `false` once it has stayed out for `leave`. A pass shorter than the delay
@@ -357,5 +374,26 @@ impl El {
             self.handlers.hover_delay = d;
         }
         self
+    }
+
+    #[doc(hidden)]
+    pub fn wrap_scroll_area(mut self, fallback_site: (&'static str, u32, u32)) -> (String, String, Self, Self) {
+        let key = self.key.clone().unwrap_or_else(|| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            fallback_site.hash(&mut h);
+            let v = h.finish();
+            let k = format!("scroll-{:08x}", (v ^ (v >> 32)) as u32);
+            self.key = Some(k.clone());
+            k
+        });
+        let area = format!("{key}-scroll-area");
+        let mut outer = col().key(area.clone());
+        outer.style = self.style.take_box_placement();
+        outer.aspect_fit = std::mem::replace(&mut self.aspect_fit, 0.0);
+        outer.above = self.above.take();
+        outer.transition = self.transition.take();
+        outer.vis.cold_mut().clip_to_content = true;
+        (area, key, outer, self)
     }
 }
