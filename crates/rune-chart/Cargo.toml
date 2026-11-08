@@ -1,0 +1,13 @@
+[package]
+name = "rune-chart"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+description = "Interactive charts for Rune: line, area, bar, candlestick, scatter, heat map, pie, radar and sankey charts with zoom, pan, tooltips and legends, on scales, nice ticks, columnar series and viewports."
+
+[dependencies]
+jiff = "0.2"
+rune = { path = "../rune", default-features = false }
+
+[lints]
+workspace = true
