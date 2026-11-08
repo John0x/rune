@@ -161,12 +161,26 @@ impl El {
         self
     }
 
+    /// [`Self::on_wheel`] for a component that keeps its own state: the handler gets no app
+    /// state, as with [`El::on_drag_any`](crate::El::on_drag_any).
+    pub fn on_wheel_any(mut self, f: impl Fn(WheelEvent, &mut Tx) -> bool + 'static) -> Self {
+        self.canvas_input().wheel = Some(Rc::new(move |_, e, tx| f(e, tx)));
+        self
+    }
+
     /// Trackpad pinches over this element: return true to take one. The innermost handler
     /// under the pointer hears it first. macOS reports pinches; on Windows, Linux and the web
     /// a pinch (and Ctrl + mouse wheel) comes as a Ctrl + wheel delta, turned into a delta of
     /// `-dy / 200` per point.
     pub fn on_magnify<S: 'static>(mut self, f: impl Fn(&mut S, MagnifyEvent, &mut Tx) -> bool + 'static) -> Self {
         self.canvas_input().magnify = Some(Rc::new(move |s, e, tx| f(state::<S>(s), e, tx)));
+        self
+    }
+
+    /// [`Self::on_magnify`] for a component that keeps its own state: the handler gets no app
+    /// state.
+    pub fn on_magnify_any(mut self, f: impl Fn(MagnifyEvent, &mut Tx) -> bool + 'static) -> Self {
+        self.canvas_input().magnify = Some(Rc::new(move |_, e, tx| f(e, tx)));
         self
     }
 

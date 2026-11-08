@@ -1,0 +1,1 @@
+- **`rune::component_state::<T>(key)` keeps a component's own state across view runs**, per window and type, without the app storing it; `El::on_wheel_any` and `El::on_magnify_any` take wheel and pinch without the app's state, as `on_drag_any` does.
