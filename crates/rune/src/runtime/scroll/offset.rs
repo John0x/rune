@@ -210,6 +210,12 @@ pub(super) fn glide_axis(spring: Spring, offset: &mut f64, glide: &mut Option<f3
 const NUDGE_FRAMES: u8 = 2;
 
 impl ScrollState {
+    /// Whether it follows its bottom: pinned there, or gliding to it. A settle lands only such a
+    /// sticky viewport at its bottom; one read further up stays where it was.
+    pub(crate) fn follows_bottom(&self) -> bool {
+        self.pinned || (self.glide.is_some() && self.glide_to.is_none())
+    }
+
     /// The spring the running glide steps on.
     pub(super) fn glide_spring(&self) -> Spring {
         self.spring.unwrap_or(motion::GLIDE)

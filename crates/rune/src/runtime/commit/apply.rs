@@ -656,7 +656,8 @@ impl<S: 'static> Runtime<S> {
                     e.x = AxisScroll::default();
                 }
                 if tx.settle && sp.stick_bottom {
-                    e.pinned = true;
+                    // Only one following its bottom lands there: one read further up stays.
+                    if e.follows_bottom() { e.pinned = true; }
                     e.v = 0.0;
                 }
                 // A window resize, a settle or an instant change lands the slack: the rows go

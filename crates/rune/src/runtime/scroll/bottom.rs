@@ -440,9 +440,40 @@ mod tests {
         assert_eq!(rt.state.far, [false, true, false]);
     }
 
+    /// A sticky viewport read far up stays where it was when the window is covered and
+    /// uncovered (which settles), its rows virtualized or not; one at its bottom stays there.
+    #[test]
+    fn a_sticky_viewport_read_far_up_stays_there_when_the_window_uncovers() {
+        for virtualized in [false, true] {
+            let mut rt = chat(Chat { rows: 40, virtualized, ..Default::default() });
+            for _ in 0..5 {
+                rt.wheel(100.0, 100.0, 300.0);
+                rt.frame(1.0 / 120.0);
+            }
+            for _ in 0..60 { rt.frame(1.0 / 120.0); }
+            let read = bottom_gap(&rt);
+            assert!(read < -1000.0, "reading far up: {read}");
+            rt.set_live_visible(false);
+            rt.hidden_wake();
+            rt.set_live_visible(true);
+            rt.settle_all();
+            for _ in 0..30 { rt.frame(1.0 / 120.0); }
+            assert!((bottom_gap(&rt) - read).abs() < 0.5, "it stays where it was read ({virtualized}): {read}, now {}", bottom_gap(&rt));
+
+            let mut rt = chat(Chat { rows: 40, virtualized, ..Default::default() });
+            rt.set_live_visible(false);
+            rt.update(|s, _| s.rows = 45);
+            rt.hidden_wake();
+            rt.set_live_visible(true);
+            rt.settle_all();
+            rt.frame(1.0 / 120.0);
+            assert!(bottom_gap(&rt).abs() < 0.05, "one at its bottom lands on its new bottom ({virtualized}): {}", bottom_gap(&rt));
+        }
+    }
+
     /// A scroll to the bottom asked for while the window is covered (or hidden) waits for the
     /// frame that uncovers it, which settles: that frame shows the bottom, with no glide after.
-    /// (Settling already pins a sticky viewport; this one isn't.)
+    /// (Settling pins a sticky viewport only if it follows its bottom; this one isn't sticky.)
     #[test]
     fn a_scroll_asked_while_covered_lands_when_it_uncovers() {
         let mut rt = chat(Chat { rows: 40, loose: true, ..Default::default() });
