@@ -1,0 +1,1 @@
+- **Shape fills take linear gradients.** `Shape::fill_gradient` and `Shape::area_gradient` with a `Gradient::vertical` or `Gradient::horizontal` run between two colours in the shape's coordinates, as an area under a line fades toward its baseline. Windows loads the uber shader from WGSL (about 250 ms on a device's first pipeline) until its DX12 bytecode is regenerated.

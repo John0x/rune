@@ -1,13 +1,18 @@
 //! Vector shapes painted inside an element: strokes (polylines) and fills (simple polygons), in
 //! the element's own points with the origin at its top-left corner. For waveforms, meters,
-//! sparklines and other drawing that changes every frame.
+//! sparklines, charts and other drawing that changes every frame.
 //!
 //! Shapes render in the uber-quad pass without the glyph atlas: a stroke is one capsule or box
-//! per segment (`KIND_SEGMENT`), a fill is ear-clipped into triangles (`KIND_TRIANGLE`) whose
+//! per segment (`KIND_SEGMENT`), a fill is triangulated into triangles (`KIND_TRIANGLE`) whose
 //! polygon-boundary edges are antialiased and whose interior edges are hard, so fills have no
-//! seams. Translucent strokes blend twice where neighbouring segments overlap at a joint; draw
-//! translucent areas as fills. An element's opacity doesn't: while it is between 0 and 1, a
-//! shape of more than one piece paints through a layer that takes it once.
+//! seams. A fill is triangulated once, when it is added, and the triangles stay with the shape:
+//! a shape kept across frames (`memo`, a stored `Shape`) costs no triangulation to draw again.
+//! [`Shape::area`] triangulates the band between two polylines in linear time, for charts with
+//! thousands of points. Translucent strokes blend twice where neighbouring segments overlap at a
+//! joint; draw translucent areas as fills. An element's opacity doesn't: while it is between 0
+//! and 1, a shape of more than one piece paints through a layer that takes it once.
+
+use std::rc::Rc;
 
 use crate::color::Color;
 
@@ -31,8 +36,59 @@ pub(crate) enum Op {
     },
     Fill {
         points: Vec<[f32; 2]>,
+        /// The colour, or the gradient's start colour.
         color: Color,
+        gradient: Option<Gradient>,
+        mesh: Mesh,
     },
+}
+
+/// A fill's triangles: vertex indices into its points and a mask of the edges on its outline
+/// (a→b, b→c, c→a as bits 0, 1, 2). Made from the points, so two fills with equal points have
+/// equal meshes and comparing them compares nothing.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Mesh(pub(crate) Rc<[([usize; 3], u32)]>);
+
+impl PartialEq for Mesh {
+    fn eq(&self, _: &Mesh) -> bool {
+        true
+    }
+}
+
+/// Which way a [`Gradient`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradientAxis {
+    /// Down the shape: `from` and `to` are y coordinates.
+    Vertical,
+    /// Across the shape: `from` and `to` are x coordinates.
+    Horizontal,
+}
+
+/// A linear gradient for a fill: `start` at `from` to `end` at `to` along `axis`, in the shape's
+/// coordinates, each colour held beyond its end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gradient {
+    pub axis: GradientAxis,
+    pub from: f32,
+    pub to: f32,
+    pub start: Color,
+    pub end: Color,
+}
+
+impl Gradient {
+    /// `top` at y `from` to `bottom` at y `to`: an area under a line fading toward its baseline.
+    pub fn vertical(from: f32, top: Color, to: f32, bottom: Color) -> Gradient {
+        Gradient { axis: GradientAxis::Vertical, from, to, start: top, end: bottom }
+    }
+
+    /// `left` at x `from` to `right` at x `to`.
+    pub fn horizontal(from: f32, left: Color, to: f32, right: Color) -> Gradient {
+        Gradient { axis: GradientAxis::Horizontal, from, to, start: left, end: right }
+    }
+
+    fn faded(self, a: f32) -> Gradient {
+        Gradient { start: Color { a: self.start.a * a, ..self.start }, end: Color { a: self.end.a * a, ..self.end }, ..self }
+    }
 }
 
 /// A list of strokes and fills, painted in order over the element's fill and under its text.
@@ -91,12 +147,67 @@ impl Shape {
     }
 
     /// The inside of the simple polygon through `points` (either winding; not self-intersecting).
-    pub fn fill(mut self, points: impl Into<Vec<[f32; 2]>>, color: Color) -> Shape {
-        let points = points.into();
+    pub fn fill(self, points: impl Into<Vec<[f32; 2]>>, color: Color) -> Shape {
+        self.push_fill(points.into(), color, None)
+    }
+
+    /// [`Self::fill`] with a linear gradient.
+    pub fn fill_gradient(self, points: impl Into<Vec<[f32; 2]>>, gradient: Gradient) -> Shape {
+        self.push_fill(points.into(), gradient.start, Some(gradient))
+    }
+
+    fn push_fill(mut self, points: Vec<[f32; 2]>, color: Color, gradient: Option<Gradient>) -> Shape {
         if points.len() >= 3 {
-            self.ops.push(Op::Fill { points, color });
+            let mesh = Mesh(triangulate(&points).into());
+            self.ops.push(Op::Fill { points, color, gradient, mesh });
         }
         self
+    }
+
+    /// The band between two polylines that run left to right, `upper` above `lower` (an area
+    /// under a chart's line, down to a baseline or to another line), as one fill triangulated in
+    /// linear time. Each line is sampled at the other's points too (held level past its ends),
+    /// so the fill's points are those of both lines. The band's outline is antialiased; where
+    /// the lines cross, the band folds over itself, so draw crossing lines' bands separately.
+    pub fn area(self, upper: impl Into<Vec<[f32; 2]>>, lower: impl Into<Vec<[f32; 2]>>, color: Color) -> Shape {
+        self.push_area(upper.into(), lower.into(), color, None)
+    }
+
+    /// [`Self::area`] with a linear gradient.
+    pub fn area_gradient(self, upper: impl Into<Vec<[f32; 2]>>, lower: impl Into<Vec<[f32; 2]>>, gradient: Gradient) -> Shape {
+        self.push_area(upper.into(), lower.into(), gradient.start, Some(gradient))
+    }
+
+    fn push_area(mut self, upper: Vec<[f32; 2]>, lower: Vec<[f32; 2]>, color: Color, gradient: Option<Gradient>) -> Shape {
+        if upper.len() < 2 || lower.len() < 2 {
+            let mut points = upper;
+            points.extend(lower.into_iter().rev());
+            return self.push_fill(points, color, gradient);
+        }
+        let (points, tris) = band(&upper, &lower);
+        self.ops.push(Op::Fill { points, color, gradient, mesh: Mesh(tris.into()) });
+        self
+    }
+
+    /// A dashed polyline: `dash` units of line, then `gap` units of none, along its length.
+    pub fn stroke_dashed(mut self, points: impl Into<Vec<[f32; 2]>>, width: f32, dash: f32, gap: f32, cap: LineCap, color: Color) -> Shape {
+        let points = points.into();
+        if dash <= 0.0 || gap <= 0.0 {
+            return self.stroke_with(points, false, width, cap, color);
+        }
+        let length: f32 = points.windows(2).map(|w| dist(w[0], w[1])).sum();
+        let mut at = 0.0;
+        while at < length {
+            self = self.stroke_with(slice(&points, at, (at + dash).min(length)), false, width, cap, color);
+            at += dash + gap;
+        }
+        self
+    }
+
+    /// A round dot of `radius` points at `center` (a chart's marker), round however the shape is
+    /// stretched.
+    pub fn dot(self, center: [f32; 2], radius: f32, color: Color) -> Shape {
+        self.stroke_with(vec![center, center], false, radius * 2.0, LineCap::Round, color)
     }
 
     /// Strokes every subpath of `path`, closed ones back to their start.
@@ -185,7 +296,7 @@ impl Shape {
                     }
                     done += l;
                 }
-                Op::Fill { points, color } => {
+                Op::Fill { color, gradient, .. } => {
                     let a = if total <= 0.0 {
                         t
                     } else if done <= 0.0 {
@@ -195,7 +306,12 @@ impl Shape {
                         ((at - (done - ramp)) / ramp).clamp(0.0, 1.0)
                     };
                     if a > 0.0 {
-                        ops.push(Op::Fill { points: points.clone(), color: Color { a: color.a * a, ..*color } });
+                        let mut faded = op.clone();
+                        if let Op::Fill { color: c, gradient: g, .. } = &mut faded {
+                            *c = Color { a: color.a * a, ..*color };
+                            *g = gradient.map(|g| g.faded(a));
+                        }
+                        ops.push(faded);
                     }
                 }
             }
@@ -395,146 +511,62 @@ pub(crate) fn triangulate(points: &[[f32; 2]]) -> Vec<([usize; 3], u32)> {
     out
 }
 
+/// The band between `upper` and `lower` (both left to right, two points or more) as a ring and
+/// its triangles. Each line is sampled at every point of both, so the band is a run of
+/// vertical-sided strips, two triangles each, which are convex wherever `upper` is above
+/// `lower`: linear in the points, however wavy the lines or sparse the baseline. The ring is the
+/// sampled `upper` then the sampled `lower` reversed; the lines and the band's two ends are its
+/// outline.
+pub(crate) fn band(upper: &[[f32; 2]], lower: &[[f32; 2]]) -> (Vec<[f32; 2]>, Vec<([usize; 3], u32)>) {
+    // `line`'s height at `x`, from its segment ending at `next`, the first point not yet taken
+    // (held level beyond its ends).
+    let at = |line: &[[f32; 2]], next: usize, x: f32| -> f32 {
+        if next == 0 {
+            return line[0][1];
+        }
+        let Some(&b) = line.get(next) else { return line[line.len() - 1][1] };
+        let a = line[next - 1];
+        let dx = b[0] - a[0];
+        if dx.abs() < 1e-6 { a[1] } else { a[1] + (b[1] - a[1]) * ((x - a[0]) / dx).clamp(0.0, 1.0) }
+    };
+    let (mut top, mut bottom) = (Vec::with_capacity(upper.len() + lower.len()), Vec::with_capacity(upper.len() + lower.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < upper.len() || j < lower.len() {
+        let (u, l) = (upper.get(i), lower.get(j));
+        match (u, l) {
+            (Some(u), Some(l)) if u[0] == l[0] => {
+                (top.push(*u), bottom.push(*l));
+                (i, j) = (i + 1, j + 1);
+            }
+            (Some(u), l) if l.is_none_or(|l| u[0] < l[0]) => {
+                (top.push(*u), bottom.push([u[0], at(lower, j, u[0])]));
+                i += 1;
+            }
+            (_, Some(l)) => {
+                (top.push([l[0], at(upper, i, l[0])]), bottom.push(*l));
+                j += 1;
+            }
+            _ => unreachable!("one line has a point left"),
+        }
+    }
+    let k = top.len();
+    let ring = 2 * k;
+    let low = |s: usize| k + (k - 1 - s);
+    let boundary = |a: usize, b: usize| (a + 1) % ring == b || (b + 1) % ring == a;
+    let mut tris = Vec::with_capacity(ring - 2);
+    for t in 0..k - 1 {
+        for [a, b, c] in [[t, t + 1, low(t + 1)], [t, low(t + 1), low(t)]] {
+            tris.push(([a, b, c], mask(boundary, a, b, c)));
+        }
+    }
+    top.extend(bottom.into_iter().rev());
+    (top, tris)
+}
+
 fn mask(boundary: impl Fn(usize, usize) -> bool, a: usize, b: usize, c: usize) -> u32 {
     (boundary(a, b) as u32) | ((boundary(b, c) as u32) << 1) | ((boundary(c, a) as u32) << 2)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn area(points: &[[f32; 2]], tris: &[([usize; 3], u32)]) -> f32 {
-        tris.iter()
-            .map(|([a, b, c], _)| {
-                let (a, b, c) = (points[*a], points[*b], points[*c]);
-                ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
-            })
-            .sum()
-    }
-
-    #[test]
-    fn a_concave_polygon_triangulates_to_its_area_with_boundary_edges_marked() {
-        // An L shape, clockwise in y-down screen space.
-        let l = [
-            [0.0, 0.0],
-            [20.0, 0.0],
-            [20.0, 10.0],
-            [10.0, 10.0],
-            [10.0, 30.0],
-            [0.0, 30.0],
-        ];
-        let tris = triangulate(&l);
-        assert_eq!(tris.len(), 4);
-        assert!((area(&l, &tris) - 400.0).abs() < 1e-3);
-        let boundary_edges: u32 = tris.iter().map(|(_, m)| m.count_ones()).sum();
-        assert_eq!(
-            boundary_edges, 6,
-            "every polygon edge once, no interior edge"
-        );
-    }
-
-    #[test]
-    fn a_waveform_envelope_triangulates_completely() {
-        let top: Vec<[f32; 2]> = (0..200)
-            .map(|i| [i as f32, 20.0 - ((i as f32) * 0.2).sin().abs() * 18.0 - 1.0])
-            .collect();
-        let mut env = top.clone();
-        env.extend(top.iter().rev().map(|p| [p[0], 40.0 - p[1]]));
-        let tris = triangulate(&env);
-        assert_eq!(tris.len(), env.len() - 2);
-        let exact: f32 = (0..env.len())
-            .map(|i| {
-                let (a, b) = (env[i], env[(i + 1) % env.len()]);
-                a[0] * b[1] - b[0] * a[1]
-            })
-            .sum::<f32>()
-            .abs()
-            * 0.5;
-        assert!((area(&env, &tris) - exact).abs() < exact * 1e-3);
-    }
-
-    #[test]
-    fn curves_flatten_within_tolerance_and_end_on_their_points() {
-        let p = Path::new()
-            .move_to([0.0, 0.0])
-            .cubic_to([0.0, 50.0], [100.0, 50.0], [100.0, 0.0])
-            .close();
-        let s = &p.subpaths[0];
-        assert!(s.closed);
-        assert_eq!(*s.points.last().unwrap(), [100.0, 0.0]);
-        let mid = s.points[s.points.len() / 2];
-        assert!((mid[1] - 37.5).abs() < 1.0, "{mid:?}");
-    }
-
-    fn strokes(s: &Shape) -> Vec<Vec<[f32; 2]>> {
-        s.ops.iter().filter_map(|op| if let Op::Stroke { points, .. } = op { Some(points.clone()) } else { None }).collect()
-    }
-
-    fn fill_alpha(s: &Shape) -> Option<f32> {
-        s.ops.iter().find_map(|op| if let Op::Fill { color, .. } = op { Some(color.a) } else { None })
-    }
-
-    #[test]
-    fn a_drawn_shape_traces_its_strokes_in_order_and_lands_its_head_last() {
-        // A connector: an L-shaped line 100 points long, a second 20-point run, then its head.
-        let s = Shape::new()
-            .stroke(vec![[0.0, 0.0], [0.0, 60.0], [40.0, 60.0]], 1.0, Color::WHITE)
-            .stroke(vec![[40.0, 70.0], [40.0, 90.0]], 1.0, Color::WHITE)
-            .fill(vec![[36.0, 90.0], [44.0, 90.0], [40.0, 96.0]], Color::WHITE);
-        assert_eq!(strokes(&s.drawn(0.0)), Vec::<Vec<[f32; 2]>>::new(), "nothing drawn yet");
-        assert_eq!(fill_alpha(&s.drawn(0.0)), None);
-        // 60 of 120 points: down the first leg, not yet round the corner.
-        assert_eq!(strokes(&s.drawn(0.5)), vec![vec![[0.0, 0.0], [0.0, 60.0]]]);
-        // 80 points: round the corner, halfway along the second leg.
-        assert_eq!(strokes(&s.drawn(80.0 / 120.0)), vec![vec![[0.0, 0.0], [0.0, 60.0], [20.0, 60.0]]]);
-        // The head fades in over the last 8 points of line.
-        assert_eq!(fill_alpha(&s.drawn(108.0 / 120.0)), None);
-        let a = fill_alpha(&s.drawn(116.0 / 120.0)).unwrap();
-        assert!((a - 0.5).abs() < 1e-4, "{a}");
-        assert_eq!(s.drawn(1.0), s, "drawn whole");
-        assert_eq!(s.drawn(f32::NAN), s);
-    }
-
-    #[test]
-    fn a_closed_stroke_draws_on_round_to_its_start_and_fills_alone_fade() {
-        let square = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
-        let s = Shape::new().stroke_with(square, true, 1.0, LineCap::Round, Color::WHITE);
-        assert_eq!(strokes(&s.drawn(0.875)), vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 5.0]]]);
-        let dot = Shape::new().fill(vec![[0.0, 0.0], [4.0, 0.0], [2.0, 4.0]], Color::WHITE);
-        assert_eq!(fill_alpha(&dot.drawn(0.25)), Some(0.25));
-    }
-
-    #[test]
-    fn a_trimmed_shape_keeps_the_stretch_between_start_and_end() {
-        let s = Shape::new()
-            .stroke(vec![[0.0, 0.0], [0.0, 60.0], [40.0, 60.0]], 1.0, Color::WHITE)
-            .stroke(vec![[40.0, 70.0], [40.0, 90.0]], 1.0, Color::WHITE);
-        // 30 to 105 of 120 points: round the corner, then 5 points down the second stroke.
-        assert_eq!(
-            strokes(&s.trimmed(0.25, 0.875)),
-            vec![vec![[0.0, 30.0], [0.0, 60.0], [40.0, 60.0]], vec![[40.0, 70.0], [40.0, 75.0]]]
-        );
-        // A cut on a vertex keeps no zero-length piece there.
-        assert_eq!(strokes(&s.trimmed(0.5, 0.875)), vec![vec![[0.0, 60.0], [40.0, 60.0]], vec![[40.0, 70.0], [40.0, 75.0]]]);
-        assert!(strokes(&s.trimmed(0.6, 0.6)).is_empty(), "nothing between equal ends");
-        assert!(strokes(&s.trimmed(0.7, 0.2)).is_empty());
-        assert_eq!(s.trimmed(0.0, 1.0), s);
-        assert_eq!(s.trimmed(f32::NAN, f32::NAN), s);
-        assert_eq!(s.trimmed(0.0, 0.5), s.drawn(0.5));
-    }
-
-    #[test]
-    fn a_closed_stroke_trims_across_its_closing_edge() {
-        let square = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
-        let s = Shape::new().stroke_with(square, true, 1.0, LineCap::Round, Color::WHITE);
-        assert_eq!(strokes(&s.trimmed(0.625, 1.0)), vec![vec![[5.0, 10.0], [0.0, 10.0], [0.0, 0.0]]]);
-    }
-
-    #[test]
-    fn empty_and_degenerate_ops_are_dropped() {
-        let s = Shape::new()
-            .stroke(vec![[0.0, 0.0]], 1.0, Color::WHITE)
-            .fill(vec![[0.0, 0.0], [1.0, 1.0]], Color::WHITE);
-        assert!(s.is_empty());
-    }
-}
+#[path = "shape_tests.rs"]
+mod tests;

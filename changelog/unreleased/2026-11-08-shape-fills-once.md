@@ -1,0 +1,1 @@
+- **A `Shape`'s fills triangulate once, when they are added, not on every frame.** A memoized or stored shape draws again without ear clipping. `Shape::area(upper, lower, color)` fills the band between two polylines (a chart's area down to a baseline or to another line) in linear time, however many points.

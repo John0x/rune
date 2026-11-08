@@ -282,6 +282,8 @@ pub use runtime::commit_generation;
 pub use runtime::scroll_watch_state;
 pub use shape::LineCap;
 pub use shape::Path;
+pub use shape::Gradient;
+pub use shape::GradientAxis;
 pub use shape::Shape;
 pub use shortcuts::PhysicalKeyCode;
 pub use shortcuts::Shortcut;

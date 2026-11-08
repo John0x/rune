@@ -125,7 +125,9 @@ fn draws(q: &Instance, apron: bool) -> Vec<Draw> {
         let [ax, ay, bx, by] = q.radii;
         let (cx, cy) = (q.uv[0], q.uv[1]);
         let b = [ax.min(bx).min(cx), ay.min(by).min(cy), ax.max(bx).max(cx), ay.max(by).max(cy)];
-        out.push(Draw { outer: b, ..solid(q.fill, 0.5) });
+        // A gradient fill (`params.z` > 0) is taken at its middle colour.
+        let color = if q.params[2] > 0.5 { lerp(q.fill, q.border, 0.5) } else { q.fill };
+        out.push(Draw { outer: b, ..solid(color, 0.5) });
     } else if kind == KIND_IMAGE {
         let a = q.fill[3];
         out.push(solid([0.5 * a, 0.5 * a, 0.5 * a, a], 1.0));

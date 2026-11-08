@@ -32,12 +32,24 @@ pub(super) fn push_shape(out: &mut Vec<Instance>, shape: &Shape, origin: [f32; 2
                     });
                 }
             }
-            Op::Fill { points, color } => {
+            Op::Fill { points, color, gradient, mesh } => {
                 let fill = premul(*color, opacity, srgb);
-                if fill[3] <= 0.0005 {
+                // A gradient runs from `fill` to `border` along `params.z` (1 down, 2 across),
+                // between the device-pixel coordinates `uv.z` and `uv.w`.
+                let (end, axis, span) = match gradient {
+                    Some(g) => {
+                        let (axis, span) = match g.axis {
+                            GradientAxis::Vertical => (1.0, [at([0.0, g.from])[1], at([0.0, g.to])[1]]),
+                            GradientAxis::Horizontal => (2.0, [at([g.from, 0.0])[0], at([g.to, 0.0])[0]]),
+                        };
+                        (premul(g.end, opacity, srgb), axis, span)
+                    }
+                    None => ([0.0; 4], 0.0, [0.0; 2]),
+                };
+                if fill[3] <= 0.0005 && end[3] <= 0.0005 {
                     continue;
                 }
-                for ([ia, ib, ic], aa) in crate::shape::triangulate(points) {
+                for &([ia, ib, ic], aa) in mesh.0.iter() {
                     let (a, b, c) = (at(points[ia]), at(points[ib]), at(points[ic]));
                     let (x0, y0) = (a[0].min(b[0]).min(c[0]), a[1].min(b[1]).min(c[1]));
                     let (x1, y1) = (a[0].max(b[0]).max(c[0]), a[1].max(b[1]).max(c[1]));
@@ -45,9 +57,9 @@ pub(super) fn push_shape(out: &mut Vec<Instance>, shape: &Shape, origin: [f32; 2
                         rect: [x0, y0, x1 - x0, y1 - y0],
                         radii: [a[0], a[1], b[0], b[1]],
                         fill,
-                        border: [0.0; 4],
-                        params: [aa as f32, KIND_TRIANGLE, 0.0, 1.0],
-                        uv: [c[0], c[1], 0.0, 0.0],
+                        border: end,
+                        params: [aa as f32, KIND_TRIANGLE, axis, 1.0],
+                        uv: [c[0], c[1], span[0], span[1]],
                         clip,
                         fade: crate::render::pack_fade(fade, clip, clip),
                     });

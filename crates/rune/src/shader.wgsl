@@ -1,8 +1,9 @@
 // One instanced "uber-quad": rounded rects with per-corner radius and border (kind 0), analytic
 // Gaussian rounded-rect shadows (kind 1), glyph-atlas text (kind 2), inset shadows (kind 3),
 // vertical-gradient rounded rects or borders (kind 4), stroke segments (kind 5) and filled
-// triangles (kind 6) for vector shapes, RGBA images (kind 7), and premultiplied layer composites
-// (kind 8), dashed borders (kind 10), and radial or angled linear gradients (kind 11).
+// triangles, solid or with a linear gradient (kind 6), for vector shapes, RGBA images (kind 7),
+// premultiplied layer composites (kind 8), dashed borders (kind 10), and radial or angled
+// linear gradients (kind 11).
 // Scope-end records (kind 9) never reach this shader. Every ordinary instance carries a
 // soft-edge clip. Output is premultiplied linear colour into an sRGB target (or sRGB into a
 // non-sRGB target when `srgb_blend` is enabled).
@@ -442,7 +443,17 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
     } else if (kind > 5.5 && kind < 6.5) {
         // The pixel centre itself, not `p`: `p` is interpolated over each triangle's own quad, so
         // neighbours would disagree in the last bits about who owns a pixel on a shared edge.
-        col = i.fill * triangle(i.pos.xy + projection.xy, i.radii.xy, i.radii.zw, i.uv.xy, u32(i.params.x + 0.5));
+        let px = i.pos.xy + projection.xy;
+        var paint = i.fill;
+        // A gradient fill: `fill` to `border` between `uv.z` and `uv.w`, down (`params.z` 1) or
+        // across (2), each colour held beyond its end.
+        if (i.params.z > 0.5) {
+            let at = select(px.y, px.x, i.params.z > 1.5);
+            let span = i.uv.w - i.uv.z;
+            let t = select(0.0, clamp((at - i.uv.z) / span, 0.0, 1.0), abs(span) > 1e-4);
+            paint = mix(i.fill, i.border, t);
+        }
+        col = paint * triangle(px, i.radii.xy, i.radii.zw, i.uv.xy, u32(i.params.x + 0.5));
     } else if (kind > 2.5) {
         let d = sd_rounded(i.p - center, half, i.radii);
         let cov = clamp(0.5 - d, 0.0, 1.0);

@@ -1,0 +1,1 @@
+- **`Shape::stroke_dashed` and `Shape::dot`.** A dashed polyline (dash and gap lengths along it) and a round marker of a radius in points, round however the shape is stretched.
