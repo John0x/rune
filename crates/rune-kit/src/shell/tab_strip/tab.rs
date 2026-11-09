@@ -314,7 +314,8 @@ fn status_slot<S: 'static>(look: SlotLook, st: &Strip<S>, id: &str, k: &Kit) -> 
         };
         let glyph = st.close_icon.unwrap_or(k.glyph.close);
         let button = match st.quiet_close {
-            // A round mark: muted, its wash and full ink only while the pointer is on it.
+            // A round mark in the muted icon ink: the pressed wash and full ink only while the
+            // pointer is on it.
             true => row()
                 .key("quiet-close")
                 .role("button")
@@ -322,10 +323,10 @@ fn status_slot<S: 'static>(look: SlotLook, st: &Strip<S>, id: &str, k: &Kit) -> 
                 .size(18.0, 18.0)
                 .center()
                 .radius(9.0)
-                .hover(k.c.hover)
+                .hover(k.c.pressed)
                 .hover_group()
                 .cursor(rune::Cursor::Pointer)
-                .child(icon(glyph, 10.0).color(k.c.icon_faint).group_color(k.c.icon_base))
+                .child(icon(glyph, 10.0).color(k.c.icon_muted).group_color(k.c.icon_base))
                 .on_press_tx(press),
             false => IconButton::new(glyph)
                 .control_size(ControlSize::Small)
