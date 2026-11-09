@@ -14,15 +14,30 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 mod cloak;
+pub(crate) mod dark_mode;
 mod dpi_drag;
+mod frame;
 mod pointer;
 
 pub(crate) use cloak::Cloak;
 pub(crate) use dpi_drag::follow_suggested_rect;
+pub(crate) use dpi_drag::in_size_move;
+pub(crate) use frame::CustomFrame;
+pub(crate) use frame::has_window_menu;
+pub(crate) use frame::request_inner_size;
+pub(crate) use frame::window_menu;
 
-fn hwnd(window: &winit::window::Window) -> Option<HWND> {
+pub(crate) fn hwnd(window: &winit::window::Window) -> Option<HWND> {
     let RawWindowHandle::Win32(h) = window.window_handle().ok()?.as_raw() else { return None };
     Some(h.hwnd.get() as HWND)
+}
+
+/// Drops the paint the system still owes `window`, which the loop just painted itself.
+pub(crate) fn drop_paint(window: &winit::window::Window) {
+    use windows_sys::Win32::Graphics::Gdi::{RDW_NOINTERNALPAINT, RedrawWindow};
+    let Some(hwnd) = hwnd(window) else { return };
+    // SAFETY: a live window this thread owns; no region or rectangle.
+    unsafe { RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_NOINTERNALPAINT) };
 }
 
 pub(crate) fn pointer_position() -> Option<(i32, i32)> {

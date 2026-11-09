@@ -1,5 +1,10 @@
 //! Menu, context menu and their items (`@opencode/ui` navigation/menu, components/context-menu).
 //! Compact (default) and standard appearances.
+//!
+//! Whether a menu is open is the app's (`open`, `on_close`); how it opens and closes is Rune's
+//! modal stack (`runtime/input/modal_focus.rs`), which follows Desktop's menu machine
+//! (`ui/src/navigation/menu/machine.ts`): focus returns to the trigger as the menu closes,
+//! without a ring when the pointer opened it.
 
 use std::rc::Rc;
 
@@ -37,6 +42,8 @@ pub struct MenuItem {
     lead: Option<El>,
     shortcut: Option<String>,
     badge: Option<String>,
+    description: Option<String>,
+    danger: bool,
     /// Checkbox and radio items: whether the indicator shows.
     checked: Option<bool>,
     sub: Option<(Vec<MenuEntry>, bool)>,
@@ -52,6 +59,8 @@ impl MenuItem {
             lead: None,
             shortcut: None,
             badge: None,
+            description: None,
+            danger: false,
             checked: None,
             sub: None,
             state: State::Rest,
@@ -74,6 +83,16 @@ impl MenuItem {
     }
     pub fn badge(mut self, b: impl Into<String>) -> Self {
         self.badge = Some(b.into());
+        self
+    }
+    /// A faint second line under the label, such as what a choice does. The item grows to fit it.
+    pub fn description(mut self, d: impl Into<String>) -> Self {
+        self.description = Some(d.into());
+        self
+    }
+    /// A destructive choice: the label and icon take the danger ink.
+    pub fn danger(mut self, on: bool) -> Self {
+        self.danger = on;
         self
     }
     /// A checkbox or radio item, showing the check when `on`.
@@ -116,15 +135,34 @@ impl MenuItem {
         } else {
             (k.ty.ui_compact, c.text_base)
         };
+        let danger = self.danger && !disabled;
+        let ink = if danger { c.danger.fg } else { ink };
         // The item's label, shortcut, badge and check say what this row shows.
         let mut content = row().key("content").grow(1.0).shrink().gap(8.0).center_y().a11y_hidden();
         if let Some(l) = self.lead {
             content = content.child(l);
         }
         if let Some(i) = self.icon {
-            content = content.child(icon(i, 14.0).key("icon").color(if standard { c.std_icon } else { c.icon_base }));
+            content = content.child(icon(i, 14.0).key("icon").color(if danger {
+                c.danger.fg
+            } else if standard {
+                c.std_icon
+            } else {
+                c.icon_base
+            }));
         }
-        content = content.child(text(self.label.clone()).key("label").font(font).color(ink).truncate());
+        let label = text(self.label.clone()).key("label").font(font).color(ink).truncate();
+        content = match &self.description {
+            Some(d) => {
+                let (font, ink) = if standard { (k.ty.text_xsmall, c.text_weak) } else { (k.ty.small, c.text_faint) };
+                content.child(
+                    col().key("text").grow(1.0).shrink().gap(2.0).child(label).child(
+                        text(d.clone()).key("description").font(font).color(ink).truncate(),
+                    ),
+                )
+            }
+            None => content.child(label),
+        };
         let mut e = row()
             .key(key.clone())
             .role(if self.checked.is_some() { "menuitemcheckbox" } else { "menuitem" })
@@ -138,13 +176,19 @@ impl MenuItem {
         if let Some(s) = &self.shortcut {
             e = e.shortcut_hint(s.clone());
         }
-        if let Some(b) = &self.badge {
-            e = e.description(b.clone());
+        match (&self.description, &self.badge) {
+            (Some(d), Some(b)) => e = e.description(format!("{d}, {b}")),
+            (Some(d), None) | (None, Some(d)) => e = e.description(d.clone()),
+            (None, None) => {}
         }
         if let Some((_, open)) = &self.sub {
             e = e.expanded(*open);
         }
-        e = if standard { e.px(8.0).py(4.0) } else { e.h(28.0).pl(12.0).pr(6.0) };
+        e = match (standard, self.description.is_some()) {
+            (true, _) => e.px(8.0).py(4.0),
+            (false, false) => e.h(28.0).pl(12.0).pr(6.0),
+            (false, true) => e.min_h(28.0).py(6.0).pl(12.0).pr(6.0),
+        };
         if highlighted {
             e = e.fill(hover);
         } else if !disabled {
@@ -177,7 +221,8 @@ impl MenuItem {
             e = e.child(el().key("indicator").size(16.0, 16.0).center().child(mark).a11y_hidden());
         }
         if let Some((entries, open)) = self.sub {
-            e = e.child(icon(k.glyph.caret_right, 16.0).key("chevron").a11y_hidden().color(if standard {
+            // It points where the submenu opens: left, right to left (`menu.css`).
+            e = e.child(icon(k.glyph.caret_right, 16.0).key("chevron").a11y_hidden().mirror_in_rtl().color(if standard {
                 c.std_icon
             } else {
                 c.text_faint
@@ -191,7 +236,7 @@ impl MenuItem {
             }
         }
         if disabled && !standard {
-            e = e.dim(0.5);
+            e = e.layer_opacity(0.5);
         }
         // A popup opens on its checked item (NSPopUpButton).
         self.acts.apply(e.focusable(!disabled).focus_selected(self.checked == Some(true)).disabled(disabled), !disabled)

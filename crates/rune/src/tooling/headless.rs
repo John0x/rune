@@ -30,6 +30,7 @@ pub fn headless<S: 'static>(app: crate::app::App<S>, args: Args) {
 /// `headless`, returning the error when a window whose own arguments aren't headless can't open.
 pub(crate) fn try_headless<S: 'static>(mut app: crate::app::App<S>, args: Args) -> Result<(), String> {
     crate::render::discard_prewarm();
+    if args.html.is_some() { return crate::tooling::html::export(app, &args); }
     if app.windows.is_empty() && args.desktop.is_none() {
         if args.list_windows { println!("main"); return Ok(()); }
         if args.window.as_deref().is_some_and(|key| key != "main") {
@@ -55,7 +56,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
     if let Some(secs) = std::env::var("RUNE_HEADLESS_WAIT").ok().and_then(|s| s.parse::<f64>().ok()) {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs));
     }
-    let chrome = app.chrome;
+    let (chrome, titlebar) = (app.chrome, app.titlebar);
     let launched = Instant::now();
     if args.list_scenes {
         for (n, _) in app.spec.scenes {
@@ -70,8 +71,9 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
     crate::tooling::interaction::gate::headless();
     let mut comp = app.compositor.take();
     let (srgb_blend, font_smoothing) = (app.srgb_blend, app.font_smoothing);
-    let (on_focus, on_ime) = (app.on_focus, app.on_ime);
+    let (on_focus, on_ime, on_mods) = (app.on_focus, app.on_ime, app.on_mods);
     let on_reopen = app.on_reopen;
+    let mut reports = crate::frame::encoded::FrameReports::<S>::new(app.on_frame_encoded.take(), Some("main"));
     let source = read_script(&args);
     let script = source.as_ref().map(load_script).unwrap_or_default();
     let timeline = Timeline::of(&args, &script).unwrap_or_else(|e| die(&e));
@@ -104,8 +106,9 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
     let state_ms = launched.elapsed().as_secs_f64() * 1000.0;
     let mut rt = runtime_for(&spec, state, size, Env::new(dark, scale), std::sync::Arc::new(|| {}));
     crate::playground::attach(&mut rt, playground, &spec, args.playground.clone(), args.variant.clone(), false);
-    rt.set_titlebar_inset(if app_options.borderless { 0.0 } else { chrome.titlebar_inset() });
+    let chrome = rt.headless_chrome(chrome, titlebar, app_options.borderless);
     rt.on_focus = on_focus;
+    rt.on_mods = on_mods;
     rt.app_ime.hook = on_ime;
     rt.transparent = transparent;
     rt.fit_height = fit_height;
@@ -129,6 +132,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
     rt.set_window_origin((opened[0], opened[1]));
     let mut placed = None;
     let Timeline { fps, dt, start_frame, frames, snap_frame, last_frame } = timeline;
+    reports.set_refresh(Some(fps));
 
     let t0 = Instant::now();
     let features = comp.as_ref().map_or(wgpu::Features::empty(), |c| c.features());
@@ -136,6 +140,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
     let mut target_format = if srgb_blend { OFFSCREEN_FORMAT.remove_srgb_suffix() } else { OFFSCREEN_FORMAT };
     let mut renderer = Renderer::new(&gpu.device, target_format);
     renderer.set_srgb_blend(srgb_blend);
+    renderer.attach_text(&mut rt.text.atlas);
     let (wp, hp) = ((size.0 * scale).round() as u32, (size.1 * scale).round() as u32);
     let mut target = Offscreen::with_format(&gpu.device, wp, hp, target_format);
     let mut readback = crate::tooling::record::Readback::new(&gpu.device, &target, crate::tooling::record::DEPTH);
@@ -230,6 +235,10 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
             (procwatch::alloc::thread_allocations(), rt.stats.commits, crate::frame::profile::cpu_ms())
         };
         let real_t = k as f64 * dt;
+        if args.realtime {
+            let ahead = real_t - wall.elapsed().as_secs_f64();
+            if ahead > 0.0 { std::thread::sleep(std::time::Duration::from_secs_f64(ahead)); }
+        }
         let frame_start = Instant::now();
         #[cfg(feature = "frame-profile")]
         let events0 = next_ev;
@@ -244,6 +253,11 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
                 Pos::Rel(dx, dy) => (last_down.0 + dx, last_down.1 + dy),
             };
             match &e.kind {
+                Kind::Mark(name) if args.realtime => {
+                    use std::io::Write as _;
+                    println!("rune-mark {name} {}", e.t);
+                    let _ = std::io::stdout().flush();
+                }
                 Kind::Mark(_) => {}
                 Kind::Focus(focused) => rt.window_focus(*focused),
                 // The one window always shows here.
@@ -366,6 +380,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
             readback.copy(&mut enc, &target, shot);
         }
         renderer.submit(&gpu.queue, enc);
+        reports.drawn(reports.stamp(), None, frame_start, update_ms);
         rt.interaction_presented(Instant::now(), None);
         if want_pixels { readback.submitted(); }
         let ms = frame_start.elapsed().as_secs_f64() * 1000.0;

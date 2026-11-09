@@ -92,6 +92,9 @@ struct Layer {
     free: bool,
     /// For a free layer, the edges of its contents that can reach the window.
     frame: [f32; 4],
+    /// The round hole its composite cuts (`El::cutout_circle`): centre, then the radii it's clear
+    /// within and whole from, in window device pixels; zeros for none.
+    hole: [f32; 4],
 }
 
 /// The upright bounds of edges `r` turned `angle` radians clockwise about `p`.
@@ -263,6 +266,8 @@ impl Renderer {
                     turn,
                     free,
                     frame,
+                    // A cached scope's `radii` name its node instead.
+                    hole: if cache.is_some() { [0.0; 4] } else { i.radii },
                 });
             } else if i.params[1] == KIND_LAYER_END {
                 let at = self.layers.stack.pop().expect("unbalanced layer end");
@@ -401,7 +406,7 @@ impl Renderer {
             }
             let l = &self.layers.plan[index];
             if cache_target.is_none() && l.opacity == 1.0 && l.blend == Blend::SourceOver && !additive_parent
-                && l.blur == 0.0 && l.fade[3] == 0 && l.clip == NO_CLIP && l.turn.is_none() {
+                && l.blur == 0.0 && l.fade[3] == 0 && l.clip == NO_CLIP && l.turn.is_none() && l.hole[3] == 0.0 {
                 self.layers.targets[index] = None;
                 continue;
             }
@@ -424,8 +429,8 @@ impl Renderer {
                     label: Some("layer projection"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                let base = Self::bind_group(device, &self.bind_layout, &self.globals, &self.atlas, &self.atlas, Some(&projection));
-                let composite = Self::bind_group(device, &self.bind_layout, &self.globals, &self.atlas, &texture, None);
+                let base = Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, &self.atlas, Some(&projection));
+                let composite = Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, &texture, None);
                 self.layers.targets[index] = Some(Target { texture, view, projection,
                     identity: self.layers.allocations + 1, composite_parent: None,
                     quad: Self::instance_buffer(device, 1), base, composite, images: Vec::new(), glyphs: Vec::new(), image_generation: u64::MAX, blur: None,
@@ -455,6 +460,7 @@ impl Renderer {
                 opacity: l.opacity, blend: l.blend, ..Default::default() });
             if let Some((angle, pivot)) = l.turn { quad = quad.turned(angle, pivot); }
             quad.fade = l.fade;
+            quad.radii = l.hole;
             staging.write_buffer(&t.quad, 0, bytemuck::bytes_of(&quad));
         }
         if !self.layers.retained.is_empty() {
@@ -472,7 +478,7 @@ impl Renderer {
             let t = self.layers.targets[index].as_ref().unwrap();
             let parent_identity = parent.map(|p| self.layers.targets[p].as_ref().unwrap().identity);
             if t.composite_parent == parent_identity { continue; }
-            let composite = Self::bind_group(device, &self.bind_layout, &self.globals, &self.atlas, &t.texture,
+            let composite = Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, &t.texture,
                 parent.map(|p| &self.layers.targets[p].as_ref().unwrap().projection));
             let t = self.layers.targets[index].as_mut().unwrap();
             t.composite = composite;
@@ -495,6 +501,19 @@ impl Renderer {
         if had_layers || !self.layers.plan.is_empty() { self.position_layer_surfaces(queue); }
     }
 
+    /// The layer pipelines again from the renderer's shader (a new uber variant).
+    pub(super) fn rebuild_layer_pipelines(&mut self, device: &wgpu::Device) {
+        for index in 0..self.layers.pipelines.len() {
+            let format = self.layers.pipelines[index].0;
+            self.layers.pipelines[index].1 = Self::pipeline(device, &self.layout, &self.shader, format, "vs", Blend::SourceOver);
+        }
+        if self.layers.additive.is_some() {
+            self.layers.additive = Some((
+                Self::pipeline(device, &self.layout, &self.shader, FORMAT, self.vertex_entry, Blend::PlusLighter),
+                Self::pipeline(device, &self.layout, &self.shader, FORMAT, "vs", Blend::PlusLighter)));
+        }
+    }
+
     pub(super) fn add_layer_format(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
         if !self.layers.pipelines.iter().any(|(f, _)| *f == format) {
             self.layers.pipelines.push((format, Self::pipeline(device, &self.layout, &self.shader, format, "vs", Blend::SourceOver)));
@@ -515,15 +534,27 @@ impl Renderer {
 
     pub(super) fn images_changed(&mut self) { self.layers.image_generation += 1; }
 
+    /// Makes every target's bind groups again (a new outline texture): the base one here, its
+    /// composite and image and glyph pages at the next `prepare_layers`.
+    pub(super) fn rebind_layers(&mut self, device: &wgpu::Device) {
+        let (layout, globals, outlines, atlas) = (&self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas);
+        for t in self.layers.targets.iter_mut().flatten().chain(&mut self.layers.retained) {
+            t.base = Self::bind_group(device, layout, globals, outlines, atlas, atlas, Some(&t.projection));
+            // No target's identity is 0, so the composite is made again.
+            t.composite_parent = Some(0);
+            t.image_generation = u64::MAX;
+        }
+    }
+
     pub(super) fn refresh_layer_bindings(&mut self, device: &wgpu::Device) {
         for t in self.layers.targets.iter_mut().flatten() {
             if t.image_generation == self.layers.image_generation { continue; }
             t.images.clear();
             t.images.extend(self.images.iter().map(|page| page.as_ref().map(|(texture, _)|
-                Self::bind_group(device, &self.bind_layout, &self.globals, &self.atlas, texture, Some(&t.projection)))));
+                Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), &self.atlas, texture, Some(&t.projection)))));
             t.glyphs.clear();
             t.glyphs.extend(self.atlas_pages.iter().map(|(texture, _)|
-                Self::bind_group(device, &self.bind_layout, &self.globals, texture, texture, Some(&t.projection))));
+                Self::bind_group(device, &self.bind_layout, &self.globals, self.uber.outlines(), texture, texture, Some(&t.projection))));
             t.image_generation = self.layers.image_generation;
         }
     }

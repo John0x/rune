@@ -28,17 +28,22 @@ pub(super) fn single_line_offset(prev: f32, inp: &crate::el::InputSpec, content:
     let caret_w = (1.5 * s).round();
     let caret = Cursor::from_byte_index(layout, caret_index(&inp.edit, content), Affinity::Downstream);
     let cx = crate::text::cursor_geometry(&caret, layout, 1.5 * s).x0 as f32;
-    let mut scroll = prev * s;
+    // A right-to-left field runs from its right edge: measure from there and shift rightward.
+    let (cx, sign) = match crate::el::Flow::of_layout(layout) {
+        crate::el::Flow::Ltr => (cx, 1.0),
+        crate::el::Flow::Rtl => (layout.full_width() - cx, -1.0),
+    };
+    let mut scroll = prev * s * sign;
     if cx - scroll > visible - caret_w {
         scroll = cx - visible + caret_w;
     }
-    scroll.min(cx).clamp(0.0, (layout.full_width() + caret_w - visible).max(0.0))
+    sign * scroll.min(cx).clamp(0.0, (layout.full_width() + caret_w - visible).max(0.0))
 }
 
 /// The display byte index the caret sits at, inside any IME preedit.
 pub(super) fn caret_index(e: &crate::edit::TextEdit, content: &str) -> usize {
-    match &e.preedit {
-        Some((p, Some((_, c)))) => (e.range().0 + (*c).min(p.len())).min(content.len()),
+    match e.preedit() {
+        Some((p, Some((_, c)))) => (e.range().0 + c.min(p.len())).min(content.len()),
         Some((p, None)) => (e.range().0 + p.len()).min(content.len()),
         None => e.display_index(e.focus).min(content.len()),
     }
@@ -62,20 +67,24 @@ pub(super) fn text_extent(n: &Node, spec: &TextSpec, layout: &Layout<Ink>, r: [f
     let (lo, hi) = layout.lines().map(|l| (l.metrics().offset, l.metrics().advance))
         .fold((f32::MAX, 0.0f32), |(lo, hi), (offset, advance)| (lo.min(offset), hi.max(offset + advance)));
     let (lo, hi) = if lo > hi { (0.0, layout.full_width()) } else { (lo, hi) };
-    let origin = [text_x(spec, x0, x1, layout.full_width() / scale), r[1] + n.inset[1]];
+    let origin = [text_x(spec, x0, x1, layout.full_width() / scale, crate::el::Flow::of_layout(layout)), r[1] + n.inset[1]];
     let x = origin[0] + lo / scale;
     (MRect::new(x, origin[1], ((hi - lo) / scale).min(x1 - x).max(0.0),
-        (layout_height(layout, spec.style, scale) / scale).min(r[3] - n.inset[1] - n.inset[3])), origin)
+        (crate::text::spec_height(layout, spec.style, scale, spec.exact_lines) / scale).min(r[3] - n.inset[1] - n.inset[3])), origin)
 }
 
 /// Where a `width`-wide text line starts between `x0` and `x1`. Wrapped text aligns each line
-/// inside the wrap width itself, so it starts at `x0`.
-pub(super) fn text_x(spec: &TextSpec, x0: f32, x1: f32, width: f32) -> f32 {
-    match spec.align {
-        _ if line_alignment(spec) != parley::Alignment::Start => x0,
-        Align::Start => x0,
-        Align::Center => x0 + (x1 - x0 - width) * 0.5,
-        Align::End => x1 - width,
+/// inside the wrap width itself, so it starts at `x0`. A right-to-left paragraph (`flow`, its
+/// layout's base level) starts at its right edge; wrapped, its lines already end there.
+pub(super) fn text_x(spec: &TextSpec, x0: f32, x1: f32, width: f32, flow: crate::el::Flow) -> f32 {
+    use crate::el::Flow;
+    if line_alignment(spec) != parley::Alignment::Start || (flow == Flow::Rtl && spec.wrap) {
+        return x0;
+    }
+    match (spec.align, flow) {
+        (Align::Start, Flow::Ltr) | (Align::End, Flow::Rtl) => x0,
+        (Align::Center, _) => x0 + (x1 - x0 - width) * 0.5,
+        (Align::End, Flow::Ltr) | (Align::Start, Flow::Rtl) => x1 - width,
     }
 }
 
@@ -185,9 +194,7 @@ fn spec_elide_keys(spec: &TextSpec, scale: f32, mode: u8, param: usize, max_w: f
     if spec.redacted {
         return None;
     }
-    let shape = spec.shape_key(scale).unwrap_or_else(|| {
-        crate::text::shape_key(&spec.content, &spec.spans, spec.style, scale, spec.wrap_anywhere, &spec.pills)
-    });
+    let shape = spec.shape_key(scale).unwrap_or_else(|| spec.fresh_shape_key(scale));
     let blocks = spec.blocks.iter().any(|&b| b != crate::edit::Block::Paragraph).then_some(spec.blocks.as_slice());
     Some((shape, crate::text::elide_key(shape, mode, param, max_w, align, blocks)))
 }
@@ -224,13 +231,13 @@ pub(super) fn truncated(text: &mut TextSystem, spec: &TextSpec, scale: f32, max_
         e.spans_into(&spec.spans, &mut span_buf);
         if spec.redacted {
             let s = zeroize::Zeroizing::new([&content[..e.head], Elision::ELLIPSIS, &content[e.tail..]].concat());
-            text.layout_blocks_inner(&s, &span_buf, &spec.blocks, &[], spec.style, scale, None, parley::Alignment::Start, spec.wrap_anywhere, false)
+            text.layout_cut(spec, &s, &span_buf, scale, None, parley::Alignment::Start, false)
         } else {
             str_buf.clear();
             str_buf.push_str(&content[..e.head]);
             str_buf.push_str(Elision::ELLIPSIS);
             str_buf.push_str(&content[e.tail..]);
-            text.layout_blocks_inner(&str_buf, &span_buf, &spec.blocks, &[], spec.style, scale, None, parley::Alignment::Start, spec.wrap_anywhere, true)
+            text.layout_cut(spec, &str_buf, &span_buf, scale, None, parley::Alignment::Start, true)
         }
     };
     let (mut lo, mut hi) = (0usize, n);
@@ -326,12 +333,14 @@ pub(super) fn compute_layout(taffy: &mut LayoutEngine, root: SlotId, room: Size<
         taffy::compute_leaf_layout(inputs, style, |_, _| 0.0, |known, avail| {
             let Some(i) = ctx else { return Size::ZERO };
             let spec = nodes[i].text.as_ref().unwrap();
+            // `known` is the border box; `avail` is already the content box (known or styled
+            // size, clamped, less padding and border), which is what `lay_out_text` wraps at.
             let w = if spec.wrap {
-                known.width.or(match avail.width {
-                    AvailableSpace::Definite(w) => Some(w),
+                match avail.width {
+                    AvailableSpace::Definite(w) => Some(w.max(0.0)),
                     AvailableSpace::MinContent => Some(0.0),
                     AvailableSpace::MaxContent => None,
-                })
+                }
             } else {
                 None
             };
@@ -340,12 +349,13 @@ pub(super) fn compute_layout(taffy: &mut LayoutEngine, root: SlotId, room: Size<
                 if let Some(w) = r.advance(*at, scale) {
                     return Size {
                         width: known.width.unwrap_or(w),
-                        height: known.height.unwrap_or(layout_height(&r.layout, spec.style, scale) / scale),
+                        height: known.height.unwrap_or(crate::text::spec_height(&r.layout, spec.style, scale, spec.exact_lines) / scale),
                     };
                 }
             }
             let l = text.layout_for_spec(spec, scale, w.map(|w| w * scale), parley::Alignment::Start);
-            let mut lw = (l.full_width() / scale).ceil_to(scale);
+            // Spaces hanging past a wrapped line's end take no room, as in CSS.
+            let mut lw = ((if w.is_some() { l.width() } else { l.full_width() }) / scale).ceil_to(scale);
             if (spec.truncate || spec.truncate_fade || spec.max_lines > 0)
                 && let AvailableSpace::Definite(a) = avail.width
             {
@@ -361,7 +371,7 @@ pub(super) fn compute_layout(taffy: &mut LayoutEngine, root: SlotId, room: Size<
 
 /// The height (device px) of `l` as `spec` shows it: its first `max_lines` lines when set.
 pub(super) fn clamped_height(l: &Layout<Ink>, spec: &TextSpec, scale: f32) -> f32 {
-    let full = layout_height(l, spec.style, scale);
+    let full = crate::text::spec_height(l, spec.style, scale, spec.exact_lines);
     match spec.max_lines.checked_sub(1).and_then(|last| l.lines().nth(last)).filter(|_| l.len() > spec.max_lines) {
         Some(line) => line.metrics().block_max_coord.ceil().min(full),
         None => full,
@@ -407,12 +417,12 @@ pub(super) fn clamped(text: &mut TextSystem, spec: &TextSpec, scale: f32, max_w:
         e.spans_into(&spec.spans, &mut span_buf);
         if spec.redacted {
             let s = zeroize::Zeroizing::new([&content[..e.head], Elision::ELLIPSIS].concat());
-            text.layout_blocks_inner(&s, &span_buf, &spec.blocks, &[], spec.style, scale, Some(max_w), align, spec.wrap_anywhere, false)
+            text.layout_cut(spec, &s, &span_buf, scale, Some(max_w), align, false)
         } else {
             str_buf.clear();
             str_buf.push_str(&content[..e.head]);
             str_buf.push_str(Elision::ELLIPSIS);
-            text.layout_blocks_inner(&str_buf, &span_buf, &spec.blocks, &[], spec.style, scale, Some(max_w), align, spec.wrap_anywhere, true)
+            text.layout_cut(spec, &str_buf, &span_buf, scale, Some(max_w), align, true)
         }
     };
     let fits = |l: &Layout<Ink>| l.len() <= lines && last_line_width(l, lines) <= max_w + 0.5;

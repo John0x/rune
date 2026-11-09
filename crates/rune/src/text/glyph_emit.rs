@@ -1,5 +1,6 @@
 //! Glyph emission: walking a laid-out paragraph's glyphs into atlas quads.
 use super::*;
+use super::atlas_fill::Residency;
 
 /// Positions a device pixel that the glyphs of a gliding box draw at down the screen
 /// ([`TextSystem::set_glide`]): a glyph has at most this many masks for each x phase.
@@ -113,11 +114,17 @@ impl TextSystem {
     /// Rasterizes (once) and appends one glyph at device position `at`, `k` times its size.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn push_glyph(&mut self, face: &Face, coords: &[i16], glyph: u32, at: [f32; 2], k: f32, byte: u32, out: &mut Vec<GlyphQuad>) -> Placed {
+        if self.emit == outline::Emit::Outline && let Some(placed) = self.push_outline(face, coords, glyph, at, k, byte, out) {
+            return placed;
+        }
         let [gx, gy] = at;
         let glide = self.glide;
         let (font, font_size, ink, skew) = (&face.font, face.size * k, face.ink, face.skew);
-        let radius = self.apple.radius(ink, font_size);
-        let ([fx, fy], [subpx, subpy]) = place(at, font_size, self.glide);
+        let direct_write = self.direct_write();
+        let windfoil = self.smoothing == FontSmoothing::Windfoil;
+        let radius = if direct_write { 0.0 } else { self.apple.radius(ink, font_size) * if windfoil { outline::TEXT_WEIGHT } else { 1.0 } };
+        let gamma = self.windows.bucket(ink);
+        let ([fx, fy], [subpx, subpy]) = place(at, font_size, self.glide, direct_write || windfoil);
         let key = GlyphKey {
             font: font.data.id(),
             index: font.index,
@@ -126,16 +133,17 @@ impl TextSystem {
             coords: face.coords_key,
             subpx,
             subpy,
-            dilation: (radius as f32).to_bits(),
-            apple: self.apple.key(),
+            dilation: if direct_write { gamma as u32 } else { (radius as f32).to_bits() },
+            apple: if direct_write { DIRECT_WRITE_KEY } else if windfoil { WINDFOIL_KEY } else { self.apple.key() },
             skew,
         };
         let entry = match self.atlas.map.get(&key) {
-            Some(&e) => {
-                if let Some(a) = e {
+            Some(e) => {
+                let mask = e.mask();
+                if let Some(a) = mask {
                     self.atlas.touch(a.page, a.w * a.h);
                 }
-                e
+                mask
             }
             None => {
                 // Colour glyphs sit on whole pixels and ignore emboldening and obliques.
@@ -164,17 +172,36 @@ impl TextSystem {
                     out.push(c.quad(gx, gy, glide, ink, byte));
                     return Placed::Other;
                 }
-                let placed = self.apple.rasterize(&mut self.scale_cx, &mut self.atlas, macos::smoothing::Job {
+                // Windfoil masks place their own entries (GPU-filled ones are queued, not uploaded).
+                if windfoil && let Some(placed) = self.windfoil_mask(key, face, coords, font_size, [subpx, subpy]) {
+                    return match placed {
+                        Rasterized::Placed(a) => {
+                            out.push(atlas_quad(a, fx, fy, ink, byte));
+                            Placed::Atlas(a, [subpx, subpy])
+                        }
+                        Rasterized::Empty => Placed::Empty([subpx, subpy]),
+                        Rasterized::Unplaced => Placed::Other,
+                    };
+                }
+                let (phase_x, shift_y) = (subpx as f32 / coretext_match::PHASES, subpy as f32 / GLIDE_PHASES as f32);
+                #[cfg(target_os = "windows")]
+                let placed = direct_write.then(|| self.windows.rasterize(&mut self.atlas, &windows::Job {
+                    font: font_ref, blob: &font.data, key: (key.font, key.index, key.coords), coords, glyph: glyph as u16, ppem: font_size,
+                    phase_x, shift_y, skew, lum: gamma,
+                })).flatten();
+                #[cfg(not(target_os = "windows"))]
+                let placed = None;
+                let placed = placed.unwrap_or_else(|| self.apple.rasterize(&mut self.scale_cx, &mut self.atlas, macos::smoothing::Job {
                     font: font_ref, key: (key.font, key.index, key.coords), coords, glyph: glyph as u16, ppem: font_size,
-                    phase_x: subpx as f32 / coretext_match::PHASES, shift_y: subpy as f32 / GLIDE_PHASES as f32, radius, skew,
-                });
+                    phase_x, shift_y, radius, skew,
+                }));
                 match placed {
                     Rasterized::Placed(g) => {
-                        self.atlas.map.insert(key, Some(g));
+                        self.atlas.map.insert(key, Residency::Uploaded(g));
                         Some(g)
                     }
                     Rasterized::Empty => {
-                        self.atlas.map.insert(key, None);
+                        self.atlas.map.insert(key, Residency::Blank);
                         None
                     }
                     Rasterized::Unplaced => return Placed::Other,
@@ -200,12 +227,18 @@ impl TextSystem {
     }
 }
 
+/// The glyph key tag of a DirectWrite mask (CoreGraphics' pipelines use the low bits).
+pub(super) const DIRECT_WRITE_KEY: u8 = 0x80;
+/// The glyph key tag of a Windfoil mask (`windfoil.rs`).
+pub(super) const WINDFOIL_KEY: u8 = 0x40;
+
 /// Where a glyph with its resting pen at `at` draws at `ppem` device px, gliding by `glide`: its
 /// quad's whole-pixel pen and its x phase (sixtieths, [`coretext_match::PHASES`]) and y phase
-/// ([`GLIDE_PHASES`] a pixel). Adding the quantised glide on top of the resting pen keeps each
+/// ([`GLIDE_PHASES`] a pixel). Pens sit on CoreGraphics' subpixel steps, or on Skia's quarters
+/// when `skia` (DirectWrite). Adding the quantised glide on top of the resting pen keeps each
 /// glyph continuous at glide start/end and visits at most [`GLIDE_PHASES`] phases per axis.
-pub(super) fn place(at: [f32; 2], ppem: f32, glide: [f32; 2]) -> ([f32; 2], [u8; 2]) {
-    let (rx, r_subpx) = coretext_match::glyph_x(at[0], ppem);
+pub(super) fn place(at: [f32; 2], ppem: f32, glide: [f32; 2], skia: bool) -> ([f32; 2], [u8; 2]) {
+    let (rx, r_subpx) = if skia { windows::glyph_x(at[0]) } else { coretext_match::glyph_x(at[0], ppem) };
     let n = GLIDE_PHASES as f32;
     let gx = rx * coretext_match::PHASES + r_subpx as f32 + (glide[0] * n).round() * (coretext_match::PHASES / n);
     let fx = (gx / coretext_match::PHASES).floor();
@@ -231,6 +264,7 @@ pub(super) fn atlas_quad(a: AtlasGlyph, fx: f32, gy: f32, ink: u16, byte: u32) -
         ink,
         byte,
         color: 0,
+        outline: None,
     }
 }
 

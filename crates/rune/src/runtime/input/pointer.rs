@@ -11,9 +11,10 @@ impl<S: 'static> Runtime<S> {
     /// point the drag last saw has nothing new to report, and its instant transaction would
     /// cut short whatever the press started (a tapped slider's knob mid-spring).
     pub(super) fn move_pointer(&mut self, x: f32, y: f32, drag_move: bool) {
-        if self.pointer != Some((x, y)) { self.hover_paused = false; self.release_hover_hold(); }
+        let moved = self.pointer != Some((x, y));
+        if moved { self.hover_paused = false; self.release_hover_hold(); }
         self.pointer = Some((x, y));
-        if self.in_viewport(x, y) { self.left_in_capture = false; }
+        if self.in_viewport(x, y) { self.set_left(false); }
         for &(id, rect) in &self.hits {
             if self.hit_contains(id, rect, x, y)
                 && let Some(&i) = self.node_index.get(&id)
@@ -24,11 +25,14 @@ impl<S: 'static> Runtime<S> {
             }
         }
         self.refresh_hover(x, y);
-        let Some((path, d)) = self.capture.clone() else { return };
-        if self.drag_out_armed && crate::drag_out::past_threshold(self.press_at, (x, y), self.drag_out_threshold) && self.start_drag_out(path.clone()) {
+        let Some(held) = self.press.held() else { return };
+        let (path, d, at, button) = (held.path.clone(), held.drag, held.at, held.button);
+        if held.drag_out.is_some_and(|threshold| crate::drag_out::past_threshold(at, (x, y), threshold)) && self.start_drag_out(path.clone()) {
             return;
         }
-        self.press_moved |= (x - self.press_at.0).abs() > CLICK_SLOP || (y - self.press_at.1).abs() > CLICK_SLOP;
+        if let Some(held) = self.press.held_mut() {
+            held.moved |= (x - at.0).abs() > CLICK_SLOP || (y - at.1).abs() > CLICK_SLOP;
+        }
         self.selection_drag(x, y);
         if self.input_click.captured {
             self.input_drag(x, y, drag_move);
@@ -37,53 +41,75 @@ impl<S: 'static> Runtime<S> {
         let Some(i) = self.live_index(&path) else { return };
         let (id, r, has_drag) = (self.nodes[i].id, self.nodes[i].target, self.nodes[i].handlers.on_drag.is_some() && !self.drags_out(&self.nodes[i]));
         // A hit rect is where the element was drawn (after scrolling); `target` is its
-        // unscrolled layout rect, kept only for elements that were never drawn.
-        let mut hits = self.hits.iter().filter(|(hit, _)| *hit == id).peekable();
-        self.capture_inside = !self.press_cancelled && if self.native_overlay || hits.peek().is_some() {
-            hits.any(|&(id, r)| self.hit_contains(id, r, x, y))
-        } else { contains(r, x, y) };
-        if has_drag && drag_move {
-            let (dx, dy) = (x - self.press_at.0, y - self.press_at.1);
-            let [lx, ly] = self.to_local(i, x, y);
-            let d = Drag { phase: Phase::Move, x: lx, y: ly, dx, dy, ..d };
-            self.queue.push(Action::Drag(path, d, self.capture_button));
+        // unscrolled layout rect, kept only for elements that were never drawn. Only the
+        // pointer moving decides whether it's still inside: a button that springs out from
+        // under a still pointer stays pressed, as AppKit only re-tracks on a drag.
+        if moved && self.press.held().is_some_and(|h| h.hit != capture::Hit::Cancelled) {
+            let mut hits = self.hits.iter().filter(|(hit, _)| *hit == id).peekable();
+            let inside = if self.native_overlay || hits.peek().is_some() {
+                hits.any(|&(id, r)| self.hit_contains(id, r, x, y))
+            } else { contains(r, x, y) };
+            if let Some(held) = self.press.held_mut() {
+                held.hit = if inside { capture::Hit::Inside } else { capture::Hit::Outside };
+            }
         }
+        if has_drag && drag_move {
+            let (dx, dy) = (x - at.0, y - at.1);
+            let [lx, ly] = self.to_local(i, x, y);
+            let d = Drag { phase: Phase::Move, x: lx, y: ly, dx, dy, window: [x, y], screen: self.screen_at(x, y), ..d };
+            self.queue.push(Action::Drag(path, d, button));
+        }
+    }
+
+    /// The pointer left the window (`true`) or came back (`false`) while a press holds it.
+    fn set_left(&mut self, out: bool) {
+        if let Some(held) = self.press.held_mut() { held.left = out; }
+        if let capture::Secondary::Held { left, .. } = &mut self.secondary { *left = out; }
     }
 
     /// Overlay observation updates coordinates without presenting unchanged hover pixels.
     pub(crate) fn observe_pointer(&mut self, x: f32, y: f32) -> bool {
         if self.pointer == Some((x, y)) { return false; }
         let visual_changed = self.nodes.iter().enumerate().any(|(i, n)| {
-            if n.vis.hover.a <= 0.0 && n.vis.press.a <= 0.0 && n.handlers.get().is_none_or(|h| h.press_scale.is_none()) { return false; }
+            if n.vis.hover().a <= 0.0 && n.vis.press().a <= 0.0 && n.handlers.get().is_none_or(|h| h.press_scale.is_none()) { return false; }
             let inside = |p: Option<(f32, f32)>| p.is_some_and(|(x, y)| self.node_contains(i, x, y));
             inside(self.pointer) != inside(Some((x, y)))
         });
         // Reaching or leaving a help element starts or ends its tooltip's wait.
         let help_changed = self.help_target_changes(x, y);
-        let (queued, capture_inside) = (self.queue.len(), self.capture_inside);
+        let (queued, capture_inside) = (self.queue.len(), self.press.inside());
         self.pointer_move(x, y);
-        visual_changed || help_changed || self.queue.len() != queued || self.capture_inside != capture_inside
+        visual_changed || help_changed || self.queue.len() != queued || self.press.inside() != capture_inside
     }
 
-    pub(crate) fn pointer_captured(&self) -> bool { self.capture.is_some() || self.secondary_capture.is_some() }
+    pub(crate) fn pointer_captured(&self) -> bool { self.press.is_held() || self.secondary.is_held() }
+
+    /// The host's window content top-left in desktop pixels; `None` where it has none.
+    pub(crate) fn set_window_pixels(&mut self, pixels: Option<(i32, i32)>) {
+        self.window_pixels = pixels;
+    }
+
+    /// (x, y) window points in desktop pixels (`Drag::screen_point`).
+    pub(super) fn screen_at(&self, x: f32, y: f32) -> Option<(i32, i32)> {
+        let s = self.env.scale;
+        self.window_pixels.map(|(px, py)| (px + (x * s).round() as i32, py + (y * s).round() as i32))
+    }
 
     /// The host moved its window by (dx, dy) points under a still pointer. Keep the pointer and
     /// a held press's origin in window points, so a drag that moves its own window still reports
     /// pointer travel in `Drag::dx`/`dy`.
     pub(crate) fn window_moved(&mut self, dx: f32, dy: f32) {
         if let Some((x, y)) = self.pointer { self.pointer = Some((x - dx, y - dy)); }
-        self.press_at = (self.press_at.0 - dx, self.press_at.1 - dy);
+        if let Some(held) = self.press.held_mut() { held.at = (held.at.0 - dx, held.at.1 - dy); }
     }
 
     pub(crate) fn cancel_pointer(&mut self) {
         self.cancel_drag();
         self.drop_drag_out_request();
-        self.drag_out_armed = false;
         self.text_sel.dragging = false;
         self.input_click.clear();
-        self.capture = None;
-        self.secondary_capture = None;
-        self.capture_inside = false;
+        self.press.drop_held();
+        self.secondary = capture::Secondary::Up;
         self.pointer_leave();
         self.drag_files_leave();
     }
@@ -92,20 +118,18 @@ impl<S: 'static> Runtime<S> {
     /// and the release that follows does nothing. False when no drag is held.
     pub(super) fn cancel_drag(&mut self) -> bool {
         if self.input_click.captured { return false; }
-        let Some((path, d)) = &self.capture else { return false };
-        let Some(i) = self.live_index(&path) else { return false };
+        let Some(held) = self.press.held() else { return false };
+        let Some(i) = self.live_index(&held.path) else { return false };
         if self.nodes[i].handlers.on_drag.is_none() || self.drags_out(&self.nodes[i]) { return false; }
-        let (x, y) = self.pointer.unwrap_or(self.press_at);
+        let at = held.at;
+        let (x, y) = self.pointer.unwrap_or(at);
         let [lx, ly] = self.to_local(i, x, y);
-        let (dx, dy) = (x - self.press_at.0, y - self.press_at.1);
-        let (path, d) = (path.clone(), Drag { phase: Phase::Up, x: lx, y: ly, dx, dy, cancelled: true, ..*d });
-        let button = std::mem::take(&mut self.capture_button);
-        self.queue.push(Action::Drag(path, d, button));
-        self.capture = None;
+        let (dx, dy) = (x - at.0, y - at.1);
+        let screen = self.screen_at(x, y);
+        let Some(held) = self.press.drop_held() else { return false };
+        let d = Drag { phase: Phase::Up, x: lx, y: ly, dx, dy, cancelled: true, window: [x, y], screen, ..held.drag };
+        self.queue.push(Action::Drag(held.path, d, held.button));
         self.end_press_repeat();
-        self.capture_inside = false;
-        self.double_armed = false;
-        self.drag_out_armed = false;
         self.text_sel.dragging = false;
         true
     }
@@ -114,7 +138,9 @@ impl<S: 'static> Runtime<S> {
     /// OS drag and hand it the pointer, so nothing stays pressed or hovered after the drop.
     /// False when the element offers nothing this time and the press stays a press.
     pub(super) fn start_drag_out(&mut self, path: String) -> bool {
-        self.drag_out_armed = false;
+        let Some(held) = self.press.held_mut() else { return false };
+        held.drag_out = None;
+        let press = held.at;
         let Some(i) = self.live_index(&path) else { return false };
         let Some(f) = self.nodes[i].handlers.drag_out.clone() else { return false };
         let Some(item) = f(playground_host::handler_states_ref(&self.state, self.playground.as_deref())).filter(|item| !item.is_empty()) else { return false };
@@ -126,9 +152,8 @@ impl<S: 'static> Runtime<S> {
         log_event!(self, "drag-out {path}");
         self.drop_drag_out_request();
         self.queue.push(Action::DragStart(path.clone()));
-        self.drag_out_request = Some(crate::drag_out::DragOutStart { path, item, rect, bounds: r, press: self.press_at });
-        self.capture = None;
-        self.capture_inside = false;
+        self.drag_out_request = Some(crate::drag_out::DragOutStart { path, item, rect, bounds: r, press });
+        self.press.drop_held();
         self.pointer_leave();
         true
     }
@@ -142,24 +167,26 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// A release outside the window, or after the pointer left during the press, ends the hover.
-    pub(super) fn leave_after_release(&mut self) {
+    pub(super) fn leave_after_release(&mut self, left: bool) {
         if self.pointer_captured() { return; }
-        if std::mem::take(&mut self.left_in_capture) || self.pointer.is_some_and(|(x, y)| !self.in_viewport(x, y)) {
+        if left || self.pointer.is_some_and(|(x, y)| !self.in_viewport(x, y)) {
             self.pointer_leave();
         }
     }
 
     pub fn pointer_down(&mut self, x: f32, y: f32) {
-        if self.capture.is_some() && self.capture_button != crate::PointerButton::Primary {
+        if self.press.held().is_some_and(|h| h.button != crate::PointerButton::Primary) {
             self.pointer = Some((x, y));
             return;
         }
         self.drop_drag_out_request();
+        // A host that didn't act on the last press's request mustn't get it with this one.
+        self.titlebar.action = None;
         self.pointer = Some((x, y));
         // A press is the hand's: hover follows the pointer through moving layout.
         self.release_hover_hold();
-        self.keyboard_focus = false;
-        self.dismiss_help();
+        self.focus.step(focus_machine::FocusEvent::Pointed);
+        self.press_help(x, y);
         // A press cancels the waits to report an enter; the next move after it starts them again.
         self.hover_pending.retain(|p| !p.1);
         self.hover_paused = true;
@@ -184,50 +211,52 @@ impl<S: 'static> Runtime<S> {
         let Some(ti) = target else {
             let now = self.now_clock();
             self.titlebar.press_empty(now, x, y, self.double_click_interval);
-            if self.focused.is_some() {
+            if self.focus.path().is_some() {
                 self.queue.push(Action::Blur);
             }
             return;
         };
         let on_link = self.link_down(ti, x, y);
         // Any press breaks a pending pair unless it's the second press of it.
-        let pending = self.last_press.take();
+        let pending = self.press.take_first();
         let now = self.now_clock();
-        let n = &self.nodes[ti];
-        if n.window_drag && n.handlers.on_press.is_none() && n.handlers.on_double_press.is_none() && n.handlers.on_drag.is_none() && n.handlers.drag_out.is_none() && self.textbox_input(ti).is_none() {
+        if self.bare_drag_region(ti) {
             self.titlebar.press_region(now, x, y, self.double_click_interval);
-            if self.focused.is_some() {
+            if self.focus.path().is_some() {
                 self.queue.push(Action::Blur);
             }
             return;
         }
-        self.press_at = (x, y);
+        let n = &self.nodes[ti];
         let clicks = self.press_clicks.press(&n.path, now, (x, y), self.double_click_interval);
-        self.double_armed = n.handlers.on_double_press.is_some() && pending.is_some_and(|(p, t, px, py)| {
-            p == n.path && now - t <= self.double_click_interval && (x - px).abs() <= CLICK_SLOP && (y - py).abs() <= CLICK_SLOP
+        let second = n.handlers.on_double_press.is_some() && pending.is_some_and(|first| {
+            first.path == n.path && now - first.at <= self.double_click_interval
+                && (x - first.point.0).abs() <= CLICK_SLOP && (y - first.point.1).abs() <= CLICK_SLOP
         });
-        self.press_down_t = now;
-        self.press_moved = false;
-        self.press_cancelled = false;
         if let Some(ji) = self.textbox_input(ti) {
-            self.input_down(ji, x, y);
+            self.input_down(ji, x, y, now, second);
             return;
         }
         // Clicking a link leaves focus where it is (a composer keeps typing). Selectable text
         // off its links isn't a control: the press blurs, as a click on plain content does.
         // Inside a control that owns its keyboard (`El::on_key`), a click on any part of it
         // focuses it, as a click on a table view's row focuses the table.
-        let keyed = (!n.focus.enabled && !self.is_selectable(ti)).then(|| std::iter::successors(n.parent, |&p| self.nodes[p].parent)
+        // A `Cx::web_focus` control that keeps the field's focus on a press (`preserve_focus_on_press`)
+        // doesn't take it, as a button whose mousedown is prevented.
+        let takes_focus = n.focus.enabled || (self.takes_focus(n) && !self.press_keeps_focus(ti));
+        let keyed = (!takes_focus && !self.is_selectable(ti)).then(|| std::iter::successors(n.parent, |&p| self.nodes[p].parent)
             .take_while(|&p| self.allowed(p))
             .find(|&p| self.nodes[p].focus.key.is_some() && self.can_focus(p))).flatten();
         let in_textbox = std::iter::successors(n.parent, |&p| self.nodes[p].parent).any(|p| self.textbox_input(p).is_some());
         let (preserve_focus, keeps) = (self.press_keeps_focus(ti), self.press_keeps_selection(ti));
-        if !on_link && !keeps && n.focus.enabled && !self.is_selectable(ti) {
+        if !on_link && !keeps && takes_focus && !self.is_selectable(ti) {
             self.queue.push(Action::FocusControl(n.path.clone()));
         } else if !on_link && !keeps && let Some(p) = keyed {
             self.queue.push(Action::FocusControl(self.nodes[p].path.clone()));
-        } else if !on_link && !in_textbox && !preserve_focus && self.focused.is_some() {
-            self.queue.push(Action::Blur);
+        } else if !on_link && !in_textbox && !preserve_focus {
+            // Tab goes on from here, as from a browser's click on plain content.
+            self.focus.step(focus_machine::FocusEvent::StartAt(n.path.clone()));
+            if self.focus.path().is_some() { self.queue.push(Action::Blur); }
         }
         let r = n.target;
         let [lx, ly] = self.to_local(ti, x, y);
@@ -244,20 +273,19 @@ impl<S: 'static> Runtime<S> {
             data: 0.0,
             clicks,
             cancelled: false,
+            window: [x, y],
+            screen: self.screen_at(x, y),
         };
         let path = n.path.clone();
-        self.drag_out_armed = self.drags_out(n);
-        self.drag_out_threshold = n.handlers.drag_threshold.unwrap_or(crate::drag_out::DRAG_THRESHOLD);
-        if n.handlers.on_drag.is_some() && !self.drag_out_armed {
+        let drag_out = self.drags_out(n).then(|| n.handlers.drag_threshold.unwrap_or(crate::drag_out::DRAG_THRESHOLD));
+        if n.handlers.on_drag.is_some() && drag_out.is_none() {
             self.queue.push(Action::Drag(path.clone(), d, crate::PointerButton::Primary));
         }
-        self.capture = Some((path, d));
-        self.capture_button = crate::PointerButton::Primary;
-        self.capture_inside = true;
+        self.press.hold(capture::Held::new(path, d, crate::PointerButton::Primary, (x, y), now, second, drag_out));
     }
 
     pub fn pointer_up(&mut self, x: f32, y: f32) {
-        if self.capture.is_some() && self.capture_button != crate::PointerButton::Primary {
+        if self.press.held().is_some_and(|h| h.button != crate::PointerButton::Primary) {
             self.pointer = Some((x, y));
             return;
         }
@@ -266,15 +294,14 @@ impl<S: 'static> Runtime<S> {
 
     pub(super) fn release_capture(&mut self, x: f32, y: f32) {
         // Hosts release at the last position they saw, which a leave doesn't move.
-        let left = self.left_in_capture;
+        let left = self.press.held().is_some_and(|h| h.left);
         self.release(x, y);
-        self.left_in_capture = left;
-        self.leave_after_release();
+        self.leave_after_release(left);
     }
 
     pub(super) fn release(&mut self, x: f32, y: f32) {
         // A release never starts a drag-out: the system session needs the button held.
-        self.drag_out_armed = false;
+        if let Some(held) = self.press.held_mut() { held.drag_out = None; }
         let moved = self.pointer != Some((x, y));
         self.move_pointer(x, y, moved);
         // A drag that selected text is a selection, not a press.
@@ -282,54 +309,52 @@ impl<S: 'static> Runtime<S> {
         self.text_sel.dragging = false;
         let input_capture = self.input_click.end_press();
         self.end_press_repeat();
-        let Some((path, d)) = self.capture.take() else { return };
-        let button = std::mem::take(&mut self.capture_button);
+        let now = self.now_clock();
+        let interval = self.double_click_interval;
+        let Some(h) = self.press.held() else { return };
+        // Only clicks pair: a press that dragged or was held past the interval is neither half.
+        let first = (!input_capture && !h.second && h.inside() && !h.moved && now - h.down_at <= interval
+            && h.button == crate::PointerButton::Primary
+            && self.live_index(&h.path).is_some_and(|i| self.nodes[i].handlers.on_double_press.is_some()))
+            .then(|| capture::FirstClick { path: h.path.clone(), at: h.down_at, point: h.at });
+        let Some(held) = self.press.release(first) else { return };
+        let inside = held.inside();
+        let capture::Held { path, drag: d, button, at, down_at, moved, second: double, .. } = *held;
         self.refresh_hover_within();
-        let double = std::mem::take(&mut self.double_armed);
-        if self.press_moved { self.press_clicks.clear(); }
-        if input_capture {
-            self.capture_inside = false;
-            return;
-        }
+        if moved { self.press_clicks.clear(); }
+        if input_capture { return; }
         let Some(i) = self.live_index(&path) else { return };
         let n = &self.nodes[i];
         let (has_drag, has_press, has_double) = (n.handlers.on_drag.is_some() && !self.drags_out(n), n.handlers.on_press.is_some(), n.handlers.on_double_press.is_some());
         if has_drag {
-            let (dx, dy) = (x - self.press_at.0, y - self.press_at.1);
+            let (dx, dy) = (x - at.0, y - at.1);
             let [lx, ly] = self.to_local(i, x, y);
-            self.queue.push(Action::Drag(path.clone(), Drag { phase: Phase::Up, x: lx, y: ly, dx, dy, ..d }, button));
+            self.queue.push(Action::Drag(path.clone(), Drag { phase: Phase::Up, x: lx, y: ly, dx, dy, window: [x, y], screen: self.screen_at(x, y), ..d }, button));
         }
-        self.link_up(&path, x, y);
-        if has_press && self.capture_inside && !selected {
+        self.link_up(&path, x, y, inside);
+        if has_press && inside && !selected {
             self.queue.push(Action::Press(path.clone(), button));
         }
-        // Only clicks pair: a press that dragged or was held past the interval is neither half.
-        let click = !self.press_moved && self.now_clock() - self.press_down_t <= self.double_click_interval;
-        if has_double && self.capture_inside && click && button == crate::PointerButton::Primary {
-            if double {
-                self.queue.push(Action::DoublePress(path));
-            } else {
-                self.last_press = Some((path, self.press_down_t, self.press_at.0, self.press_at.1));
-            }
+        let click = !moved && now - down_at <= interval;
+        if has_double && inside && click && button == crate::PointerButton::Primary && double {
+            self.queue.push(Action::DoublePress(path));
         }
-        self.capture_inside = false;
     }
 
     pub fn pointer_leave(&mut self) {
         self.wheel_lost();
-        if self.capture.is_none() && self.secondary_capture.is_none() {
+        if !self.pointer_captured() {
             self.pointer = None;
             self.hovered = None;
-            self.left_in_capture = false;
             self.refresh_hover_within();
         } else {
-            self.left_in_capture = true;
+            self.set_left(true);
         }
     }
 
     /// A press on an element is held (the hand drives whatever follows it).
     pub fn pressing(&self) -> bool {
-        self.capture.is_some()
+        self.press.is_held()
     }
     pub fn pointer(&self) -> Option<(f32, f32)> {
         self.pointer
@@ -345,9 +370,9 @@ impl<S: 'static> Runtime<S> {
         let Some((x, y)) = self.pointer.filter(|&(x, y)| self.in_viewport(x, y)) else { return crate::el::Cursor::Default };
         // An element on its way out has no cursor: `Cursor::Hidden` ends when it's removed.
         // Selectable text shows its I-beam even where its presses go to a row around it.
-        let target = match &self.capture {
+        let target = match self.press.path() {
             Some(_) if self.text_sel.dragging => self.selection_holder(),
-            Some((p, _)) => self.live_index(p).filter(|&i| self.allowed(i)),
+            Some(p) => self.live_index(p).filter(|&i| self.allowed(i)),
             // Moving layout holds hover: the cursor stays with what the pointer was over.
             None => self.held_hover().flatten().or_else(|| self.selectable_at(x, y).or_else(|| self.primary_target(x, y))),
         };
@@ -396,10 +421,8 @@ impl<S: 'static> Runtime<S> {
         if let Some(st) = self.scrolls.get_mut(&id) {
             let before = st.offset;
             st.offset = (st.offset - f64::from(dy)).clamp(0.0, st.max);
-            st.v = 0.0;
-            st.glide = None;
             st.direct = true;
-            st.pinned = stick && st.offset >= st.max - 0.5;
+            st.land(stick);
             log_event!(self, "wheel {dy:.1}");
             if st.offset != before { self.scroll_cancels_press(id); }
         }
@@ -413,9 +436,7 @@ impl<S: 'static> Runtime<S> {
         self.dismiss_help();
         let Some(id) = self.scroll_at(x, y) else { return };
         if let Some(st) = self.scrolls.get_mut(&id) {
-            st.v = -velocity;
-            st.pinned = false;
-            st.glide = None;
+            st.mode = ScrollMode::Momentum { v: -velocity };
             log_event!(self, "fling {velocity:.0}");
             if velocity != 0.0 { self.scroll_cancels_press(id); }
         }
@@ -429,13 +450,14 @@ impl<S: 'static> Runtime<S> {
     /// cancels its content's touches: the row lets go and the release doesn't press. A drag
     /// keeps its capture.
     pub(super) fn scroll_cancels_press(&mut self, id: NodeId) {
-        let Some((path, _)) = &self.capture else { return };
-        let Some(i) = self.nodes.iter().position(|n| &n.path == path) else { return };
+        let Some(path) = self.press.path() else { return };
+        let Some(i) = self.nodes.iter().position(|n| n.path == path) else { return };
         let inside = std::iter::successors(self.nodes[i].parent, |&p| self.nodes[p].parent).any(|p| self.nodes[p].id == id);
         if inside && self.nodes[i].handlers.on_drag.is_none() {
-            self.press_cancelled = true;
-            self.capture_inside = false;
-            self.double_armed = false;
+            if let Some(held) = self.press.held_mut() {
+                held.hit = capture::Hit::Cancelled;
+                held.second = false;
+            }
         }
     }
 }

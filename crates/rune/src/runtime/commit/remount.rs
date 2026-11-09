@@ -193,7 +193,7 @@ impl<S: 'static> Measurement<'_, S> {
 
             let sticky = self.nodes[scroll_idx].scroll.unwrap().stick_bottom;
             let old_scroll = self.scrolls.get(&scroll_id);
-            let pinned = old_scroll.map_or(sticky, |s| s.pinned);
+            let pinned = old_scroll.map_or(sticky, |s| s.pinned());
             let mut offset = old_scroll.map_or(0.0, |s| s.offset as f32);
             v.viewport = self.nodes[scroll_idx].local.h;
             offset = (offset - v.top).max(0.0);
@@ -268,6 +268,7 @@ impl<S: 'static> Measurement<'_, S> {
             self.system_accent,
             self.system_reduced_motion,
             crate::theme::blends_srgb(),
+            self.chrome_bits(),
             self.caret.clone(),
             self.layout_seen.clone(),
         );
@@ -312,7 +313,7 @@ impl<S: 'static> Measurement<'_, S> {
                 let key = &v.keys[row_i];
                 if !plan.mounted_rows.contains_key(key) {
                     let row = build_indexed_row(&plan.rows, state, &plan.path, key, row_i, self.key_warnings);
-                    if row.has_virtual {
+                    if row.flags.has(crate::el::ElFlags::HAS_VIRTUAL) {
                         nested_virtual = true;
                         break;
                     }
@@ -338,7 +339,7 @@ impl<S: 'static> Measurement<'_, S> {
             let v = self.virtuals.get_mut(&plan.path).unwrap();
             plan.quiet = plan.range.clone().map(|i| v.mounts_quietly(i, self.commits)).collect();
             for (pos, row) in &mut plan.built_rows {
-                row.virtual_mount = plan.quiet[*pos];
+                row.flags.set(crate::el::ElFlags::VIRTUAL_MOUNT, plan.quiet[*pos]);
             }
         }
 
@@ -433,6 +434,7 @@ impl<S: 'static> Measurement<'_, S> {
                             taken_paths: Vec::new(),
                             path_ids: &mut *self.path_ids,
                             next_id: &mut *self.next_id,
+                            foreground: self.defaults.foreground,
                         };
                         let (kid_slot, kid_dirty) = flatten_with_buf(
                             row_el,
@@ -541,6 +543,8 @@ impl<S: 'static> Measurement<'_, S> {
             nodes,
             reduced_motion: self.reduced_motion,
             time_scale: self.time_scale,
+            defaults: self.defaults,
+            titlebar: self.titlebar,
             caret_read: self.caret_read,
             layout_reads: self.layout_reads,
             memo_flattened: Some(pending),

@@ -35,25 +35,25 @@ pub(crate) fn mark_colors(k: &Kit) -> ([Color; 9], [Color; 9]) {
     }
 }
 
-/// Shared shell painting: sheen over the base, button elevation, hover overlay, focus/invalid
-/// outline, disabled dimming.
-fn shell(k: &Kit, e: El, sheen: [f32; 2], state: State, invalid: bool, focused: bool) -> El {
+/// Shared shell painting (text-input.css:5-75, textarea.css): the base fill, input elevation,
+/// hover overlay, a 1 point focus or invalid ring just inside the box in place of the shadow,
+/// disabled dimming.
+fn shell(k: &Kit, e: El, state: State, invalid: bool, focused: bool) -> El {
     let c = &k.c;
     let hover = state == State::Hover && !invalid && !focused;
     let mut e = e
         .radius(k.radius.md)
         .fill(if hover { over(c.hover, c.bg_base) } else { c.bg_base })
-        .gradient(k.light(sheen[0]), k.light(sheen[1]))
         .token_motion(k.motion.control);
     if state == State::Disabled {
-        return shadows(k, e, &k.elevation.button_neutral).dim(0.5);
+        return shadows(k, e, k.elevation.input()).layer_opacity(0.5);
     }
     if invalid {
-        e = e.outline(1.0, 0.0, c.danger.fg);
+        e = e.outline(1.0, -1.0, c.danger.fg);
     } else if focused || state == State::Focus {
-        e = e.outline(1.0, 0.0, c.border_focus);
+        e = e.outline(1.0, -1.0, c.border_focus);
     } else {
-        e = shadows(k, e, &k.elevation.button_neutral);
+        e = shadows(k, e, k.elevation.input());
         if state == State::Rest {
             e = e.hover(c.hover);
         }
@@ -171,6 +171,11 @@ impl TextInput {
     pub fn revealed(mut self, revealed: bool) -> Self {
         self.edit.set_revealed(revealed);
         self.edits.visual(move |e| e.revealed(revealed));
+        self
+    }
+    /// Mark misspelled words and offer their suggestions in the field's menu (`El::spellcheck`).
+    pub fn spellcheck(mut self, on: bool) -> Self {
+        self.edits.visual(move |e| e.spellcheck(on));
         self
     }
     pub fn animate_edit_layout(mut self) -> Self {
@@ -325,6 +330,7 @@ impl TextInput {
             .key("input")
             .grow(1.0)
             .shrink()
+            .min_w(0.0)
             .color(ink)
             .rich_style(kit_rich_style(k))
             .placeholder(self.placeholder.clone(), hint)
@@ -334,7 +340,9 @@ impl TextInput {
             field = field.active_descendant(key);
         }
         let field = self.edits.apply(field, disabled);
-        let mut value = row().key("value").grow(1.0).shrink().gap(6.0).center_y();
+        // The value stops at the box's padding: a placeholder or value longer than the box is cut
+        // there, as an `input` cuts its own text, rather than running on to the border.
+        let mut value = row().key("value").grow(1.0).shrink().min_w(0.0).gap(6.0).center_y().clip_rounded(0.0);
         if let Some(i) = self.leading {
             value = value.child(el().key("leading").pl(8.0).center().child(icon(i, self.leading_size).color(c.icon_muted)).a11y_hidden());
         } else {
@@ -377,9 +385,9 @@ impl TextInput {
             e = e.child(b);
         }
         if self.plain {
-            return if disabled { e.dim(0.5) } else { e };
+            return if disabled { e.layer_opacity(0.5) } else { e };
         }
-        shell(k, e, [0.06, 0.02], self.state, self.invalid && !disabled, self.edit.focused && !disabled)
+        shell(k, e, self.state, self.invalid && !disabled, self.edit.focused && !disabled)
     }
 }
 
@@ -411,6 +419,11 @@ impl TextArea {
     pub fn revealed(mut self, revealed: bool) -> Self {
         self.edit.set_revealed(revealed);
         self.edits.visual(move |e| e.revealed(revealed));
+        self
+    }
+    /// Mark misspelled words and offer their suggestions in the field's menu (`El::spellcheck`).
+    pub fn spellcheck(mut self, on: bool) -> Self {
+        self.edits.visual(move |e| e.spellcheck(on));
         self
     }
     pub fn new(edit: &TextEdit) -> TextArea {
@@ -543,7 +556,7 @@ impl TextArea {
             Some(w) => e.w(w),
             None => e.w_full(),
         };
-        shell(k, e, [0.02, 0.0], self.state, self.invalid && !disabled, self.edit.focused && !disabled)
+        shell(k, e, self.state, self.invalid && !disabled, self.edit.focused && !disabled)
     }
 }
 
@@ -683,6 +696,6 @@ impl TextField {
             root = root.child(text(e.clone()).key("error").font(k.ty.text_xsmall_medium).color(c.danger.fg)
                 .live_region(rune::LiveRegion::Assertive));
         }
-        if self.state == State::Disabled { root.dim(0.5) } else { root }
+        if self.state == State::Disabled { root.layer_opacity(0.5) } else { root }
     }
 }

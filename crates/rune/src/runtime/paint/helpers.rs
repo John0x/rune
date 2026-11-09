@@ -202,7 +202,7 @@ pub(super) fn input_caret(n: &Node, r: [f32; 4], scale: f32, s: f32, gliding: bo
     let ins = n.inset.map(|v| v * scale * s);
     let (x0, x1) = (r[0] + ins[0], r[2] - ins[2]);
     // The text scales with its box, so the caret does too.
-    let mut x = text_x(spec, x0, x1, (layout.full_width() * scale).ceil());
+    let mut x = text_x(spec, x0, x1, (layout.full_width() * scale).ceil(), crate::el::Flow::of_layout(layout));
     if input.single_line { x -= single_line_scroll(scrolls, &n.path, input, &spec.content, layout, s, (x1 - x0) / scale.max(1e-4)) * scale; }
     let ci = caret_index(e, &spec.content);
     let cur = Cursor::from_byte_index(layout, ci, Affinity::Downstream);
@@ -223,6 +223,40 @@ pub(super) fn fades(looping: Option<rune_motion::LoopSpec>) -> bool {
     matches!(looping.map(|l| l.kind), Some(rune_motion::LoopKind::Opacity { .. } | rune_motion::LoopKind::OpacityCycle(_) | rune_motion::LoopKind::Sequence(_)))
 }
 
+/// How many separate things node `n` paints itself (fill, border, gradient, shape, image,
+/// shadows, words), which can lie one over another.
+pub(super) fn own_paints(n: &Node) -> usize {
+    let v = &n.vis;
+    [
+        v.fill.a > 0.0,
+        v.border_width() > 0.0 && (v.border().a > 0.0 || v.border_bottom.is_some()),
+        v.gradient.is_some() || v.radial.is_some() || v.surface.is_some(),
+        v.shape.is_some(),
+        v.pixels.is_some(),
+        !v.shadows.is_empty(),
+        n.text.is_some(),
+    ].into_iter().filter(|&b| b).count()
+}
+
+/// Whether `rect` (edges) lies a pixel or more inside the rounded rectangle `mask` (edges) with
+/// corner `radii` `[tl, tr, br, bl]`, so that rounding the mask's corners can't touch it. The
+/// mask is convex, so it's enough that `rect`'s corners are inside; a continuous corner counts
+/// as its whole corner square.
+pub(super) fn inside_rounded(rect: [f32; 4], mask: [f32; 4], radii: [f32; 4]) -> bool {
+    const AA: f32 = 1.0;
+    if rect[2] <= rect[0] || rect[3] <= rect[1] { return true; }
+    if rect[0] < mask[0] || rect[1] < mask[1] || rect[2] > mask[2] || rect[3] > mask[3] { return false; }
+    let corners = [(mask[0], mask[1], 1.0, 1.0), (mask[2], mask[1], -1.0, 1.0), (mask[2], mask[3], -1.0, -1.0), (mask[0], mask[3], 1.0, -1.0)];
+    corners.iter().zip(radii).all(|(&(cx, cy, sx, sy), radius)| {
+        let e = crate::render::corner_extent(radius);
+        [(rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])].iter().all(|&(x, y)| {
+            let (dx, dy) = ((x - cx) * sx, (y - cy) * sy);
+            if dx >= e || dy >= e { return true; }
+            radius > 0.0 && (radius - dx).hypot(radius - dy) <= radius - AA
+        })
+    })
+}
+
 /// `rect` (x, y, w, h) magnified `k` times from `r_origin` to `origin`.
 pub(super) fn scale_about(rect: [f32; 4], origin: [f32; 2], r_origin: [f32; 2], k: f32) -> [f32; 4] {
     [origin[0] + (rect[0] - r_origin[0]) * k, origin[1] + (rect[1] - r_origin[1]) * k, rect[2] * k, rect[3] * k]
@@ -232,7 +266,10 @@ pub(super) fn scale_about(rect: [f32; 4], origin: [f32; 2], r_origin: [f32; 2], 
 /// its atlas footprint in `uv.zw`, so the shader samples it filtered.
 pub(super) fn zoom_glyph(mut g: Instance, origin: [f32; 2], r_origin: [f32; 2], k: f32) -> Instance {
     if k == 1.0 && origin == r_origin { return g; }
-    if g.params[1] == KIND_GLYPH && g.uv[2] == 0.0 { (g.uv[2], g.uv[3]) = (g.rect[2], g.rect[3]); }
+    if g.params[1] == KIND_GLYPH && g.radii[3] > 0.0 {
+        // An outline glyph (`text::Outline`) magnifies its pen and pixel instead of its mask.
+        g.radii = [origin[0] + (g.radii[0] - r_origin[0]) * k, origin[1] + (g.radii[1] - r_origin[1]) * k, g.radii[2], g.radii[3] * k];
+    } else if g.params[1] == KIND_GLYPH && g.uv[2] == 0.0 { (g.uv[2], g.uv[3]) = (g.rect[2], g.rect[3]); }
     g.rect = [
         origin[0] + (g.rect[0] - r_origin[0]) * k,
         origin[1] + (g.rect[1] - r_origin[1]) * k,
@@ -246,7 +283,9 @@ pub(super) fn zoom_glyph(mut g: Instance, origin: [f32; 2], r_origin: [f32; 2], 
 /// at `fill`'s alpha. None when the image atlas can't place it.
 pub(super) fn glyph_or_image(q: &GlyphQuad, text: &TextSystem, images: &mut crate::pixels::ImageAtlas, fill: [f32; 4], clip: [f32; 4], fade: [f32; 4]) -> Option<Instance> {
     if q.color == 0 {
-        return Some(glyph(q, fill, clip, fade));
+        let mut g = glyph(q, fill, clip, fade);
+        g.params[3] = text.coverage_exponent(fill);
+        return Some(g);
     }
     let image = images.place(text.color_glyph(q.color), [q.rect[2], q.rect[3]])?;
     Some(Instance {

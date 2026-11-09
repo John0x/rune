@@ -16,7 +16,8 @@ pub enum DiffMode {
     /// One column, removed lines above the added lines that replace them.
     #[default]
     Unified,
-    /// Old on the left, new on the right, changed lines side by side.
+    /// Old on the left, new on the right, changed lines side by side. An added or deleted
+    /// file shows its one side as a single column.
     Split,
 }
 
@@ -284,6 +285,16 @@ impl DiffState {
         }
     }
 
+    /// In split mode, the one side `file` shows across the whole width, as a single column:
+    /// an added file's new side or a deleted file's old side ([`FileDiff::sole_side`]).
+    /// `None` in unified mode and for a file with both sides.
+    pub fn single_column(&self, file: usize) -> Option<Side> {
+        if self.mode != DiffMode::Split {
+            return None;
+        }
+        self.files.get(file)?.sole_side()
+    }
+
     pub fn wrap(&self) -> bool {
         self.wrap
     }
@@ -302,7 +313,7 @@ impl DiffState {
         }
     }
 
-    /// Highlight code with `h` instead of the built-in scanners.
+    /// Highlight code with `h` instead of the built-in highlighter.
     pub fn set_highlighter(&mut self, h: Highlighter) {
         self.highlighter = h;
         self.chunks.borrow_mut().clear();

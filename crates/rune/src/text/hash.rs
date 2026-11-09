@@ -58,9 +58,19 @@ pub(crate) fn shape_key(text: &str, spans: &[Span], style: TextStyle, scale: f32
     let mut h = KeyHasher::default();
     (key, wrap_anywhere).hash(&mut h);
     for p in pills {
-        (p.start, p.end, p.icon.is_some()).hash(&mut h);
+        (p.start, p.end, p.icon.is_some(), p.bare.as_ref().map(|b| (b.size.to_bits(), b.gap.to_bits()))).hash(&mut h);
     }
     h.finish()
+}
+
+/// [`shape_key`] for a paragraph laid out in `base`: left to right keeps the key, the others
+/// salt it, as their bidi levels shape the same text differently.
+pub(crate) fn directed(key: u64, base: parley::BaseDirection) -> u64 {
+    match base {
+        parley::BaseDirection::Ltr => key,
+        parley::BaseDirection::Rtl => key ^ 0x6a09_e667_f3bc_c909,
+        parley::BaseDirection::Auto => key ^ 0xbb67_ae85_84ca_a73b,
+    }
 }
 
 /// A shaping broken at `max_width`, aligned and block-indented: the shape key itself when the

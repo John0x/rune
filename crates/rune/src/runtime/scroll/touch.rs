@@ -39,8 +39,7 @@ impl<S: 'static> Runtime<S> {
         };
         let id = self.scroll_at(x, y)?;
         let st = self.scrolls.get_mut(&id)?;
-        st.v = 0.0;
-        st.glide = None;
+        st.halt();
         if !caught { self.touch.scroll = Some(TouchScroll { id, origin: st.offset, dragging: true, horizontal: false }); }
         Some(id)
     }
@@ -71,12 +70,13 @@ impl<S: 'static> Runtime<S> {
         if touch.id != id { return; }
         let (origin, horizontal) = (touch.origin, touch.horizontal);
         let Some(st) = self.scrolls.get_mut(&id) else { return };
-        let (offset, _, max) = st.axis(horizontal);
-        let to = origin - f64::from(d);
+        let toward = if horizontal { st.x.toward(f64::from(d)) } else { -f64::from(d) };
+        let (offset, max) = st.axis(horizontal);
+        let to = origin + toward;
         let edge = to.clamp(0.0, max);
         let over = to - edge;
         *offset = edge + over * 0.55 / (1.0 + over.abs() * 0.55 / 300.0);
-        if !horizontal { st.pinned = false; }
+        if !horizontal { st.mode = ScrollMode::Rest; }
         st.direct = true;
         self.scroll_cancels_press(id);
     }
@@ -88,7 +88,10 @@ impl<S: 'static> Runtime<S> {
         touch.dragging = false;
         if Some(touch.id) != id { return; }
         let horizontal = touch.horizontal;
-        if let Some(st) = self.scrolls.get_mut(&touch.id) { *st.axis(horizontal).1 = -velocity.clamp(-8000.0, 8000.0); }
+        if let Some(st) = self.scrolls.get_mut(&touch.id) {
+            let v = f64::from(velocity.clamp(-8000.0, 8000.0));
+            if horizontal { st.x.v = st.x.toward(v) as f32 } else { st.mode = ScrollMode::Momentum { v: -v as f32 } }
+        }
     }
 
     /// Own the touched viewport's panned axis through momentum and its edge return. Other
@@ -98,22 +101,23 @@ impl<S: 'static> Runtime<S> {
         let dragging = touch.dragging;
         let st = self.scrolls.get_mut(&id)?;
         if horizontal { st.x.max = overflow.max(0.0); } else { st.max = overflow.max(0.0); }
-        let v = *st.axis(horizontal).1;
+        let mut v = if horizontal { st.x.v } else { st.coast() };
         st.scrolling = dragging || v.abs() > 1.0;
         st.by_hand |= st.scrolling;
         if dragging { return Some(false); }
         st.direct = false;
-        let (offset, v, max) = st.axis(horizontal);
+        let (offset, max) = st.axis(horizontal);
         let edge = offset.clamp(0.0, max);
         if *offset != edge {
-            (*offset, *v) = rebound(*offset, *v, edge, dt);
-            if (*offset - edge).abs() < 0.1 && v.abs() < 1.0 { *offset = edge; *v = 0.0; }
+            (*offset, v) = rebound(*offset, v, edge, dt);
+            if (*offset - edge).abs() < 0.1 && v.abs() < 1.0 { *offset = edge; v = 0.0; }
         } else {
             let decay = (-SCROLL_DECAY * dt).exp();
-            *offset += f64::from(*v * (1.0 - decay) / SCROLL_DECAY);
-            *v *= decay;
+            *offset += f64::from(v * (1.0 - decay) / SCROLL_DECAY);
+            v *= decay;
         }
         let moving = v.abs() > 1.0 || *offset < 0.0 || *offset > max;
+        if horizontal { st.x.v = v; } else if v != 0.0 { st.mode = ScrollMode::Momentum { v }; } else { st.halt(); }
         if !moving { self.touch.scroll = None; }
         Some(moving)
     }

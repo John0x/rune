@@ -43,6 +43,8 @@ pub struct Tx {
     pub(crate) text_flights: Vec<(String, String)>,
     /// `Tx::launch`: (source, destination).
     pub(crate) launches: Vec<(String, String)>,
+    /// `Tx::unclipped_flights`.
+    pub(crate) unclipped_flights: bool,
     /// Rows to reveal or centre (`Tx::scroll_into_view` and `Tx::scroll_center`).
     pub(crate) scroll_to: Vec<crate::runtime::ScrollReveal>,
     /// Scroll viewports to send to their bottom: (key, animated).
@@ -56,6 +58,12 @@ pub struct Tx {
     pub(crate) wakes: Vec<std::time::Duration>,
     pub(crate) shell: Option<Shell>,
     pub(crate) minimize: bool,
+    /// `Tx::toggle_maximized`.
+    pub(crate) toggle_maximized: bool,
+    /// `Tx::toggle_full_screen`.
+    pub(crate) toggle_full_screen: bool,
+    /// `Tx::send_key`, in order.
+    pub(crate) keys: Vec<crate::KeyEvent>,
     /// `Tx::drop_point`.
     pub(crate) drop_point: Option<PointerEvent>,
     pub(crate) title: Option<String>,
@@ -74,6 +82,10 @@ pub struct Tx {
     pub(crate) font_smoothing: Option<crate::text::FontSmoothing>,
     pub(crate) font_families: Option<(String, String)>,
     pub(crate) blur: bool,
+    /// `Tx::focus`: the key and whether its ring shows.
+    pub(crate) focus_to: Option<(String, bool)>,
+    /// `Tx::focus_visible`.
+    pub(crate) focus_visible: bool,
     /// The text selection as the event arrived (`Tx::text_selection`).
     pub(crate) selection: Option<Rc<crate::TextSelection>>,
     /// `Tx::select_text`, `Tx::select_all_text` and `Tx::clear_text_selection`; the last wins.
@@ -87,6 +99,10 @@ pub struct Tx {
     pub(crate) live_only: bool,
     /// `Tx::open_playground` and kin, and the playground's own controls.
     pub(crate) playground: Vec<crate::playground::Request>,
+    /// `Tx::invalidate_memos_by_prefix`.
+    pub(crate) evict_memos: Vec<String>,
+    /// `Tx::clock`.
+    pub(crate) clock: f64,
 }
 
 /// A change to the text selection a handler asked for, carried out after its commit.
@@ -146,6 +162,13 @@ impl Tx {
         self.pick_reads.push(PickRead { within, x, y, pick, f: Rc::new(std::cell::Cell::new(Some(f))) });
     }
 
+    /// [`Runtime::invalidate_memos_by_prefix`](crate::Runtime::invalidate_memos_by_prefix) on
+    /// this window, from a handler or `poll`: e.g. a plugin host evicting the subtrees an
+    /// unloading library built.
+    pub fn invalidate_memos_by_prefix(&mut self, prefix: impl Into<String>) {
+        self.evict_memos.push(prefix.into());
+    }
+
     /// Whether this runtime has an attached motion or tooling trace.
     pub fn tracing(&self) -> bool { self.trace.is_some() }
 
@@ -184,12 +207,29 @@ impl Tx {
         self.wakes.push(duration);
     }
 
+    /// The window's logical clock in seconds as this handler or poll runs: the `clock` `poll`
+    /// gets, and the frame's for a handler. Headless runs step it virtually, so a state
+    /// machine that stamps its timers with it (`rune::machine`) runs the same in a script.
+    /// 0 for a `Tx` no runtime made.
+    pub fn clock(&self) -> f64 {
+        self.clock
+    }
+
+    /// Wake the app's poll hook once the clock reaches `due` (seconds on [`Tx::clock`]), as
+    /// [`Tx::wake_after`] does for the time left; a deadline already past wakes the next
+    /// frame. A timed state stores its deadline and asks for it here, and its poll checks
+    /// `clock >= due` to fire the timer as an event.
+    pub fn wake_at(&mut self, due: f64) {
+        self.wakes.push(std::time::Duration::from_secs_f64((due - self.clock).max(0.0)));
+    }
+
     /// Close the window after this handler, as the close button would (`App::on_close` runs).
     pub fn close_window(&mut self) {
         self.shell = self.shell.max(Some(Shell::Close));
     }
 
-    /// Quit the app after this handler, whether or not it keeps running without a window.
+    /// Quit the app after this handler, whether or not it keeps running without a window. Every
+    /// open window's `App::on_quit` runs as it ends; no `on_close` does.
     pub fn quit(&mut self) {
         self.shell = Some(Shell::Quit);
     }
@@ -201,6 +241,28 @@ impl Tx {
     /// A close or quit asked in the same change wins.
     pub fn minimize(&mut self) {
         self.minimize = true;
+    }
+
+    /// Maximize this window after this handler, or restore it when it is maximized, as its
+    /// maximize button would (macOS zooms). Does nothing for overlays and headless runs.
+    pub fn toggle_maximized(&mut self) {
+        self.toggle_maximized = true;
+    }
+
+    /// Take this window full screen after this handler, or bring it back, as macOS's green
+    /// button and Electron's `setFullScreen` do: on Windows and Linux a borderless window over
+    /// its display, which hides a custom titlebar's caption buttons (`Cx::chrome_insets`).
+    /// Does nothing for overlays and headless runs.
+    pub fn toggle_full_screen(&mut self) {
+        self.toggle_full_screen = true;
+    }
+
+    /// Deliver `ev` once this handler is done, as if it were typed: to the focused field, then
+    /// the key handlers, as the keyboard routes it. For a menu the app draws itself, whose Edit
+    /// items send Ctrl+C (⌘C) and the rest to the field that has focus, as AppKit's standard
+    /// Edit items do. Keys sent in one handler arrive in order.
+    pub fn send_key(&mut self, ev: crate::KeyEvent) {
+        self.keys.push(ev);
     }
 
     /// Set this window's title after this handler, in its title bar and the Window menu. The
@@ -261,6 +323,22 @@ impl Tx {
     /// model clears it too. Does nothing when nothing has focus.
     pub fn blur(&mut self) {
         self.blur = true;
+    }
+
+    /// Focus the element keyed `key` once this handler's change is on screen, as a web page's
+    /// `element.focus()`: a menu's trigger as the menu closes, say. The first shown, focusable
+    /// element with that key takes it (or its first focusable child), drawing its focus ring when
+    /// `ring` (`:focus-visible`). A text field focused through its model (`TextEdit::focused`)
+    /// in the same change wins over it. Nothing happens when no such element shows.
+    pub fn focus(&mut self, key: impl Into<String>, ring: bool) {
+        self.focus_to = Some((key.into(), ring));
+    }
+
+    /// Whether keyboard focus was showing its ring (`:focus-visible`) as this event arrived:
+    /// the keyboard, not the pointer, has been driving. A menu that opens with it returns focus
+    /// to its trigger with the ring.
+    pub fn focus_visible(&self) -> bool {
+        self.focus_visible
     }
 
     /// The [`El::selectable`] text selection as this event arrived: the texts it covers with

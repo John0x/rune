@@ -10,7 +10,7 @@
 //! moved, or any glyph after the atlas evicts a page, asks the atlas again.
 use std::rc::Weak;
 
-use super::glyph_emit::{Placed, atlas_quad, place};
+use super::glyph_emit::{DIRECT_WRITE_KEY, Placed, WINDFOIL_KEY, atlas_quad, place};
 use super::*;
 
 /// Bytes all entries may hold before the least recently painted go.
@@ -211,11 +211,13 @@ impl TextSystem {
         out: &mut Vec<GlyphQuad>,
     ) {
         let mut cache = std::mem::take(&mut self.glyph_cache);
-        let inks = self.apple.inks();
+        let skia = self.direct_write();
+        let tag = if self.smoothing == FontSmoothing::Windfoil { WINDFOIL_KEY } else { self.apple.key() };
+        let (inks, apple) = if skia { (self.windows.inks(), DIRECT_WRITE_KEY) } else { (self.apple.inks(), tag) };
         let key = Key {
             layout: Rc::as_ptr(layout) as usize,
             inks: inks.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)),
-            apple: self.apple.key(),
+            apple,
         };
         let frame = cache.frame;
         let (entry, before) = match cache.entries.entry(key) {
@@ -273,6 +275,7 @@ impl TextSystem {
     fn replay(&mut self, entry: &mut Entry, i: usize, origin: [f32; 2], k: f32, out: &mut Vec<GlyphQuad>) {
         let (start, end) = entry.lines[i];
         let (mut face, mut baseline, mut size) = (u16::MAX, 0.0, 0.0);
+        let quarters = self.quarter_pens();
         for gi in start as usize..end as usize {
             if entry.clock != self.atlas.clock {
                 // A page went: every mask is looked up again.
@@ -286,7 +289,7 @@ impl TextSystem {
             }
             let at = if k == 1.0 { [origin[0] + g.rel + g.x, baseline + g.y] }
                 else { [origin[0] + (g.rel + g.x) * k, baseline + g.y * k] };
-            let ([fx, fy], sub) = place(at, size, self.glide);
+            let ([fx, fy], sub) = place(at, size, self.glide, quarters);
             if g.sub == sub && g.state == PLACED {
                 self.atlas.touch(g.mask.page, g.mask.w * g.mask.h);
                 out.push(atlas_quad(g.mask, fx, fy, f.0.ink, g.byte));

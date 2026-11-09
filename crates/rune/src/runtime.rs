@@ -32,7 +32,7 @@ use crate::overlay::options::contains;
 use crate::flight::{TextFlight, transformed};
 use crate::render::{Instance, KIND_DASHED, KIND_EFFECT, KIND_GLYPH, KIND_GRADIENT, KIND_IMAGE, KIND_INSET, KIND_RADIAL, KIND_RECT, KIND_SEGMENT, KIND_SHADOW, KIND_TRIANGLE, NO_CLIP};
 use crate::shape::{GradientAxis, LineCap, Op, Shape};
-use crate::text::{Deco, PaintedDeco, GlyphQuad, Ink, TextSystem, layout_height};
+use crate::text::{Deco, PaintedDeco, GlyphQuad, Ink, TextSystem};
 use crate::tok::motion;
 use event_log::log_event;
 
@@ -102,9 +102,15 @@ pub(crate) use blend::{apron_key, glyph, icon_inst, premul};
 
 #[path = "runtime/input/focus.rs"]
 mod focus;
+#[path = "runtime/input/capture.rs"]
+mod capture;
+#[path = "runtime/input/focus_machine.rs"]
+mod focus_machine;
+#[path = "runtime/input/modal_focus.rs"]
+mod modal_focus;
 #[path = "runtime/input/physical.rs"]
 mod physical_dispatch;
-#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(unused_imports))]
 pub(crate) use physical_dispatch::Unhandled;
 #[path = "runtime/input/modifier_keys.rs"]
 mod modifier_keys;
@@ -126,6 +132,8 @@ mod caret;
 pub(crate) mod event_log;
 #[path = "runtime/layout_read.rs"]
 pub(crate) mod layout_read;
+#[path = "runtime/visible.rs"]
+mod visible;
 #[path = "runtime/selection/links.rs"]
 mod links;
 #[path = "runtime/selection/selectable.rs"]
@@ -134,6 +142,9 @@ pub(crate) mod selectable;
 mod input_click;
 #[path = "runtime/input/help.rs"]
 mod help;
+#[path = "runtime/input/help_look.rs"]
+mod help_look;
+pub use help_look::HelpLook;
 #[path = "runtime/scroll/edge.rs"]
 mod scroll_edge;
 #[path = "runtime/scroll/x.rs"]
@@ -187,6 +198,8 @@ mod hot_state;
 mod props;
 #[path = "runtime/input/secondary.rs"]
 mod secondary;
+#[path = "runtime/input/field_menu.rs"]
+pub(crate) mod field_menu;
 #[path = "runtime/input/app_ime.rs"]
 mod app_ime;
 #[path = "runtime/input/press_clicks.rs"]
@@ -195,6 +208,7 @@ mod press_clicks;
 mod press_repeat;
 #[path = "runtime/input/titlebar.rs"]
 mod titlebar;
+pub(crate) use titlebar::WindowMenu;
 #[path = "runtime/window_requests.rs"]
 mod window_requests;
 #[path = "runtime/paint/tracks.rs"]
@@ -204,6 +218,8 @@ mod action;
 use action::*;
 #[path = "runtime/paint/bands.rs"]
 mod bands;
+#[path = "runtime/paint/border.rs"]
+mod border_paint;
 #[path = "runtime/paint/slots.rs"]
 mod paint_slots;
 #[path = "runtime/paint/pixel_snap.rs"]
@@ -227,6 +243,9 @@ mod timer_wake_tests;
 #[cfg(test)]
 #[path = "runtime/truncate_tests.rs"]
 mod truncate_tests;
+#[cfg(test)]
+#[path = "runtime/truncate_fade_tests.rs"]
+mod truncate_fade_tests;
 #[cfg(test)]
 #[path = "runtime/line_clamp_tests.rs"]
 mod line_clamp_tests;
@@ -269,6 +288,10 @@ mod size_tests;
 pub(crate) mod web_runtime;
 #[path = "runtime/web/a11y.rs"]
 pub(crate) mod web_a11y;
+#[path = "runtime/web/page.rs"]
+pub(crate) mod web_page;
+#[path = "runtime/web/export.rs"]
+pub(crate) mod web_export;
 
 #[path = "runtime/commit/text_layout.rs"]
 mod text_layout;
@@ -294,8 +317,12 @@ mod unseen_presence;
 mod row_reorder;
 #[path = "runtime/motion/growth_rows.rs"]
 mod growth_rows;
+#[path = "runtime/motion/growth_runs.rs"]
+mod growth_runs;
 #[path = "runtime/motion/fold_hold.rs"]
 mod fold_hold;
+#[path = "runtime/motion/landing_hold.rs"]
+mod landing_hold;
 #[path = "runtime/motion/content_slide.rs"]
 mod content_slide;
 mod elements;
@@ -348,7 +375,7 @@ pub(crate) use commit_why::CommitWhy;
 #[cfg(debug_assertions)]
 pub(crate) use layout_read::window_read_key;
 pub(crate) use types::{AnimSource, Node};
-use types::{AxisScroll, Inh, NodeCold, RevealState, RowLayout, ScaleMotion, ScrollState, Stack};
+use types::{AxisScroll, GlideTo, Inh, NodeCold, RevealState, RowLayout, ScaleMotion, ScrollMode, ScrollState, Stack};
 #[path = "runtime/motion/tracks.rs"]
 mod tracks;
 use tracks::{SCROLL_DECAY, mark_ancestors, scroll_offsets, word_starts};
@@ -358,6 +385,9 @@ use commit::{Measured, Measurement, unwrapped_width};
 pub struct Runtime<S: 'static> {
     pub state: S,
     pub(crate) on_focus: Option<fn(&mut S, bool, &mut Tx)>,
+    /// `App::on_modifiers`, and the modifiers it last heard.
+    pub(crate) on_mods: Option<fn(&mut S, crate::Mods, &mut Tx)>,
+    mods_heard: crate::Mods,
     /// `App::on_ime` and the composition it has open.
     pub(crate) app_ime: app_ime::AppIme<S>,
     view: fn(&S, &mut Cx<S>) -> El,
@@ -389,6 +419,9 @@ pub struct Runtime<S: 'static> {
     system_accent: crate::SystemAccent,
     scroll_bars: system_settings::ScrollBarHost,
     pub time_scale: f32,
+    /// The last view's `Cx::foreground` and `Cx::focus_ring`, for rows built after it and the
+    /// rings painted until the next.
+    defaults: cx::ViewDefaults,
     /// Called at the start of every frame with the clock; return true when state changed (new data).
     pub poll: Option<fn(&mut S, f64, &mut Tx) -> bool>,
     /// Seconds since the first frame, unscaled (virtual when headless).
@@ -420,13 +453,11 @@ pub struct Runtime<S: 'static> {
     settle: bool,
     queue: ActionQueue,
     pointer: Option<(f32, f32)>,
-    capture: Option<(String, Drag)>,
-    /// The button holding `capture` (`El::pointer_buttons`).
-    capture_button: crate::PointerButton,
-    secondary_capture: Option<String>,
-    capture_inside: bool,
-    /// The pointer left while a press held it; the leave lands on release.
-    left_in_capture: bool,
+    /// The press the pointer holds, or the click a next press may pair with
+    /// (`runtime/input/capture.rs`).
+    press: capture::Press,
+    /// The secondary button's press, held beside it.
+    secondary: capture::Secondary,
     drag_data: f32,
     pub instances: Vec<Instance>,
     /// Per instance, the `El::mark` of its nearest marked node (0 for none). Filled only while
@@ -494,12 +525,17 @@ pub struct Runtime<S: 'static> {
     /// bottom, then the node's own content box top and bottom (unscaled points), while
     /// `has_sticky`.
     sticky_frame: Vec<[f32; 8]>,
+    /// Sections whose rows fade under their stuck header this frame (`ScrollFade::below_sticky`),
+    /// with the paint clip top the header keeps.
+    sticky_bands: Vec<(usize, f32)>,
     /// `Tx::keep_on_screen` across the commit underway.
     keeps: Vec<sticky::Keep>,
     /// `Tx::scroll_into_view` requests that follow their target while growth/layout springs run.
     scroll_reveals: Vec<sticky::Reveal>,
     /// Some element is `El::raise`d: paint order isn't tree order.
     has_raise: bool,
+    /// Some element sets `El::paint_order`: its siblings paint out of tree order.
+    has_paint_order: bool,
     /// The focus where the held non-IME key(s) went down, so a release after focus moves
     /// still reaches that element first.
     key_focus: Option<String>,
@@ -547,19 +583,19 @@ pub struct Runtime<S: 'static> {
     row_lifts: Vec<(usize, f32)>,
     /// The header each lifted fold shuts under, by the fold's id, which draws where it's laid out.
     fold_headers: HashMap<NodeId, String>,
+    /// What this frame's commits held at their landing width (`El::hold_landing_width`).
+    landing_holds: landing_hold::LandingHolds,
     grow_acc: f32,
     caught_up: f32,
     slack_dt: f32,
-    focused: Option<String>,
-    keyboard_focus: bool,
-    /// The pointer focused a `focus_highlight` row, so its highlight shows without a key.
-    hover_focus: bool,
+    /// What has focus, how it shows and where Tab starts (`runtime/input/focus_machine.rs`).
+    focus: focus_machine::FocusState,
     /// Type-select's typed prefix and when its last key arrived (`now_clock`).
-    typeahead: (String, f64),
+    type_select: focus_machine::TypeSelect,
     /// The activation key (Enter, Escape, Space) held down and the focus it was first pressed
     /// on. Its repeats are dropped once focus has moved, so a held key that closed something
     /// can't act again on whatever took focus next.
-    held: Option<physical_dispatch::HeldKey>,
+    held: physical_dispatch::Activation,
     /// Modifier keys down, for `Key::Modifier` (off unless the app opts in).
     modifier_keys: modifier_keys::ModifierKeys,
     /// Tab visits every control; off, only text fields and lists (macOS Full Keyboard
@@ -567,18 +603,19 @@ pub struct Runtime<S: 'static> {
     full_keyboard_access: bool,
     /// `App::tab_visits_controls`: Tab visits every control whatever `full_keyboard_access` says.
     tab_visits_controls: bool,
-    modal_stack: Vec<(String, Option<String>)>,
+    /// The open modals and where focus returns as each closes (`modal_focus`).
+    modal_focus: modal_focus::ModalFocus,
     /// Focus when the running commit began, before a new view's focus request applied: what a
     /// modal that opens in this commit returns focus to.
     focus_before_commit: Option<String>,
-    /// Focus before the current gesture/commit blurred it, so a scrim press that blurs on
-    /// pointer-down and closes its overlay on pointer-up still honours `focus_return`.
-    last_focused: Option<String>,
+    /// `Tx::focus`: the key the next commit focuses, and whether its ring shows.
+    focus_request: Option<(String, bool)>,
     /// Focused text fields that unmounted without being blurred: while another field holds focus,
     /// remounting one with its old `focused = true` flag does not steal focus back.
     unmounted_focused: Vec<std::sync::Weak<crate::edit::History>>,
-    modal_index: Option<usize>,
-    modal_members: Vec<bool>,
+    /// The innermost open modal this commit shows and what input may reach inside it, worked
+    /// out from the nodes at each commit; none while no modal shows.
+    modal_scope: Option<focus::ModalScope>,
     loops: HashMap<NodeId, rune_motion::LoopTrack>,
     loop_clock: loop_clock::LoopClock,
     loops_active: bool,
@@ -620,8 +657,12 @@ pub struct Runtime<S: 'static> {
     screen_fired: HashMap<NodeId, [f32; 4]>,
     /// (Drawn rect, laid-out rect) last sent to each element's `El::on_drawn_layout`.
     drawn_fired: HashMap<NodeId, ([f32; 4], [f32; 4])>,
+    /// Whether each element with `El::on_visible` was last on screen.
+    visible_fired: HashMap<NodeId, bool>,
     /// The window's content top-left in global screen points, as its host last saw it.
     window_origin: (f32, f32),
+    /// The window's content top-left in desktop pixels, as its host last saw it (`Drag::screen_point`).
+    window_pixels: Option<(i32, i32)>,
     /// Commits in a row caused only by layout feedback (see `layout_read`).
     layout_echoes: u32,
     /// An edit ran this frame: keep the caret in its scroll viewport after the commit.
@@ -681,6 +722,8 @@ pub struct Runtime<S: 'static> {
     pub(crate) fit_height: bool,
     /// The content height last asked of the window.
     fit_asked: Option<f32>,
+    /// The band of a taller document the window draws (`App::web_document`).
+    pub(crate) page: web_page::Page,
     /// A fitting window at rest asked to move: this frame shows the commit's motion at its
     /// start, as the window can't move until the next frame.
     fit_hold: bool,
@@ -714,6 +757,8 @@ pub struct Runtime<S: 'static> {
     live_wake: Arc<crate::live::Wake>,
     live_clock: Arc<()>,
     window_focused: Option<bool>,
+    /// The focused spellchecked field's word at the caret (`spell::pause`).
+    spell_watch: Option<crate::spell::pause::Watch>,
     /// `keys_lost` queued its `FocusLost` since the window last had focus.
     keys_lost: bool,
     live_subscriptions: Vec<Arc<crate::live::Subscription>>,
@@ -745,35 +790,21 @@ pub struct Runtime<S: 'static> {
     /// Seconds until the next frame while only [`Cycle`](crate::el::Cycle)s move on screen
     /// (the shell sleeps until then instead of drawing every display frame).
     pub ambient: Option<f32>,
-    /// Where (window points) the current press started.
-    press_at: (f32, f32),
-    /// The first of a possible double press: the element, its down time and point.
-    last_press: Option<(String, f64, f32, f32)>,
-    /// The press now held is the second of a double press.
-    double_armed: bool,
     /// The presses counted into `Drag::clicks`.
     press_clicks: press_clicks::PressClicks,
     /// The held press's drag repeat (`Tx::drag_repeat_after`).
     press_repeat: press_repeat::PressRepeat,
-    press_down_t: f64,
-    /// The held press has travelled past the click slop: it isn't a click of a double press.
-    press_moved: bool,
-    /// A scroll under the held press cancelled it ([`Runtime::scroll_cancels_press`]).
-    press_cancelled: bool,
     titlebar: titlebar::Titlebar,
     /// Two presses closer than this (seconds) are a double press: the system setting on macOS
     /// and Windows, 0.5 elsewhere and headless.
     pub double_click_interval: f64,
     /// How long (seconds) the pointer rests on an `El::help` element before its tooltip shows:
     /// the system's hover time on Windows, 0.5 elsewhere and headless. macOS windows use
-    /// AppKit's own tooltips.
+    /// AppKit's own tooltips, unless the view sets its own look (`Cx::help_look`), whose delay
+    /// may replace this one.
     pub help_delay: f64,
     /// The host starts OS drags, so `drag_out` elements start one (headless tools act as one).
     os_drag: bool,
-    /// The held press is on a `drag_out` element that hasn't crossed the threshold yet.
-    drag_out_armed: bool,
-    /// The armed element's drag threshold (points).
-    drag_out_threshold: f32,
     drag_out_request: Option<crate::drag_out::DragOutStart>,
     /// How OS drags ended, filled by the host's session callbacks between frames.
     drag_ends: crate::drag_out::DragEnds,
@@ -816,6 +847,7 @@ impl<S: 'static> Runtime<S> {
             system_accent: crate::SystemAccent::DEFAULT,
             scroll_bars: Default::default(),
             time_scale: 1.0,
+            defaults: Default::default(),
             poll: None,
             clock: 0.0,
             wake_deadlines: Vec::new(),
@@ -839,11 +871,8 @@ impl<S: 'static> Runtime<S> {
             settle: false,
             queue: ActionQueue::default(),
             pointer: None,
-            capture: None,
-            capture_button: crate::PointerButton::Primary,
-            secondary_capture: None,
-            capture_inside: false,
-            left_in_capture: false,
+            press: Default::default(),
+            secondary: Default::default(),
             drag_data: 0.0,
             instances: Vec::new(),
             marks: Vec::new(),
@@ -886,9 +915,11 @@ impl<S: 'static> Runtime<S> {
             has_sticky: false,
             stuck: Vec::new(),
             sticky_frame: Vec::new(),
+            sticky_bands: Vec::new(),
             keeps: Vec::new(),
             scroll_reveals: Vec::new(),
             has_raise: false,
+            has_paint_order: false,
             key_focus: None,
             keys_held: 0,
             ime_keys_down: 0,
@@ -920,23 +951,21 @@ impl<S: 'static> Runtime<S> {
             row_mask: Vec::new(),
             row_lifts: Vec::new(),
             fold_headers: HashMap::default(),
+            landing_holds: Default::default(),
             grow_acc: 0.0,
             caught_up: 0.0,
             slack_dt: 0.0,
-            focused: None,
-            keyboard_focus: false,
-            hover_focus: false,
-            typeahead: (String::new(), f64::NEG_INFINITY),
-            held: None,
+            focus: Default::default(),
+            type_select: Default::default(),
+            held: Default::default(),
             modifier_keys: Default::default(),
             full_keyboard_access: true,
             tab_visits_controls: false,
-            modal_stack: Vec::new(),
+            modal_focus: modal_focus::ModalFocus::Closed,
             focus_before_commit: None,
-            last_focused: None,
+            focus_request: None,
             unmounted_focused: Vec::new(),
-            modal_index: None,
-            modal_members: Vec::new(),
+            modal_scope: None,
             loops: HashMap::default(),
             loop_clock: Default::default(),
             loops_active: false,
@@ -960,7 +989,9 @@ impl<S: 'static> Runtime<S> {
             layout_fired: HashMap::default(),
             screen_fired: HashMap::default(),
             drawn_fired: HashMap::default(),
+            visible_fired: HashMap::default(),
             window_origin: (0.0, 0.0),
+            window_pixels: None,
             layout_echoes: 0,
             caret_follow: false,
             links: Default::default(),
@@ -992,6 +1023,7 @@ impl<S: 'static> Runtime<S> {
             window_title: Default::default(),
             fit_height: false,
             fit_asked: None,
+            page: Default::default(),
             fit_hold: false,
             fit_held: false,
             window_resting: false,
@@ -1013,8 +1045,11 @@ impl<S: 'static> Runtime<S> {
             videos_active: false,
             video_signature: 0,
             window_focused: None,
+            spell_watch: None,
             keys_lost: false,
             on_focus: None,
+            on_mods: None,
+            mods_heard: Default::default(),
             app_ime: Default::default(),
             live_subscriptions: Vec::new(),
             live_dirty: false,
@@ -1030,19 +1065,11 @@ impl<S: 'static> Runtime<S> {
             live_only_warnings: Vec::new(),
             key_warnings: None,
             ambient: None,
-            press_at: (0.0, 0.0),
-            last_press: None,
-            double_armed: false,
             press_clicks: Default::default(),
             press_repeat: Default::default(),
-            press_down_t: 0.0,
-            press_moved: false,
-            press_cancelled: false,
             titlebar: Default::default(),
             double_click_interval: 0.5,
             os_drag: true,
-            drag_out_armed: false,
-            drag_out_threshold: crate::drag_out::DRAG_THRESHOLD,
             drag_out_request: None,
             drag_ends: Default::default(),
             drags_open: 0,

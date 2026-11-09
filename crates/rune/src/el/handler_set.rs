@@ -2,7 +2,7 @@
 //! `Cold<Handlers>`, so elements without callbacks pay one pointer.
 use crate::cold::Empty;
 use crate::el::{
-    AtBottomFn, Cursor, DragEndFn, DragFn, DragOutFn, DropSpec, LayoutFn, LayoutTxFn, ModalSpec,
+    AtBottomFn, Cursor, DragEndFn, DragFn, DragOutFn, DropSpec, LanguagesFn, LayoutFn, LayoutTxFn, ModalSpec,
     PasteFn, PointerFn, PressFn, ScrollOffsetFn, SelectionChangeFn, SelectionCopy, VisibleRowsFn,
     WindowFocusFn,
 };
@@ -11,6 +11,10 @@ use crate::el::{
 pub(crate) struct Handlers {
     pub on_paste: Option<PasteFn>,
     pub on_window_focus: Option<WindowFocusFn>,
+    /// `El::on_spellcheck`: the app's spell checking setting and what flips it.
+    pub on_spellcheck: Option<(bool, WindowFocusFn)>,
+    /// `El::on_spellcheck_languages`: keeps the dictionaries a field's menu chose.
+    pub on_spellcheck_languages: Option<LanguagesFn>,
     pub modal: Option<ModalSpec>,
     pub on_press: Option<PressFn>,
     pub on_double_press: Option<PressFn>,
@@ -35,6 +39,8 @@ pub(crate) struct Handlers {
     pub on_layout: Option<LayoutTxFn>,
     pub on_screen_layout: Option<LayoutFn>,
     pub on_drawn_layout: Option<LayoutTxFn>,
+    /// `El::on_visible`: the element came on screen (`true`) or left it.
+    pub on_visible: Option<WindowFocusFn>,
     /// `El::drawn_rect_into`: where each frame draws the element.
     pub drawn_rect: Option<crate::Live<[f32; 4]>>,
     pub on_scroll_offset: Option<ScrollOffsetFn>,
@@ -92,6 +98,8 @@ impl Empty for Handlers {
     const EMPTY: &'static Self = &Handlers {
         on_paste: None,
         on_window_focus: None,
+        on_spellcheck: None,
+        on_spellcheck_languages: None,
         modal: None,
         on_press: None,
         on_double_press: None,
@@ -114,6 +122,7 @@ impl Empty for Handlers {
         on_layout: None,
         on_screen_layout: None,
         on_drawn_layout: None,
+        on_visible: None,
         drawn_rect: None,
         on_scroll_offset: None,
         selection_copy: None,

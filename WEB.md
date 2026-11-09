@@ -18,11 +18,13 @@ Serve the entire output folder over HTTPS, including `snippets/`. A local HTTP s
 `localhost` also works for development. The host must serve `.wasm` as `application/wasm`.
 No application server, SharedArrayBuffer, COOP or COEP headers are required.
 `--opt` additionally runs an installed `wasm-opt -Oz`; the default build does not need it.
+A release build drops the wasm's function-name section, so a panic's stack shows offsets
+instead of Rust names; `--names` keeps it for profiling, and `--dev` builds always keep it.
 The script prints the raw and gzip wasm sizes. Configure gzip or Brotli on the static host
 to get the corresponding transfer size.
 
 ```text
-usage: web-build.sh PACKAGE [--example NAME] [--out DIR] [--opt] [--dev] [--watch] [--no-html]
+usage: web-build.sh PACKAGE [--example NAME] [--out DIR] [--opt] [--dev] [--watch] [--no-html] [--names]
 ```
 
 The script builds with the toolchain's own cargo (`rustup which cargo`), not a `cargo` wrapper
@@ -90,6 +92,22 @@ example. Disable Rune's `dev`, `hot` and `native-file-dialog` features on wasm. 
 filesystem, process and thread dependencies behind target conditions in your app too.
 Use `rune::time::Instant` for deadlines passed to Rune; it is `std::time::Instant` on native.
 
+## Luau scripts
+
+An app that hosts Luau with `rune-luau` builds for the web too: Luau's C++ compiles with
+[WASI SDK](https://github.com/WebAssembly/wasi-sdk) (33 or newer) against WASI libc, using
+WebAssembly exception handling. Unpack the SDK and point `WASI_SDK_PATH` at it; `web-build.sh`
+then sets the C and C++ compilers for the wasm target, and `rune-luau` links the SDK's C runtime
+and defines the WASI calls libc makes inside the module, so the page loads like any other
+Rune app. Luau runs as its interpreter there.
+
+```sh
+WASI_SDK_PATH=$HOME/wasi-sdk-34.0 scripts/web-build.sh luau-panel --out target/web-luau
+node examples/luau-panel/web-proof.mjs target/web-luau target/web-luau-proof
+```
+
+Browsers with exception handling run it: current Chrome, Edge, Firefox and Safari.
+
 ## Mount in a page
 
 By default Rune appends its own canvas, covers the viewport and stops the body scrolling.
@@ -119,6 +137,46 @@ let handle = app.handle();           // keep it with the route
 App::new(spec).canvas_id("route-canvas").full_viewport().try_run()?; // after handle.quit()
 ```
 
+## A whole web page
+
+`App::web_document()` makes the app the page itself, for a marketing site, docs or an article.
+The root lays out at its natural height and the browser scrolls the document, so trackpad
+momentum, the scroll bar, Page Down, Space, find-in-page, anchors and back/forward are the
+browser's own. The canvas stays fixed to the viewport and draws the band the page is scrolled to;
+a scroll moves only that band and rebuilds nothing.
+
+Above the canvas Rune keeps a DOM mirror of the scene: landmarks (`role("main")`,
+`role("region")`, `role("navigation")`, `role("contentinfo")`), headings with their level,
+paragraphs, links and images, each at its element's place. Keys become element ids, so
+`#views` scrolls to the element keyed `views`. Its text is transparent but real, so the browser
+selects and copies it, and screen readers, crawlers and link previews read it. An element with
+`El::href(url)` is an `<a href>`: middle-click, Cmd-click and Copy Link work, and a plain click
+opens it in the same tab. Tab moves through the mirror's links and buttons; a press on one runs
+the element's handler. The page tints selections and focus rings with `--rune-selection` and
+`--rune-focus`, and sets the mirror's fonts with `--rune-sans` and `--rune-mono`, so match them
+to the fonts the app draws with.
+
+### A static first frame
+
+`--html out.html` lays the app out without a GPU, lets entrance motion land, and writes the
+scene as HTML and CSS: each element's flexbox style, paint and text, with the same tags the
+mirror uses. The browser draws that page before the wasm arrives, and a reader without WebGPU
+(or with scripts off) keeps a readable page:
+
+```sh
+cargo run -p site -- --html dist/index.html --html-widths 360,640,1000 --html-template index.html
+```
+
+Each width in `--html-widths` lays the page out again; the narrowest is the base and each wider
+one adds a `@media (min-width)` block where it differs, so the layout holds between the widths
+taken. `--html-template` fills `<!-- rune:css -->` and `<!-- rune:body -->` in a page that
+carries your meta tags. When Rune's first frame is on screen it removes the exported elements
+(`[data-rune-static]`), keeping the section at the top of the window where it was, and the
+canvas dispatches a bubbling `runepresent` event. An image is exported as `<img>` when its
+pixels came from `ImageCache::url` or `ImageCache::file`; shapes become inline SVG. Grid layout
+and effects drawn by shaders (`rune-fx`, materials) aren't exported; give such an element a
+fill to stand in for it.
+
 ## Images
 
 `ImageCache::url` fetches an image and lets the browser decode it with its own codecs
@@ -137,15 +195,35 @@ SVG (by `Content-Type` or a `.svg`/`.svgz` path) rasterizes with Rune's renderer
 asked for. Images over 8192 pixels a side are refused before their pixels are read, and a
 failed request or a cross-origin image without CORS headers resolves to `Image::error`.
 
+`Cursor::Image` sets the canvas's CSS `cursor` to the PNG at 2x (`image-set(url(blob:…) 2x)`),
+so the browser decodes it and draws it at its size in points on any display.
+
 ## Fonts and browser input
 
-Web includes Inter Regular and IBM Plex Mono Regular. There is no system-font discovery.
+Web includes Inter Regular and IBM Plex Mono Regular (the `embedded-fonts` feature). There is
+no system-font discovery. `App::font_url("fonts/brand.ttf")` fetches a TrueType or OpenType
+font (not WOFF2) alongside GPU setup, before the first frame, and adds it to `AppSpec::fonts`;
+on native it reads the same path from disk. Point the page's `@font-face` at the same file so the
+browser downloads it once, and build with `default-features = false` to drop the embedded fonts.
 Set `AppSpec::fonts` to static font bytes and `AppSpec::families` to your sans/mono family
 names for branding, additional weights, emoji and scripts outside the default fonts.
 For example, extend a static slice of `rune_theme_opencode::FONTS` with
 `include_bytes!("assets/NotoColorEmoji.ttf")` and the CJK fonts your app needs, then assign
 the combined slice to `spec.fonts`. Keep the theme's sans/mono family names in `spec.families`.
 Missing emoji and CJK glyphs display fallback boxes; they do not trigger font downloads.
+
+The embedded Inter is cut to Latin, Greek and Cyrillic text (Latin-1, Latin Extended-A, modern
+Greek, Cyrillic, punctuation, arrows and the Mac's key symbols), under half its size. Once the
+first frame is up the app fetches the full faces, `Inter-Regular.ttf`, `Inter-Medium.ttf` and
+`Inter-SemiBold.ttf`, from beside `app.js`; `scripts/web-build.sh` copies them there. Text the
+cut covers draws the same before and after; other text (Vietnamese, polytonic Greek, Cyrillic
+beyond Russian, Ukrainian, Belarusian, Serbian, Macedonian and Bulgarian) draws in fallback
+fonts or boxes until they arrive, and stays that way, with a console warning, on a host that
+doesn't serve them.
+
+In a Mac's browser text draws with macOS font smoothing (`FontSmoothing::On`), as Safari,
+Chrome and Firefox draw the page's own text there, and without it elsewhere, iPhone and iPad
+included. `App::font_smoothing` sets it either way.
 
 Rust supplies the hidden textarea with up to 512 UTF-16 units on each side of the selection,
 expanding for the selected range, and skips unchanged mirrors. Browser input events supply replacements; Rune validates the mirrored
@@ -183,7 +261,8 @@ page's `viewport-fit=cover` meta tag and the textarea's 16 px font size.
 
 ## Scope and verification
 
-This target needs WebGPU. It has no WebGL fallback, DOM accessibility mirror, overlays,
+This target needs WebGPU. It has no WebGL fallback (a page made with `--html` stays readable
+without it), overlays,
 extra windows, native menus, drag-out, native audio/video, networking layer or hot patching.
 Native configuration types remain source-compatible, but their desktop host paths are not
 used on wasm. Unsupported window requests warn in the console; Show/Open are ignored.
@@ -201,6 +280,9 @@ and reports whether it has a WebGPU adapter. The proof checks GPU errors, idle r
 and submissions, touch
 focus and momentum, Unicode edits, a long sliding context, predictive replacement,
 composition, selection, paste, copied model text, link isolation, theme and viewport resize.
+In Chromium it also installs Playwright's fake clock after the app has started and checks that
+a touch fling waits for `clock.runFor` instead of finishing in real time: Rune reads the page's
+current `performance.now()` on every frame, so a capture can step it frame by frame.
 The `?input-proof` fixture adds password input, Tab/Escape focus, mobile Enter, recomposition,
 same-field focus stability, continuous-input coalescing and visibility regression checks.
 Its mobile DPR check exercises the Safari-style CSS-size fallback because Chromium device
@@ -210,5 +292,5 @@ dictation, autocorrect or Safari WebGPU test; those still need device verificati
 The shell follows PLAN's winit-first approach, retaining winit 0.30's rAF and ResizeObserver
 implementation. Unlike research/11's proposed custom shell, it adds a document-aware
 textarea beside winit rather than replacing winit. This also defers PLAN's proposed switch
-to an owned shell when text input lands. WebGL fallback, EditContext and a DOM
-accessibility mirror from that research remain later work.
+to an owned shell when text input lands. WebGL fallback and EditContext from that research
+remain later work.

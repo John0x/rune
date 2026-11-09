@@ -145,6 +145,11 @@ impl<S: 'static> Runtime<S> {
             let path = self.node_index.get(&node).map_or_else(|| format!("node:{}", node.0), |&i| self.nodes[i].path.clone());
             (path, prop_name(p.0), store.is_active(track))
         }).collect();
+        // A growth row's feathered edge (`GrowTrack::mask`) paints as it eases out, after its height
+        // has landed: it is a track of its own here.
+        out.extend(self.grows.iter().filter(|(_, g)| g.mask > 0.01).filter_map(|(id, _)| {
+            self.node_index.get(id).map(|&i| (self.nodes[i].path.clone(), "mask", true))
+        }));
         out.sort();
         out.dedup();
         out
@@ -161,10 +166,10 @@ impl<S: 'static> Runtime<S> {
         self.nodes.iter().enumerate().filter(|&(i, n)| {
             let v = &n.vis;
             !parents[i] && n.text.is_none() && n.input.is_none() && !n.focus.enabled && n.material.is_none()
-                && v.fill.a == 0.0 && (v.border_width == 0.0 || v.border.a == 0.0 && v.border_bottom.is_none_or(|c| c.a == 0.0))
+                && v.fill.a == 0.0 && (v.border_width() == 0.0 || v.border().a == 0.0 && v.border_bottom.is_none_or(|c| c.a == 0.0))
                 && v.shadows.is_empty() && v.surface.is_none() && v.icon.is_none() && v.gradient.is_none() && v.radial.is_none()
                 && v.outline.is_none() && v.shape.is_none() && v.pixels.is_none() && v.effect.is_none()
-                && v.hover.a == 0.0 && v.press.a == 0.0
+                && v.hover().a == 0.0 && v.press().a == 0.0
         }).map(|(_, n)| n.path.as_str()).collect()
     }
 
@@ -199,7 +204,7 @@ impl<S: 'static> Runtime<S> {
                 crate::live::Property::Offset => 1,
                 crate::live::Property::Scale | crate::live::Property::Rect => 1 | 2,
                 crate::live::Property::Opacity => 4,
-                crate::live::Property::Fill | crate::live::Property::Blur | crate::live::Property::Trim => 0,
+                _ => 0,
             })
         }
         let store = self.scene.store();
@@ -237,13 +242,17 @@ impl<S: 'static> Runtime<S> {
                 let mut scrolling = false;
                 let mut scrolled = [0.0; 2];
                 let mut live_intent = intent(n);
+                // Held at its landing width this frame: its re-layout is the design.
+                if self.landing_holds.holds(n.id) {
+                    live_intent |= 1 | 2;
+                }
                 // A group_opacity swap under an instant hover group is a deliberate cut (Beta's
                 // status/close swap), for it and what it contains: opacity and transition intent.
                 let up = |from: Option<usize>| std::iter::successors(from, |&pi| self.nodes[pi].parent);
                 if let Some(gi) = up(Some(i)).find(|&j| self.nodes[j].vis.group_opacity.is_some()) {
                     let group = up(self.nodes[gi].parent)
                         .map(|pi| &self.nodes[pi])
-                        .find(|g| g.vis.hover.a > 0.0 || g.vis.hover_group);
+                        .find(|g| g.vis.hover().a > 0.0 || g.vis_flags.hover_group());
                     if group.and_then(|g| g.hover_motion()).is_some_and(|(e, x)| [e, x].iter().any(|a| matches!(a.curve, rune_motion::Curve::Instant))) {
                         live_intent |= 4 | 16;
                     }
@@ -278,7 +287,7 @@ impl<S: 'static> Runtime<S> {
                     let p = &self.nodes[pi];
                     moving |= animating(p.id)
                         || self.stacks.get(&p.id).is_some_and(|s| s.moving)
-                        || self.scrolls.get(&p.id).is_some_and(|s| s.slack.moving() || s.glide.is_some());
+                        || self.scrolls.get(&p.id).is_some_and(|s| s.slack.moving() || s.glide().is_some());
                     live_intent |= intent(p);
                     scrolling |= self.scrolls.get(&p.id).is_some_and(ScrollState::moving);
                     in_growing_row |= self.grows.get(&p.id).is_some_and(|g| g.moving());
@@ -293,8 +302,8 @@ impl<S: 'static> Runtime<S> {
                         else { l.phase(self.scene.store().node_time(n.id)) }
                     }),
                     focusable: self.can_focus(i),
-                    focused: self.focused.as_deref() == Some(&n.path),
-                    focus_visible: self.keyboard_focus && self.focused.as_deref() == Some(&n.path),
+                    focused: self.focus.path() == Some(&n.path),
+                    focus_visible: self.focus.keyboard() && self.focus.path() == Some(&n.path),
                     inert: !self.allowed(i) || exiting,
                     exiting,
                     path: n.path.clone(),
@@ -314,7 +323,7 @@ impl<S: 'static> Runtime<S> {
                     radius: p.radius.0[0],
                     fill: self.color(n.id, P_FILL, n.vis.fill),
                     text_color: n.text.as_ref().map(|t| t.color).or(n.vis.icon.map(|(_, c)| c)).map(|c| self.color(n.id, P_TEXT, c)),
-                    hover: if n.focus.highlight.is_some() && self.highlight_visible(i) { 1.0 }
+                    hover: if (n.focus.highlight.is_some() && self.highlight_visible(i)) || (n.focus.fill.is_some() && self.focus_ring_visible(i)) { 1.0 }
                         else { self.scene.get(n.id, P_HOVER).unwrap_or(0.0) },
                     press: self.scene.get(n.id, P_PRESS).unwrap_or(0.0),
                     moving,
@@ -327,7 +336,7 @@ impl<S: 'static> Runtime<S> {
                     live_intent,
                     caret: self.caret_rect(&self.nodes, i),
                     drag_out: n.handlers.drag_out.is_some(),
-                    help: n.help.as_ref().filter(|_| !n.help_cut || n.text_cut(s)).cloned(),
+                    help: n.help.as_deref().filter(|_| !n.help_cut || n.text_cut(s)).map(|h| crate::el::help_words(h).into_owned()),
                     selected: n.text.as_ref().filter(|t| t.selectable && !secure).and_then(|t| {
                         let (a, b) = selectable::range_in(&sel_ranges, i)?;
                         t.copy_slice(a as u32, b as u32)
@@ -337,7 +346,7 @@ impl<S: 'static> Runtime<S> {
                     item_selected: n.focus.selected,
                     stuck: self.stuck.get(i).copied().unwrap_or(0.0),
                     virtual_extent: self.virtuals.contains_key(&n.path) && n.vis.fill.a == 0.0
-                        && n.vis.border_width == 0.0 && n.vis.shadows.is_empty() && n.text.is_none() && n.vis.icon.is_none(),
+                        && n.vis.border_width() == 0.0 && n.vis.shadows.is_empty() && n.text.is_none() && n.vis.icon.is_none(),
                 })
             })
             .collect();
@@ -367,12 +376,20 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// Centre of the first element whose key is `key`, or whose path ends with `key` when it
-    /// contains a `/` (e.g. `slider/knob`), in points. Failing that, the first line box of the
-    /// link (`El::link`) or highlight (`El::text_highlight`) keyed `key`. Exiting elements and
-    /// their children are gone here; [`Runtime::presented`] still reads them.
+    /// contains a `/` (e.g. `slider/knob`), in points. Elements without keys between them don't
+    /// count, so `slider/knob` finds a knob inside unkeyed rows inside the slider. Failing that,
+    /// the first line box of the link (`El::link`) or highlight (`El::text_highlight`) keyed
+    /// `key`. Exiting elements and their children are gone here; [`Runtime::presented`] still
+    /// reads them.
     pub fn find(&self, key: &str) -> Option<(f32, f32)> {
         let suffix = format!("/{key}");
-        let matches = |n: &Node| if key.contains('/') { n.path == key || n.path.ends_with(&suffix) } else { n.key.as_deref() == Some(key) };
+        let matches = |n: &Node| {
+            if key.contains('/') {
+                n.path == key || n.path.ends_with(&suffix) || keyed_suffix(&n.path, key)
+            } else {
+                n.key.as_deref() == Some(key)
+            }
+        };
         let i = (0..self.nodes.len()).find(|&i| matches(&self.nodes[i]) && !self.subtree_exiting(i));
         let Some(i) = i else { return self.find_link(key).or_else(|| self.find_highlight(key)) };
         let r = self.drawn.get(i).copied()?;
@@ -505,4 +522,12 @@ impl<S: 'static> Runtime<S> {
         let c = self.color(n.id, P_FILL, n.vis.fill);
         (c.a > 0.5).then(|| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b < 0.25)
     }
+}
+
+/// Whether `path`'s keyed segments end with `key`'s: `slider/knob` matches
+/// `form/#2/slider/#0/knob`, since the `#n` segments stand for elements without keys.
+fn keyed_suffix(path: &str, key: &str) -> bool {
+    let unkeyed = |s: &&str| s.len() > 1 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_digit());
+    let mut keyed = path.rsplit('/').filter(|s| !unkeyed(s));
+    key.rsplit('/').all(|want| keyed.next() == Some(want))
 }

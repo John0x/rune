@@ -41,7 +41,7 @@ impl<S: 'static> Runtime<S> {
         let y = t[1] + self.stack_row_dy(nodes, i);
         let tw = layout.full_width().ceil() / s;
         let (x0, x1) = (t[0] + n.inset[0], t[2] - n.inset[2]);
-        let mut x = text_x(spec, x0, x1, tw);
+        let mut x = text_x(spec, x0, x1, tw, crate::el::Flow::of_layout(layout));
         if inp.single_line {
             let prev = self.input_scroll.get(&n.path).copied().unwrap_or(0.0);
             x -= single_line_offset(prev, inp, &spec.content, layout, s, (x1 - x0) * s) / s;
@@ -73,14 +73,12 @@ impl<S: 'static> Runtime<S> {
             let stick = self.nodes[v].scroll.is_some_and(|s| s.stick_bottom);
             let Some(st) = self.scrolls.get_mut(&self.nodes[v].id) else { continue };
             if horizontal {
-                st.x.offset = (st.x.offset + delta).clamp(0.0, st.x.max);
+                st.x.offset = (st.x.offset + st.x.toward(-delta)).clamp(0.0, st.x.max);
                 st.x.v = 0.0;
                 st.x.glide = None;
             } else {
                 st.offset = (st.offset + delta).clamp(0.0, st.max);
-                st.pinned = stick && st.offset >= st.max - 0.5;
-                st.v = 0.0;
-                st.glide = None;
+                st.land(stick);
                 scrolled = true;
             }
             st.direct = true;
@@ -221,13 +219,13 @@ mod tests {
         assert!(!rt.state[190].focused);
         rt.update(|s, _| s[180].focused = false);
         rt.frame(0.0);
-        assert!(rt.focused.is_none(), "explicitly blurred offscreen input stays blurred");
+        assert!(rt.focus.path().is_none(), "explicitly blurred offscreen input stays blurred");
         rt.update(|s, _| s[190].focused = true);
         rt.frame(0.0);
         assert!(rt.state[190].focused);
         rt.update(|s, _| { s.truncate(100); });
         rt.frame(0.0);
-        assert!(rt.focused.is_none(), "deleted offscreen input loses focus");
+        assert!(rt.focus.path().is_none(), "deleted offscreen input loses focus");
         rt.update(|s, tx| { s.extend(make_blocks(140, None)); tx.scroll_into_view("b190"); });
         rt.frame(0.0);
         assert!(!rt.state[190].focused, "reusing a deleted path must not restore focus");

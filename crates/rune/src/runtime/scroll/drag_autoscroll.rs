@@ -13,11 +13,11 @@ impl<S: 'static> Runtime<S> {
     /// Scrolls the viewport under a held autoscroll drag by `dt` seconds' worth, and gives the
     /// drag a Move from where the pointer now is over the content. Whether it scrolled.
     pub(super) fn step_drag_autoscroll(&mut self, dt: f32) -> bool {
-        let (Some((path, _)), Some((x, y))) = (&self.capture, self.pointer) else { return false };
+        let (Some(path), Some((x, y))) = (self.press.path().map(str::to_owned), self.pointer) else { return false };
         if dt <= 0.0 || self.input_click.captured {
             return false;
         }
-        let Some(i) = self.nodes.iter().position(|n| &n.path == path && n.handlers.get().is_some_and(|h| h.drag_autoscroll && h.on_drag.is_some())) else {
+        let Some(i) = self.nodes.iter().position(|n| &n.path == path.as_str() && n.handlers.get().is_some_and(|h| h.drag_autoscroll && h.on_drag.is_some())) else {
             return false;
         };
         let scrolls_y = |p: &usize| self.nodes[*p].scroll.is_some() && self.nodes[*p].scroll_axes.y();
@@ -41,9 +41,7 @@ impl<S: 'static> Runtime<S> {
         let Some(st) = self.scrolls.get_mut(&self.nodes[v].id) else { return false };
         let before = st.offset;
         st.offset = (st.offset + f64::from(speed * dt)).clamp(0.0, st.max);
-        st.v = 0.0;
-        st.glide = None;
-        st.pinned = false;
+        st.mode = ScrollMode::Rest;
         if st.offset == before {
             return false;
         }

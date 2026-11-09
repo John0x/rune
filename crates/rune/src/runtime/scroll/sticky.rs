@@ -86,15 +86,15 @@ mod tests {
     fn completed_reveal_and_keep_repin_the_end_and_go_idle() {
         for keep in [false, true] {
             let mut rt = following(keep);
-            if !keep { assert!(!scroll(&rt).pinned); }
+            if !keep { assert!(!scroll(&rt).pinned()); }
             for _ in 0..240 { rt.frame(1.0 / 120.0); }
             assert!(rt.keeps.is_empty() && rt.scroll_reveals.is_empty());
             assert!(!rt.animating);
-            assert!(scroll(&rt).pinned, "the completed hold returns the end to stick_bottom");
+            assert!(scroll(&rt).pinned(), "the completed hold returns the end to stick_bottom");
             rt.update(|s, _| { s.height = 230.0; s.streaming = true; });
             for _ in 0..60 {
                 rt.frame(1.0 / 120.0);
-                assert!(scroll(&rt).pinned);
+                assert!(scroll(&rt).pinned());
                 assert!((scroll(&rt).offset - scroll(&rt).max).abs() < 0.05);
             }
         }
@@ -141,17 +141,17 @@ mod tests {
         rt.frame(0.0);
         rt.update(|_, tx| tx.scroll_to("scroll", 0.0, 0.0));
         rt.frame(1.0 / 120.0);
-        assert!(scroll(&rt).glide_to.is_some());
+        assert!(scroll(&rt).glide_to().is_some());
         rt.update(|_, tx| tx.instant());
         rt.frame(1.0 / 120.0);
-        assert!(scroll(&rt).glide_to.is_some(), "an unrelated instant commit leaves an existing glide alone");
+        assert!(scroll(&rt).glide_to().is_some(), "an unrelated instant commit leaves an existing glide alone");
         rt.update(|_, tx| { tx.instant(); tx.scroll_to("scroll", 0.0, 100.0); });
         rt.frame(1.0 / 120.0);
-        assert!(scroll(&rt).glide_to.is_none());
+        assert!(scroll(&rt).glide_to().is_none());
         assert!((scroll(&rt).offset - 100.0).abs() < 0.05);
         rt.update(|_, tx| { tx.instant(); tx.scroll_to_bottom("scroll"); });
         rt.frame(1.0 / 120.0);
-        assert!(scroll(&rt).glide.is_none());
+        assert!(scroll(&rt).glide().is_none());
         assert!((scroll(&rt).offset - scroll(&rt).max).abs() < 0.05);
     }
 
@@ -161,10 +161,10 @@ mod tests {
         rt.frame(0.0);
         rt.update(|_, tx| tx.scroll_to("scroll", 0.0, 0.0));
         rt.frame(0.0);
-        assert!(scroll(&rt).glide_to.is_some());
+        assert!(scroll(&rt).glide_to().is_some());
         rt.update(|_, tx| tx.scroll_into_view("tail"));
         rt.frame(1.0 / 120.0);
-        assert!(scroll(&rt).glide.is_none() && scroll(&rt).glide_to.is_none());
+        assert!(scroll(&rt).glide().is_none() && scroll(&rt).glide_to().is_none());
         assert!((scroll(&rt).offset - scroll(&rt).max).abs() < 0.05);
         assert!(!rt.animating);
     }
@@ -343,7 +343,7 @@ fn target_shift(nodes: &[Node], scrolls: &HashMap<NodeId, ScrollState>, j: usize
             let ox: f32 = std::iter::successors(Some(p), |&u| nodes[u].parent)
                 .take_while(|&u| u != s)
                 .chain(std::iter::once(s))
-                .filter_map(|u| scrolls.get(&nodes[u].id).map(|st| st.x.offset as f32))
+                .filter_map(|u| scrolls.get(&nodes[u].id).map(|st| st.x.shift() as f32))
                 .sum();
             let st_x = nodes[s].target[0];
             let band_w = nodes[s].target[2] - st_x;
@@ -483,6 +483,22 @@ impl<S: 'static> Runtime<S> {
         self.nodes[i].sticky.as_ref().and_then(|s| Some((s.edge?, s.inset, s.tail)))
     }
 
+    /// `El::stuck_fade`: how much of node `i`'s children show, drawn with its top at `drawn`
+    /// (a frame point, `dy` the offset its siblings draw at): whole until the next sticky-top
+    /// sibling's top comes within `lead + span` of it, gone at `lead`.
+    pub(super) fn stuck_fade(&self, i: usize, drawn: f32, dy: f32) -> f32 {
+        let n = &self.nodes[i];
+        let Some([lead, span]) = n.sticky.as_ref().and_then(|s| s.fade) else { return 1.0 };
+        let next = (i + 1..self.nodes.len())
+            .filter(|&j| self.nodes[j].parent == n.parent)
+            .find(|&j| self.nodes[j].sticky.as_ref().is_some_and(|s| s.edge == Some(StickyEdge::Top)));
+        let Some(p) = next.and_then(|j| self.scene.presented(self.nodes[j].id).map(|p| (j, p))) else { return 1.0 };
+        let (j, p) = p;
+        let own = self.scene.get(self.nodes[j].id, prop::OFFSET).unwrap_or(rune_motion::Vec2::ZERO);
+        let top = p.rect.y - own.y + dy + self.row_dy[j] - self.row_dy[i];
+        ((top - drawn - lead) / span.max(1e-3)).clamp(0.0, 1.0)
+    }
+
     /// The bands and box node `i` sticks within along `edge` (see `shift`), from its ancestors'
     /// drawn places this frame, and the viewport it sticks to.
     pub(super) fn sticky_frame_of(&self, i: usize, edge: StickyEdge) -> ([f32; 8], Option<usize>) {
@@ -540,7 +556,7 @@ impl<S: 'static> Runtime<S> {
                     if self.scroll_stack(s).and_then(|c| self.stacks.get(&self.nodes[c].id)).is_some_and(|st| st.growing)
                         && let Some(st) = self.scrolls.get_mut(&self.nodes[s].id)
                     {
-                        st.pinned = false;
+                        st.unpin();
                     }
                     // Mounted anchors follow drawn geometry after the motion step.
                     continue;
@@ -558,11 +574,8 @@ impl<S: 'static> Runtime<S> {
                 st.direct = true;
                 let to = (laid - f64::from(k.was)).clamp(0.0, st.max);
                 if pass > 0 && (to - st.offset).abs() < 0.5 { continue; }
-                st.v = 0.0;
-                st.glide = None;
-                st.glide_to = None;
                 st.offset = to;
-                st.pinned = stick && st.offset >= st.max - 0.5;
+                st.land(stick);
                 moved = true;
             }
             if !moved || !self.virtual_window_changed() { break; }
@@ -588,10 +601,7 @@ impl<S: 'static> Runtime<S> {
             let to = (st.offset + f64::from(delta)).clamp(0.0, st.max);
             if (to - st.offset).abs() < 1e-5 { continue; }
             st.offset = to;
-            st.v = 0.0;
-            st.glide = None;
-            st.glide_to = None;
-            st.pinned = stick && delta >= 0.0 && to >= st.max - 0.5;
+            st.land(stick && delta >= 0.0);
             st.direct = true;
             moved = true;
         }
@@ -621,22 +631,19 @@ impl<S: 'static> Runtime<S> {
             let top = st.offset + rel_top;
             let to = reveal::place(r.center, st.offset, top, height, viewport, margin).clamp(0.0, st.max);
             // A `Tx::scroll_center` glide follows its target once the target moves.
-            if let Some(v) = st.glide {
-                if st.glide_to.is_none_or(|g| (to - g).abs() >= 1.0 / 64.0) {
-                    st.glide_to = Some(to);
-                    st.glide = Some(scroll_offset::retarget_v(st.glide_spring(), st.offset, v, to));
+            if let ScrollMode::Glide { v, to: aim } = st.mode {
+                if aim.offset().is_none_or(|g| (to - g).abs() >= 1.0 / 64.0) {
+                    let aim = if let GlideTo::ShrunkEnd(_) = aim { GlideTo::ShrunkEnd(to) } else { GlideTo::Offset(to) };
+                    st.mode = ScrollMode::Glide { v: scroll_offset::retarget_v(st.glide_spring(), st.offset, v, to), to: aim };
                 }
                 continue;
             }
             if (to - st.offset).abs() < 1.0 / 64.0 {
-                if growing { st.pinned = false; }
+                if growing { st.unpin(); }
                 continue;
             }
             st.offset = to;
-            st.v = 0.0;
-            st.glide = None;
-            st.glide_to = None;
-            st.pinned = stick && !growing && to >= st.max - 0.5;
+            st.land(stick && !growing);
             st.direct = true;
             moved = true;
         }
@@ -646,7 +653,7 @@ impl<S: 'static> Runtime<S> {
         keeps.retain(|k| {
             let Some(i) = self.nodes.iter().position(|n| n.path == k.path) else { return true };
             let Some(s) = self.viewport_of(i) else { return false };
-            !(self.scrolls.get(&self.nodes[s].id).is_some_and(|st| st.pinned)
+            !(self.scrolls.get(&self.nodes[s].id).is_some_and(|st| st.pinned())
                 && self.drawn[i][1] - self.drawn[s][1] > k.was + 0.5)
         });
         self.keeps = keeps;
@@ -674,7 +681,7 @@ impl<S: 'static> Runtime<S> {
         });
         let gliding = |viewport: &str| self.path_ids.get(viewport)
             .and_then(|id| self.scrolls.get(id))
-            .is_some_and(|st| st.glide.is_some());
+            .is_some_and(|st| st.glide().is_some());
         keeps.retain(|k| animating(&k.viewport));
         // A glide keeps its reveal until it lands; otherwise a reveal lasts while its viewport's
         // subtree moves with its target in it.

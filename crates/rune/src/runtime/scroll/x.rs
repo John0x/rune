@@ -75,8 +75,8 @@ pub(crate) const SHIFT_TURNS_WHEEL: bool = !cfg!(target_os = "macos");
 
 impl ScrollState {
     /// The offset, velocity and limit on one axis.
-    pub(super) fn axis(&mut self, horizontal: bool) -> (&mut f64, &mut f32, f64) {
-        if horizontal { (&mut self.x.offset, &mut self.x.v, self.x.max) } else { (&mut self.offset, &mut self.v, self.max) }
+    pub(super) fn axis(&mut self, horizontal: bool) -> (&mut f64, f64) {
+        if horizontal { (&mut self.x.offset, self.x.max) } else { (&mut self.offset, self.max) }
     }
 }
 
@@ -196,7 +196,7 @@ impl<S: 'static> Runtime<S> {
         let Some(id) = latched.or_else(|| self.scroll_at_axis(x, y, true)) else { return };
         let Some(st) = self.scrolls.get_mut(&id) else { return };
         let before = st.x.offset;
-        st.x.offset = (st.x.offset - f64::from(dx)).clamp(0.0, st.x.max);
+        st.x.offset = (st.x.offset + st.x.toward(f64::from(dx))).clamp(0.0, st.x.max);
         st.x.v = 0.0;
         st.x.glide = None;
         st.direct = true;
@@ -216,18 +216,22 @@ impl<S: 'static> Runtime<S> {
         self.dismiss_help();
         let Some(id) = self.scroll_at_axis(x, y, true) else { return };
         if let Some(st) = self.scrolls.get_mut(&id) {
-            st.x.v = -vx;
+            st.x.v = st.x.toward(f64::from(vx)) as f32;
             st.x.glide = None;
             log_event!(self, "fling-x {vx:.0}");
             if vx != 0.0 { self.scroll_cancels_press(id); }
         }
     }
 
-    /// How far horizontal viewport `i`'s content reaches past its right edge, negative while it
-    /// fits.
+    /// How far horizontal viewport `i`'s content reaches past its end edge (its right, or its
+    /// left right to left), negative while it fits.
     fn scroll_overflow_x(&self, i: usize) -> f64 {
         let view = self.nodes[i].target;
-        let content_w = self.scroll_children(i).map(|c| f64::from(self.nodes[c].target[2] - view[0])).reduce(f64::max).unwrap_or(0.0);
+        let reach = |c: usize| match self.nodes[i].flow {
+            crate::el::Flow::Ltr => self.nodes[c].target[2] - view[0],
+            crate::el::Flow::Rtl => view[2] - self.nodes[c].target[0],
+        };
+        let content_w = self.scroll_children(i).map(|c| f64::from(reach(c))).reduce(f64::max).unwrap_or(0.0);
         content_w - f64::from(view[2] - view[0])
     }
 
@@ -267,7 +271,12 @@ impl<S: 'static> Runtime<S> {
         let Some(v) = std::iter::successors(self.nodes[i].parent, |&p| self.nodes[p].parent)
             .find(|&p| self.nodes[p].scroll.is_some() && self.nodes[p].scroll_axes.x()) else { return };
         let view = &self.nodes[v];
-        let (left, width, viewport) = (f64::from(target_x - view.target[0]), f64::from(target_w), f64::from(view.local.w));
+        // From the viewport's start edge: its right, right to left.
+        let start = match view.flow {
+            crate::el::Flow::Ltr => target_x - view.target[0],
+            crate::el::Flow::Rtl => view.target[2] - (target_x + target_w),
+        };
+        let (left, width, viewport) = (f64::from(start), f64::from(target_w), f64::from(view.local.w));
         let (margin, id) = (f64::from(view.scroll_edges.margin), view.id);
         // A vertical reveal may have just mounted rows (virtual ones) that widened the content.
         let max = self.scroll_overflow_x(v).max(0.0);

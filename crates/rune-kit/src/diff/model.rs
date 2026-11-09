@@ -5,6 +5,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use super::myers::{self, Op};
+use super::words;
 
 /// The two sides of a diff: the text before the change and after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -36,7 +37,8 @@ pub struct Line {
     /// The line without its line break.
     pub text: String,
     /// Byte ranges of `text` that differ from the line it replaced or was replaced by (word
-    /// changes), when it pairs with one and they share enough to say.
+    /// changes), when it pairs with one: as OpenCode Desktop marks them, one range from the first
+    /// changed word to the last.
     pub changes: Vec<Range<usize>>,
     /// The file ends here without a line break (`\ No newline at end of file`).
     pub no_newline: bool,
@@ -192,13 +194,24 @@ impl FileDiff {
     /// change and word changes on paired lines. Both texts stay with it, so every unchanged
     /// range between hunks can be expanded.
     pub fn from_texts(path: impl Into<String>, old: &str, new: &str) -> FileDiff {
+        FileDiff::from_texts_with_context(path, old, new, CONTEXT)
+    }
+
+    /// [`FileDiff::from_texts`] with `context` unchanged lines around each change instead of
+    /// three: four is what jsdiff (and so OpenCode Desktop) keeps.
+    pub fn from_texts_with_context(path: impl Into<String>, old: &str, new: &str, context: u32) -> FileDiff {
         let path = path.into();
-        FileDiff::between(Some(path.clone()), Some(path), old, new)
+        FileDiff::between_with_context(Some(path.clone()), Some(path), old, new, context)
     }
 
     /// [`FileDiff::from_texts`] for a file whose path changed (a rename), was added (`old_path`
     /// `None`, `old` empty) or deleted (`new_path` `None`, `new` empty).
     pub fn between(old_path: Option<String>, new_path: Option<String>, old: &str, new: &str) -> FileDiff {
+        FileDiff::between_with_context(old_path, new_path, old, new, CONTEXT)
+    }
+
+    /// [`FileDiff::between`] with `context` unchanged lines around each change.
+    pub fn between_with_context(old_path: Option<String>, new_path: Option<String>, old: &str, new: &str, context: u32) -> FileDiff {
         let mut f = FileDiff::empty(old_path, new_path);
         f.status = match (&f.old_path, &f.new_path) {
             (None, _) => FileStatus::Added,
@@ -211,7 +224,7 @@ impl FileDiff {
             return f;
         }
         let (a, b) = (Rc::new(Source::new(old)), Rc::new(Source::new(new)));
-        f.hunks = hunks(&a, &b);
+        f.hunks = hunks(&a, &b, context);
         f.old_text = Some(a);
         f.new_text = Some(b);
         f.pair_words();
@@ -233,19 +246,96 @@ impl FileDiff {
         self.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind == LineKind::Removed).count()
     }
 
-    /// The highlighter language for the path's extension (or name, for a `Makefile`), as
-    /// written: `"rs"`, `"tsx"`.
+    /// The highlighter language for the path, as Desktop names it from the file name
+    /// ([`lang_for_path`](crate::syntax::lang_for_path)): `"rust"`, `"tsx"`, `"makefile"`.
     pub fn language(&self) -> Option<&str> {
-        let name = self.path().rsplit('/').next()?;
-        match name.rsplit_once('.') {
-            Some((stem, ext)) if !stem.is_empty() => Some(ext),
-            _ => Some(name).filter(|n| matches!(*n, "Makefile" | "Dockerfile")),
-        }
+        crate::syntax::lang_for_path(self.path())
     }
 
     /// Whether the unchanged lines between hunks can be shown.
     pub fn expandable(&self) -> bool {
         self.old_text.is_some() || self.new_text.is_some()
+    }
+
+    /// The only side the file has: `New` for an added file, `Old` for a deleted one, `None`
+    /// when it has both. A file diffed from texts counts as added when its old text is empty
+    /// and its new one isn't (and the other way round as deleted), unless it moved.
+    pub fn sole_side(&self) -> Option<Side> {
+        match self.status {
+            FileStatus::Added => Some(Side::New),
+            FileStatus::Deleted => Some(Side::Old),
+            FileStatus::Modified => {
+                let empty = |t: &Option<Rc<Source>>| t.as_ref().map(|t| t.text.is_empty());
+                match (empty(&self.old_text), empty(&self.new_text)) {
+                    (Some(true), Some(false)) => Some(Side::New),
+                    (Some(false), Some(true)) => Some(Side::Old),
+                    _ => None,
+                }
+            }
+            FileStatus::Renamed | FileStatus::Copied => None,
+        }
+    }
+
+    /// The whole text of `side`, when the diff has it ([`FileDiff::from_texts`],
+    /// [`FileDiff::fold`]).
+    pub fn text(&self, side: Side) -> Option<&str> {
+        let t = match side {
+            Side::Old => &self.old_text,
+            Side::New => &self.new_text,
+        };
+        t.as_deref().map(|t| t.text.as_str())
+    }
+
+    /// A diff whose one hunk holds the whole file, as a patch made with full context does,
+    /// folded as a diff of the two texts is: the hunk splits around its changes with `context`
+    /// unchanged lines each side, and the texts it holds stay with the diff, so every folded
+    /// range can be expanded. The patch's own line pairing stays. A diff of any other shape
+    /// (more than one hunk, or one that starts past the first line) comes back as it was.
+    pub fn fold(mut self, context: u32) -> FileDiff {
+        let [h] = self.hunks.as_slice() else { return self };
+        if self.binary || h.first(Side::Old) > 1 || h.first(Side::New) > 1 {
+            return self;
+        }
+        let text = |side: Side| {
+            let kept = |l: &&Line| l.kind == LineKind::Context || l.kind == if side == Side::Old { LineKind::Removed } else { LineKind::Added };
+            h.lines.iter().filter(kept).fold(String::new(), |mut s, l| {
+                s.push_str(&l.text);
+                if !l.no_newline {
+                    s.push('\n');
+                }
+                s
+            })
+        };
+        let (old, new) = (Rc::new(Source::new(&text(Side::Old))), Rc::new(Source::new(&text(Side::New))));
+        let lines = std::mem::take(&mut self.hunks).pop().map(|h| h.lines).unwrap_or_default();
+        let ranges = lines.iter().enumerate().filter(|(_, l)| l.kind != LineKind::Context).fold(Vec::<(usize, usize)>::new(), |mut out, (i, _)| {
+            let (start, end) = (i.saturating_sub(context as usize), (i + context as usize).min(lines.len() - 1));
+            match out.last_mut() {
+                Some(r) if start <= r.1 + 1 => r.1 = end,
+                _ => out.push((start, end)),
+            }
+            out
+        });
+        let before = |side: Side, i: usize| lines[..i].iter().filter(|l| l.number(side).is_some()).count() as u32;
+        self.hunks = ranges
+            .into_iter()
+            .map(|(start, end)| {
+                let lines = lines[start..=end].to_vec();
+                let count = |side: Side| lines.iter().filter(|l| l.number(side).is_some()).count() as u32;
+                let (ob, nb, oc, nc) = (before(Side::Old, start), before(Side::New, start), count(Side::Old), count(Side::New));
+                Hunk {
+                    old_start: if oc == 0 { ob } else { ob + 1 },
+                    old_count: oc,
+                    new_start: if nc == 0 { nb } else { nb + 1 },
+                    new_count: nc,
+                    section: section(&old, ob),
+                    lines,
+                }
+            })
+            .collect();
+        self.old_text = Some(old);
+        self.new_text = Some(new);
+        self
     }
 
     /// Unchanged line `n` of the old side (with `new` its number on the new side), from
@@ -296,13 +386,10 @@ impl FileDiff {
                     i = i.max(del + 1);
                     continue;
                 }
-                let pairs = (add - del).min(i - add);
-                if pairs <= 128 {
-                    for k in 0..pairs {
-                        let (a, b) = myers::words(&h.lines[del + k].text, &h.lines[add + k].text);
-                        h.lines[del + k].changes = a;
-                        h.lines[add + k].changes = b;
-                    }
+                for k in 0..(add - del).min(i - add) {
+                    let (a, b) = words::words(&h.lines[del + k].text, &h.lines[add + k].text);
+                    h.lines[del + k].changes = a.into_iter().collect();
+                    h.lines[add + k].changes = b.into_iter().collect();
                 }
             }
         }
@@ -314,9 +401,9 @@ pub(crate) fn columns(line: &str) -> u32 {
     line.chars().fold(0, |col, c| if c == '\t' { col + 4 - col % 4 } else { col + 1 })
 }
 
-/// Hunks of `old` to `new` with [`CONTEXT`] lines around each change, merged when their
+/// Hunks of `old` to `new` with `context` lines around each change, merged when their
 /// context would touch.
-fn hunks(old: &Source, new: &Source) -> Vec<Hunk> {
+fn hunks(old: &Source, new: &Source, context: u32) -> Vec<Hunk> {
     // Intern lines; a last line without its break differs from the same text with one.
     let mut ids: HashMap<(&str, bool), u32> = HashMap::new();
     let (a, b) = (intern(old, &mut ids), intern(new, &mut ids));
@@ -352,7 +439,7 @@ fn hunks(old: &Source, new: &Source) -> Vec<Hunk> {
     let mut groups: Vec<Vec<(Range<u32>, Range<u32>)>> = Vec::new();
     for c in changes {
         match groups.last_mut().and_then(|g| g.last().cloned().map(|l| (g, l))) {
-            Some((g, last)) if c.0.start - last.0.end <= 2 * CONTEXT => g.push(c),
+            Some((g, last)) if c.0.start - last.0.end <= 2 * context => g.push(c),
             _ => groups.push(vec![c]),
         }
     }
@@ -361,10 +448,10 @@ fn hunks(old: &Source, new: &Source) -> Vec<Hunk> {
         .into_iter()
         .map(|g| {
             let (first, last) = (&g[0], &g[g.len() - 1]);
-            let start = first.0.start.saturating_sub(CONTEXT);
+            let start = first.0.start.saturating_sub(context);
             let shift = first.0.start - start;
             let (os, ns) = (start, first.1.start - shift);
-            let end_old = (last.0.end + CONTEXT).min(old.len());
+            let end_old = (last.0.end + context).min(old.len());
             let mut lines = Vec::new();
             let (mut i, mut j) = (os, ns);
             for c in &g {
@@ -809,9 +896,9 @@ mod tests {
     #[test]
     fn languages_come_from_the_extension() {
         let f = |p: &str| FileDiff::from_texts(p, "", "x").language().map(str::to_owned);
-        assert_eq!(f("src/lib.rs").as_deref(), Some("rs"));
+        assert_eq!(f("src/lib.rs").as_deref(), Some("rust"));
         assert_eq!(f("web/App.tsx").as_deref(), Some("tsx"));
         assert_eq!(f(".gitignore"), None);
-        assert_eq!(f("Makefile").as_deref(), Some("Makefile"));
+        assert_eq!(f("Makefile").as_deref(), Some("makefile"));
     }
 }

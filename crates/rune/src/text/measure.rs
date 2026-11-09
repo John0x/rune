@@ -79,6 +79,17 @@ pub(super) fn note_fonts(fonts: &[&'static [u8]], families: (&str, &str)) {
     with_state(|slot| apply_fonts(slot, fonts, families));
 }
 
+/// Called when a web app's full faces arrive: the next measurement shapes with them.
+#[cfg(all(target_arch = "wasm32", feature = "embedded-fonts"))]
+pub(super) fn note_faces_arrived() {
+    with_state(|slot| {
+        if let Some(f) = slot.as_mut() {
+            f.generation += 1;
+            f.fonts_generation = f.generation;
+        }
+    });
+}
+
 /// Called by [`TextSystem::set_families`]; the next measurement uses these families.
 pub(super) fn note_families(sans: &str, mono: &str) {
     with_state(|slot| {
@@ -162,7 +173,8 @@ pub fn with_families(sans: &str, mono: &str) -> FamiliesGuard {
 
 /// The size in points of `text` (with `spans`, as [`crate::rich`] takes them) set in `style`,
 /// wrapped at `max_width` points when given, as the runtime will lay it out. Widths round up
-/// to whole points. `max_width: Some(0.0)` gives the widest unbreakable run (CSS min-content).
+/// to whole points; heights are the lines' own, as a text lays out unless it asks for
+/// [`El::rounded_lines`](crate::El::rounded_lines). `max_width: Some(0.0)` gives the widest unbreakable run (CSS min-content).
 ///
 /// The first call on a thread loads the fonts (a few milliseconds); later calls cost a hash
 /// lookup when the same text was measured recently, or one shaping pass when not.
@@ -182,7 +194,20 @@ pub fn measure_with(
 ) -> (f32, f32) {
     with_text(|t| {
         let l = t.layout_rich_with(text, spans, style, 1.0, max_width, options);
-        (l.full_width().ceil(), super::layout_height(&l, style, 1.0))
+        // Spaces hanging past a wrapped line's end take no room, as the runtime measures them.
+        let w = if max_width.is_some() { l.width() } else { l.full_width() };
+        (w.ceil(), super::line_metrics::spec_height(&l, style, 1.0, true))
+    })
+}
+
+/// CSS's min-content and max-content widths of `text` (with `spans`) in `style`, in points and
+/// unrounded, as a browser's automatic table layout reads a cell: its widest unbreakable run,
+/// and its width on one line, neither counting the spaces that end a line.
+pub fn content_widths(text: &str, spans: &[Span], style: TextStyle) -> (f32, f32) {
+    with_text(|t| {
+        let min = t.layout_rich_with(text, spans, style, 1.0, Some(0.0), RichLayoutOptions::default()).width();
+        let max = t.layout_rich_with(text, spans, style, 1.0, None, RichLayoutOptions::default()).width();
+        (min, max)
     })
 }
 

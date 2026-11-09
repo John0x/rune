@@ -85,7 +85,8 @@ pub struct WindowOptions {
     pub min_size: Option<(f32, f32)>,
     /// Logical maximum content size. None leaves it unconstrained.
     pub max_size: Option<(f32, f32)>,
-    /// Whether the user can resize the window. Programmatic sizing is unaffected.
+    /// Whether the user can resize the window. Programmatic sizing is unaffected. A window
+    /// that isn't resizable doesn't maximize either: its maximize (zoom) button is disabled.
     pub resizable: bool,
 }
 
@@ -139,13 +140,15 @@ impl WindowOptions {
 
     pub(crate) fn attributes(&self, title: &str, size: (f32, f32), app_min: Option<(f32, f32)>, visible: bool) -> winit::window::WindowAttributes {
         use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-        use winit::window::{Window, WindowLevel};
+        use winit::window::{Window, WindowButtons, WindowLevel};
         let (min, _) = self.size_limits(app_min);
+        let buttons = if self.resizable { WindowButtons::all() } else { WindowButtons::all() - WindowButtons::MAXIMIZE };
         let mut attrs = Window::default_attributes()
             .with_title(title)
             .with_inner_size(LogicalSize::new(size.0, size.1))
             .with_min_inner_size(LogicalSize::new(min.0, min.1))
             .with_resizable(self.resizable)
+            .with_enabled_buttons(buttons)
             .with_transparent(self.transparent)
             .with_decorations(!self.borderless)
             .with_visible(visible)
@@ -245,6 +248,8 @@ impl<S> WindowSpec<S> {
     }
     /// Configure this window's frame, including headless traffic-light placement.
     pub fn chrome(mut self, chrome: crate::Chrome) -> Self { self.app = self.app.chrome(chrome); self }
+    /// This window draws its own titlebar, like `App::titlebar`.
+    pub fn titlebar(mut self, titlebar: crate::Titlebar) -> Self { self.app = self.app.titlebar(titlebar); self }
     /// Composite this window's translucent fills, blurs, shadows, images and video in sRGB
     /// (gamma) space instead of linear light, matching CSS and Core Animation. With a
     /// `Compositor`, `Frame::srgb_blend` says which encoding its passes must match.
@@ -252,10 +257,13 @@ impl<S> WindowSpec<S> {
     /// This window's font smoothing (`App::font_smoothing`).
     pub fn font_smoothing(mut self, mode: crate::FontSmoothing) -> Self { self.app = self.app.font_smoothing(mode); self }
     pub fn on_focus(mut self, f: fn(&mut S, bool, &mut crate::Tx)) -> Self { self.app = self.app.on_focus(f); self }
+    pub fn on_modifiers(mut self, f: fn(&mut S, crate::Mods, &mut crate::Tx)) -> Self { self.app = self.app.on_modifiers(f); self }
     /// This window's editor's input method events, like `App::on_ime`.
     pub fn on_ime(mut self, f: fn(&mut S, &crate::Ime, &mut crate::Tx) -> bool) -> Self { self.app = self.app.on_ime(f); self }
     /// This window's playground, like `App::playground`.
     pub fn playground(mut self, playground: crate::Playground<S>) -> Self { self.app = self.app.playground(playground); self }
+    /// Runs in this window when the app starts to quit, like `App::on_quit`.
+    pub fn on_quit(mut self, f: fn(&mut S, &mut crate::Tx)) -> Self { self.app = self.app.on_quit(f); self }
     /// Runs when the app is reopened, like `App::on_reopen`.
     pub fn on_reopen(mut self, f: fn(&mut S, bool, &mut crate::Tx) -> bool) -> Self { self.app = self.app.on_reopen(f); self }
     /// Receives links opened with the app, like `App::on_open_url`.
@@ -295,6 +303,54 @@ impl<S> WindowSpec<S> {
 impl<S: 'static> WindowSpec<S> {
     /// Erase the state type, so one factory can return windows of different state types.
     pub fn boxed(self) -> AnyWindowSpec { self.into() }
+    /// Open this window without taking focus from the window that has it, such as a window a
+    /// tab is dragged into while the press stays with its strip. A later `open` or `focus`
+    /// activates it.
+    pub fn inactive(mut self) -> Self { self.app = self.app.open_inactive(); self }
+    /// Open this window maximized, like `App::maximized`.
+    pub fn maximized(mut self, maximized: bool) -> Self { self.app = self.app.maximized(maximized); self }
+}
+
+thread_local! {
+    /// Windows [`open_window`] asked for, which the event loop starts at the end of its turn.
+    static OPENED: std::cell::RefCell<Vec<AnyWindowSpec>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Opens another window in the running app's event loop, with its own state, retained tree,
+/// focus and clocks, as the windows a `run_windows` factory returns do: a second document
+/// window, or a tab dragged out of its strip. Call it on the UI thread (a handler, an update,
+/// `on_ready`); the window starts at the end of the turn. It keeps the app running as the
+/// factory's windows do, so the app ends when the last of them closes. Its key must differ
+/// from every open window's; a window with a key already open isn't opened. The handle places,
+/// focuses and closes it, and its requests wait for it to start. Headless runs open nothing.
+pub fn open_window<S: 'static>(spec: WindowSpec<S>) -> crate::WindowHandle {
+    let handle = crate::WindowHandle::new(&spec.key);
+    if !crate::is_headless() {
+        let opened = AnyWindowSpec(Box::new(Erased { spec, handle: Some(handle.clone()), secondary: false }));
+        OPENED.with(|o| o.borrow_mut().push(opened));
+    }
+    handle
+}
+
+/// The windows `open_window` queued since the last call.
+pub(crate) fn take_opened() -> Vec<AnyWindowSpec> {
+    OPENED.with(|o| std::mem::take(&mut *o.borrow_mut()))
+}
+
+/// A window's place on the desktop, in physical pixels: what to save to reopen it there.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WindowPlacement {
+    /// The frame's top-left, the space `WindowOptions::position` takes.
+    pub position: (i32, i32),
+    /// The content's top-left.
+    pub content_position: (i32, i32),
+    /// The content's size, the space `WindowOptions::physical_size` takes.
+    pub content_size: (u32, u32),
+    /// Physical pixels per point on the window's display.
+    pub scale: f64,
+    pub maximized: bool,
+    pub minimized: bool,
+    pub full_screen: bool,
 }
 
 /// A `WindowSpec` of any state type, for factories that mix them:

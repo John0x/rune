@@ -57,14 +57,31 @@ export function assignLink(href) {
 // `url` (relative to the page) decoded by the browser's own codecs, which run off the main
 // thread: `[width, height, rgba]` with straight-alpha sRGB RGBA bytes, upright by EXIF. SVG comes
 // back as `[0, 0, bytes]` for Rune to rasterize. Images over `maxSide` a side are refused
-// before their pixels are read.
+// before their pixels are read. It resolves in a task of its own, so Rune's work on one image
+// (its mips) never runs in the same long task as another's or a frame's.
 export async function fetchImage(url, maxSide) {
+    const reply = await readImage(url, maxSide);
+    await nextTask();
+    return reply;
+}
+
+async function readImage(url, maxSide) {
     const response = await fetch(new URL(url, document.baseURI));
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const blob = await response.blob();
     const type = (response.headers.get('content-type') || blob.type).split(';')[0].trim().toLowerCase();
     const path = response.url ? new URL(response.url).pathname : '';
     if (type === 'image/svg+xml' || /\.svgz?$/i.test(path)) return [0, 0, new Uint8Array(await blob.arrayBuffer())];
+    return blobRgba(blob, maxSide);
+}
+
+export async function decodeImage(bytes, maxSide) {
+    const reply = await blobRgba(new Blob([bytes]), maxSide);
+    await nextTask();
+    return reply;
+}
+
+async function blobRgba(blob, maxSide) {
     const bitmap = await createImageBitmap(blob, { imageOrientation: 'from-image', colorSpaceConversion: 'default' });
     try {
         const { width, height } = bitmap;
@@ -79,10 +96,54 @@ export async function fetchImage(url, maxSide) {
     }
 }
 
+export function objectUrl(bytes, type) {
+    return URL.createObjectURL(new Blob([bytes], { type }));
+}
+
+export function revokeUrl(url) {
+    URL.revokeObjectURL(url);
+}
+
+// Sets `canvas`'s CSS cursor, or clears it when `css` is empty. Safari reads `image-set()` in a
+// cursor only with its `-webkit-` prefix.
+export function setCursor(canvas, css) {
+    if (!css) return void canvas.style.removeProperty('cursor');
+    canvas.style.cursor = css;
+    if (!canvas.style.cursor) canvas.style.cursor = `-webkit-${css}`;
+}
+
+export function browserPlatform() {
+    const nav = globalThis.navigator;
+    return nav ? (nav.userAgentData?.platform || nav.platform || '') : undefined;
+}
+
+export function touchPoints() {
+    return globalThis.navigator?.maxTouchPoints || 0;
+}
+
+export function nextTask() {
+    return globalThis.scheduler?.yield ? globalThis.scheduler.yield() : new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+export async function fetchBytes(url) {
+    const response = await fetch(new URL(url, document.baseURI));
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return new Uint8Array(await response.arrayBuffer());
+}
+
+export function resolveUrl(url, base) {
+    return new URL(url, base).href;
+}
+
 export function viewport(canvas, callback, embedded) {
     const probe = document.createElement('div');
     probe.style.cssText = 'position:fixed;visibility:hidden;pointer-events:none;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)';
     document.body.append(probe);
+    // The largest viewport: on iOS Safari `100lvh` is the viewport with the toolbar collapsed, so
+    // a canvas or band sized from it doesn't change as the toolbar comes and goes mid-scroll.
+    const largest = document.createElement('div');
+    largest.style.cssText = 'position:fixed;top:0;left:0;width:0;height:100lvh;visibility:hidden;pointer-events:none';
+    document.body.append(largest);
     const update = () => {
         if (!embedded) {
             const v = window.visualViewport;
@@ -92,7 +153,8 @@ export function viewport(canvas, callback, embedded) {
             canvas.style.top = `${v?.offsetTop ?? 0}px`;
         }
         const s = getComputedStyle(probe);
-        callback(JSON.stringify({ kind: 'viewport', insets: embedded ? [0, 0, 0, 0] : [s.paddingTop, s.paddingRight, s.paddingBottom, s.paddingLeft].map(parseFloat) }));
+        callback(JSON.stringify({ kind: 'viewport', h: largest.offsetHeight || innerHeight,
+            insets: embedded ? [0, 0, 0, 0] : [s.paddingTop, s.paddingRight, s.paddingBottom, s.paddingLeft].map(parseFloat) }));
     };
     const motion = matchMedia('(prefers-reduced-motion: reduce)');
     const reduced = () => callback(JSON.stringify({ kind: 'motion', reduced: motion.matches }));
@@ -128,5 +190,6 @@ export function viewport(canvas, callback, embedded) {
         window.removeEventListener('blur', focus);
         document.removeEventListener('visibilitychange', visibility);
         probe.remove();
+        largest.remove();
     };
 }

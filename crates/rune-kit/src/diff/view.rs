@@ -15,6 +15,10 @@ use crate::Kit;
 use crate::palette::tint;
 use crate::syntax::SyntaxTheme;
 
+mod line_info;
+
+pub use line_info::FoldRow;
+
 static EXPAND_UP: Icon = Icon {
     name: "kit-diff-expand-up",
     view: 16.0,
@@ -60,6 +64,7 @@ pub struct DiffView<S> {
     get: Get<S>,
     get_mut: GetMut<S>,
     key: String,
+    fold_row: FoldRow,
     annotation: Option<Rc<dyn Fn(&S, &Annotation) -> El>>,
     header: Option<Rc<dyn Fn(&S, usize) -> El>>,
     on_select: Option<Rc<dyn Fn(&mut S, Option<LineRange>, &mut Tx)>>,
@@ -73,6 +78,7 @@ impl<S: 'static> DiffView<S> {
             get: Rc::new(get),
             get_mut: Rc::new(get_mut),
             key: "diff".into(),
+            fold_row: FoldRow::default(),
             annotation: None,
             header: None,
             on_select: None,
@@ -84,6 +90,13 @@ impl<S: 'static> DiffView<S> {
     /// The view's element key (`"diff"` by default); give each diff in a window its own.
     pub fn key(mut self, key: impl Into<String>) -> Self {
         self.key = key.into();
+        self
+    }
+
+    /// How folded unchanged lines draw: [`FoldRow::Summary`] by default, or Pierre's
+    /// [`FoldRow::LineInfo`] as OpenCode Desktop's review has them.
+    pub fn fold_row(mut self, fold_row: FoldRow) -> Self {
+        self.fold_row = fold_row;
         self
     }
 
@@ -169,6 +182,11 @@ struct Look {
     font: TextStyle,
     label: TextStyle,
     small: TextStyle,
+    /// [`FoldRow::LineInfo`]'s count: the interface face at the code's size, on the row's height.
+    separator_text: TextStyle,
+    /// [`FoldRow::LineInfo`]'s row: the background 2% toward black, 5% toward white in dark
+    /// (OpenCode's `--diffs-bg-separator-override`).
+    separator: Color,
     /// The advance of a mono column.
     adv: f32,
     bg: Color,
@@ -223,6 +241,8 @@ impl Look {
             font,
             label: TextStyle { size: 13.0, line_height: 20.0, ..k.ty.ui_medium },
             small: TextStyle { size: 12.0, line_height: 16.0, ..k.ty.mono },
+            separator_text: TextStyle { size: font.size, line_height: GAP_H, ..k.ty.ui },
+            separator: tint(bg, if dark { c.white } else { Color::BLACK }, if dark { 0.05 } else { 0.02 }),
             adv: 0.6 * font.size,
             bg,
             text: c.text_base,
@@ -336,7 +356,10 @@ impl<S: 'static> View<S> {
         match r {
             Row::File(f) => self.file_header(s, st, f as usize, false),
             Row::Note(f) => memo(key, (self.look.version, st.rev, st.view_width().to_bits()), || self.note(st, f as usize)),
-            Row::Gap { f, gap } => memo(key, (self.look.version, st.rev, st.view_width().to_bits()), || self.gap(st, f as usize, gap as usize)),
+            Row::Gap { f, gap } => memo(key, (self.look.version, st.rev, st.view_width().to_bits(), self.d.fold_row), || match self.d.fold_row {
+                FoldRow::Summary => self.gap(st, f as usize, gap as usize),
+                FoldRow::LineInfo => self.line_info(st, f as usize, gap as usize),
+            }),
             _ if !st.annotations().is_empty() && self.d.annotation.is_some() && self.annotated(st, r) => self.line(s, st, i),
             _ => {
                 let version = (self.look.version, st.rev, st.row_selected(i, None), st.copy_side(), st.selection().map(|s| s.start.side));
@@ -410,14 +433,20 @@ impl<S: 'static> View<S> {
                 out = out.child(c.children(all.map(|a| note(build(s, a), a))));
             }
             DiffMode::Split => {
+                let single = st.single_column(f);
                 let half = |key: &'static str, els: Vec<El>| {
-                    let mut c = col().key(key).w_frac(0.5).min_w(0.0);
-                    if let Some(w) = self.view_w(st, true) {
+                    let mut c = col().key(key).w_frac(if single.is_some() { 1.0 } else { 0.5 }).min_w(0.0);
+                    if let Some(w) = self.view_w(st, single.is_none()) {
                         c = c.max_w(w);
                     }
                     c.children(els)
                 };
-                out = out.child(row().key("notes").w_full().items_start().child(half("old", old)).child(half("new", new)));
+                let notes = row().key("notes").w_full().items_start();
+                out = out.child(match single {
+                    Some(Side::Old) => notes.child(half("old", old)),
+                    Some(Side::New) => notes.child(half("new", new)),
+                    None => notes.child(half("old", old)).child(half("new", new)),
+                });
             }
         }
         out
@@ -469,10 +498,11 @@ impl<S: 'static> View<S> {
 
     fn split<'a>(&self, st: &'a DiffState, i: usize, f: usize, old: Option<Cell<'a>>, new: Option<Cell<'a>>) -> El {
         let digits = st.digits(f);
+        let single = st.single_column(f);
         let half = |side: Side, c: Option<Cell<'a>>| -> El {
             let l = &self.look;
             let key = if side == Side::Old { "old" } else { "new" };
-            let mut h = row().key(key).w_frac(0.5).min_w(0.0).min_h(LINE_H).items_start().self_stretch();
+            let mut h = row().key(key).w_frac(if single.is_some() { 1.0 } else { 0.5 }).min_w(0.0).min_h(LINE_H).items_start().self_stretch();
             let Some(c) = c else {
                 return h.fill(l.empty_bg);
             };
@@ -500,8 +530,16 @@ impl<S: 'static> View<S> {
             }
             h
         };
-        let divider = col().key("divider").w(1.0).self_stretch().fill(self.look.border);
-        row().w_full().min_h(LINE_H).items_stretch().child(half(Side::Old, old)).child(divider).child(half(Side::New, new))
+        let line = row().w_full().min_h(LINE_H).items_stretch();
+        // An added or deleted file has one side: it takes the whole width, as one column.
+        match single {
+            Some(Side::Old) => line.child(half(Side::Old, old)),
+            Some(Side::New) => line.child(half(Side::New, new)),
+            None => {
+                let divider = col().key("divider").w(1.0).self_stretch().fill(self.look.border);
+                line.child(half(Side::Old, old)).child(divider).child(half(Side::New, new))
+            }
+        }
     }
 
     fn bar(&self, kind: LineKind) -> El {

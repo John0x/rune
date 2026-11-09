@@ -62,18 +62,22 @@ impl<S: 'static> Runtime<S> {
     /// are left out, since a commit rebuilds them from the view and the next latch sets them.
     #[cfg(debug_assertions)]
     pub(super) fn view_print(&self) -> ViewPrint {
-        let live_fill = |n: &Node| n.live.iter().any(|b| b.property == crate::live::Property::Fill);
         ViewPrint(self.nodes.iter()
             // Retained exits can disappear between commits without a model change.
             .filter(|n| !self.is_exiting(n.id))
-            .map(|n| NodePrint {
-                path: n.path.clone(),
-                target: n.target,
-                fill: (!live_fill(n)).then_some(n.vis.fill),
-                border: (n.vis.border, n.vis.border_width),
-                opacity: n.vis.opacity,
-                radius: n.vis.radius,
-                text: n.text.clone(),
+            .map(|n| {
+                let live = super::paint_tracks::live_colors(n);
+                let mut text = n.text.clone();
+                if live.text && let Some(t) = &mut text { t.color = Color::TRANSPARENT; }
+                NodePrint {
+                    path: n.path.clone(),
+                    target: n.target,
+                    fill: (!live.fill).then_some(n.vis.fill),
+                    border: (if live.border { Color::TRANSPARENT } else { n.vis.border() }, n.vis.border_width()),
+                    opacity: n.vis.opacity,
+                    radius: n.vis.radii(),
+                    text,
+                }
             })
             .collect())
     }
@@ -220,7 +224,10 @@ impl NodePrint {
             ("text", |t| key(|h| t.live.is_none().then_some(&t.content).hash(h)), Some(snippet)),
             ("text colour", |t| key(|h| rgba(t.color).hash(h)), Some(|t| colour(t.color))),
             ("text style", |t| key(|h| bits(&[t.style.size, t.style.weight]).hash(h)), Some(|t| format!("{:.1}pt weight {}", t.style.size, t.style.weight))),
-            ("pills", |t| key(|h| for p in &t.pills { (p.start, p.end, p.icon.map(|i| i.name), p.bg, p.fg).hash(h) }), None),
+            ("pills", |t| key(|h| for p in &t.pills {
+                (p.start, p.end, p.icon.map(|i| i.name), p.bg, p.fg).hash(h);
+                p.bare.as_ref().map(|b| (b.size.to_bits(), b.gap.to_bits(), b.radius.to_bits(), b.image.as_ref().map(crate::pixels::Pixels::signature))).hash(h);
+            }), None),
             ("rings", |t| key(|h| for &(a, b, c, w) in &t.rings { (a, b, c, w.to_bits()).hash(h) }), None),
             ("strikes", |t| key(|h| t.strikes.hash(h)), None),
             ("highlights", |t| key(|h| for hl in &t.highlights {

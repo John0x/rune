@@ -7,6 +7,8 @@ use super::*;
 pub(super) struct Launches {
     pending: Vec<(String, [f32; 2])>,
     flying: Vec<Launched>,
+    /// `El::matched` flights started under `Tx::unclipped_flights`, until they land.
+    unclipped: Vec<NodeId>,
 }
 
 /// A launch in the air, the offsets outside the scene it was started against, the ones its
@@ -26,8 +28,12 @@ struct Launched {
 impl Launches {
     pub(super) fn pending(&self) -> bool { !self.pending.is_empty() }
 
-    /// Draws outside every clip, at its own size, until it lands.
-    pub(super) fn flying(&self, id: NodeId) -> bool { self.flying.iter().any(|l| l.id == id) }
+    /// Draws outside every clip until it lands: a launch, at its own size, or an unclipped
+    /// matched flight.
+    pub(super) fn flying(&self, id: NodeId) -> bool { self.launched(id) || self.unclipped.contains(&id) }
+
+    /// A launch in the air, which flies at its own size.
+    pub(super) fn launched(&self, id: NodeId) -> bool { self.flying.iter().any(|l| l.id == id) }
 
     /// Before its destination's layout moves mid-flight and its path restarts from where it is
     /// drawn: the offset and velocity outside the scene its last frame drew it with, which the
@@ -63,6 +69,7 @@ impl Launches {
     /// Drops launches that landed (left `flying`).
     pub(super) fn keep(&mut self, flying: &[(NodeId, MRect)]) {
         self.flying.retain(|l| flying.iter().any(|f| f.0 == l.id));
+        self.unclipped.retain(|id| flying.iter().any(|f| f.0 == *id));
     }
 
     /// A launch leaves from where its source was seen and flies to where its destination is
@@ -189,8 +196,18 @@ impl<S: 'static> Runtime<S> {
                 self.scene.set(to, prop::OPACITY, o);
                 self.scene.animate(to, prop::OPACITY, nodes[i].vis.opacity, spring);
             }
+            // Its content mounted with it and flies as part of what was seen, so none of it fades
+            // in on its own (each fresh level under a present parent otherwise would).
+            for j in i + 1..nodes.len() {
+                if !std::iter::successors(nodes[j].parent, |&p| nodes[p].parent).any(|p| p == i) { break; }
+                self.scene.enter_now(nodes[j].id);
+            }
             self.flying.retain(|f| f.0 != to);
             self.flying.push((to, nodes[i].local));
+            self.launches.unclipped.retain(|&id| id != to);
+            if tx.unclipped_flights {
+                self.launches.unclipped.push(to);
+            }
         }
     }
 
@@ -206,7 +223,10 @@ impl<S: 'static> Runtime<S> {
         if rect.w <= 0.0 || clip[2] <= clip[0] || clip[3] <= clip[1] { return; }
         self.glyph_scratch.clear();
         self.text.set_glyph_inks(spec.color, &[]);
+        // From outlines where text draws them, which a flight's zoom magnifies without blurring.
+        self.text.set_emit(self.text.moving_emit());
         self.text.glyphs_for_layout(layout, scale, [origin[0] * scale, origin[1] * scale], false, &mut self.glyph_scratch);
+        self.text.set_emit(crate::text::outline::Emit::Atlas);
         let color = spec.color;
         let srgb = self.srgb_blend;
         // Colour glyphs live in the image atlas, which may move them before the flight ends.

@@ -5,7 +5,7 @@ A Rust GPU UI framework (wgpu, winit) for apps that feel like SwiftUI on iOS at 
 
 ## Layout
 
-- `crates/rune`: layout, runtime, renderer, windows, overlays, dev tooling. `crates/rune-kit`: components. `crates/rune-mermaid`: Mermaid diagrams (flowcharts, sequence and state diagrams). `crates/rune-motion`: springs and transitions. `crates/rune-fx`, `crates/rune-light`: effects. `crates/rune-ref`: reference renderer. `crates/procwatch`: an app's own memory and CPU (footprint, counting allocator, gauges, warnings, loopback JSON); libc only, no Rune dependency.
+- `crates/rune`: layout, runtime, renderer, windows, overlays, dev tooling. `crates/rune-kit`: components. `crates/rune-mermaid`: Mermaid diagrams (flowcharts, sequence and state diagrams). `crates/rune-i18n`: message catalogs generated from JSON, CLDR plurals and numbers, the system's languages. `crates/rune-motion`: springs and transitions. `crates/rune-fx`, `crates/rune-light`: effects. `crates/rune-ref`: reference renderer. `crates/procwatch`: an app's own memory and CPU (footprint, counting allocator, gauges, warnings, loopback JSON); libc only, no Rune dependency.
 - `examples/`: apps and labs. `themes/`: themes. `site/`: the docs site (see `site/README.md`).
 - `PLAN.md`: direction and milestones. `research/`: notes behind decisions. `demo/`: images the docs show.
 
@@ -27,6 +27,11 @@ A Rust GPU UI framework (wgpu, winit) for apps that feel like SwiftUI on iOS at 
 - A feature owns its state, keys and registrations so it plugs in with one line. New runtime state goes in the owning subsystem's struct, not a flat `Runtime` field.
 - In `lib.rs`, keep `mod` and `pub use` lists one item per line, sorted.
 - Apps build these types as literals, so adding a pub field breaks them: `AppSpec`, `Env`, `Elevation`, `PaletteSeed`, `OverlaySpec`, `TextStyle`, `RunOptions`, `ScrollSpec`, `Span`, `ByteFrame`, `SurfaceDraw`, `LayerSpec`. Add a builder method instead.
+
+## State
+
+- Behaviour with modes or phases (hover delays, drags, IME composition, scroll modes, requests and retries) is an explicit state machine: one `enum State` whose variants carry only the data valid in them, and one `fn step(state: &mut State, event: Event) -> Effects<Effect>` (`rune::machine`) that returns effects instead of performing them. No clusters of booleans, `Option`s and timestamps whose combinations encode the mode.
+- Timers are events: a timed variant stores its `Attempt` and due time on `Tx::clock`/the runtime clock, the caller turns its effect into `Tx::wake_at`, and `poll` (or the runtime's frame) feeds the timer back into `step`. An answer whose attempt the state no longer holds changes nothing.
 
 ## Performance
 

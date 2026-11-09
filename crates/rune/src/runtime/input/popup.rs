@@ -21,6 +21,9 @@ impl<S: 'static> Runtime<S> {
             None => self.trace_event("popup-menu:cancel"),
         }
         let mut one = self.transaction();
+        if let (Some(field), Some(id)) = (request.field, picked) {
+            self.field_menu_pick(*field, id, &mut one);
+        }
         (request.on_pick)(states!(self), picked, &mut one);
         self.latch_requests(&mut one);
         merge(&mut self.pending, one);
@@ -64,7 +67,7 @@ impl<S: 'static> Runtime<S> {
     /// A menu is about to take the mouse: press, capture and hover end now, as if the pointer
     /// left, rather than when it next moves. True when that changed anything.
     pub(crate) fn release_pointer_for_popup(&mut self) -> bool {
-        if self.popups.is_empty() || (self.pointer.is_none() && self.capture.is_none() && self.secondary_capture.is_none()) {
+        if self.popups.is_empty() || (self.pointer.is_none() && !self.pointer_captured()) {
             return false;
         }
         self.cancel_pointer();

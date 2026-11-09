@@ -5,20 +5,26 @@ pub(super) struct Fallback { key: KeyEvent, base: Option<char>, unhandled: Optio
 
 /// What a window does with a logical key no handler took: close or minimize as its title-bar
 /// button would, or run a menu item. A standard ⌘W or ⌘M item, or an app's item marked
-/// `MenuItem::keys_first`, asks for it, so an app's own binding wins.
+/// `MenuItem::keys_first`, asks for it, so an app's own binding wins. On Windows, Alt+Space
+/// opens the window menu.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone)]
-pub(crate) enum Unhandled { Close, Minimize, Menu(std::sync::Arc<dyn Fn() + Send + Sync>) }
+pub(crate) enum Unhandled { Close, Minimize, Menu(std::sync::Arc<dyn Fn() + Send + Sync>), WindowMenu }
 
 impl std::fmt::Debug for Unhandled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self { Self::Close => "Close", Self::Minimize => "Minimize", Self::Menu(_) => "Menu" })
+        f.write_str(match self { Self::Close => "Close", Self::Minimize => "Minimize", Self::Menu(_) => "Menu", Self::WindowMenu => "WindowMenu" })
     }
 }
 
-/// An activation key held down: its physical code (native and physical input) or logical key
-/// (`Runtime::key`), and the focus its first press landed on.
-pub(super) struct HeldKey { physical: Option<PhysicalKeyCode>, key: Option<crate::Key>, focus: Option<String> }
+/// Whether an activation key (Enter, Escape, Space) is held down: its physical code (native and
+/// physical input) or logical key (`Runtime::key`), and the focus its first press landed on.
+#[derive(Default)]
+pub(super) enum Activation {
+    #[default]
+    Up,
+    Held { physical: Option<PhysicalKeyCode>, key: Option<crate::Key>, focus: Option<String> },
+}
 
 impl<S: 'static> Runtime<S> {
     /// Queue physical input without a logical fallback (also useful for headless drivers).
@@ -102,13 +108,12 @@ impl<S: 'static> Runtime<S> {
                 | Code::CapsLock | Code::Fn)) || key.is_some_and(|k| matches!(k, Key::Modifier { .. })) { return false; }
             let activation = physical.is_some_and(|c| matches!(c, Code::Enter | Code::NumpadEnter | Code::Escape | Code::Space))
                 || key.is_some_and(|k| matches!(k, Key::Enter | Key::Escape) || matches!(k, Key::Text(t) if t == " "));
-            self.held = activation.then(|| HeldKey { physical, key: key.cloned(), focus: self.focused.clone() });
+            self.held = if activation { Activation::Held { physical, key: key.cloned(), focus: self.focus.owned() } } else { Activation::Up };
             return false;
         }
-        self.held.as_ref().is_some_and(|held| {
-            let same = match physical { Some(code) => held.physical == Some(code), None => held.key.as_ref() == key };
-            same && held.focus != self.focused
-        })
+        let Activation::Held { physical: held, key: held_key, focus } = &self.held else { return false };
+        let same = match physical { Some(code) => *held == Some(code), None => held_key.as_ref() == key };
+        same && focus.as_deref() != self.focus.path()
     }
     pub(super) fn dispatch_physical(&mut self, event: PhysicalInput, fallback: Option<Fallback>, tx: &mut Tx) -> bool {
         use crate::PhysicalKeyCode as Code;
@@ -121,7 +126,7 @@ impl<S: 'static> Runtime<S> {
                 if !is_mod(key) { self.note_key_down(repeat); }
             }
             PhysicalInput::Key { key, pressed: false, .. } => {
-                if self.held.as_ref().is_some_and(|h| h.physical == Some(key)) { self.held = None; }
+                if matches!(&self.held, Activation::Held { physical, .. } if *physical == Some(key)) { self.held = Activation::Up; }
                 if fallback.is_none() && !is_mod(key) && self.composing() {
                     self.ime_keys_down = self.ime_keys_down.saturating_sub(1);
                 }
@@ -150,7 +155,7 @@ impl<S: 'static> Runtime<S> {
                 ran
             }
             Some(Fallback { key, base, unhandled }) => {
-                if key.key == crate::Key::Command('v') && self.accepts_paste() {
+                if key.edit_command() == Some('v') && self.accepts_paste() {
                     // Capture the target in event order, before another queued click can
                     // change focus. An empty/image clipboard still consumes the command.
                     self.paste_request = Some(self.paste_target());
@@ -165,6 +170,7 @@ impl<S: 'static> Runtime<S> {
                         Some(Unhandled::Close) => one.close_window(),
                         Some(Unhandled::Minimize) => one.minimize(),
                         Some(Unhandled::Menu(run)) => run(),
+                        Some(Unhandled::WindowMenu) => self.request_window_menu(),
                         None => {}
                     }
                     fold_live(&mut live, ran || fell, &one);
@@ -174,12 +180,28 @@ impl<S: 'static> Runtime<S> {
             }
             None => false,
         };
+        let ran = self.dispatch_mods(tx, &mut live) || ran;
         tx.live_only = ran && live == Some(true);
         ran
     }
+    /// `App::on_modifiers`, when the held modifiers changed since it last heard them.
+    fn dispatch_mods(&mut self, tx: &mut Tx, live: &mut Option<bool>) -> bool {
+        let Some(f) = self.on_mods.filter(|_| self.held_mods != self.mods_heard) else { return false };
+        self.mods_heard = self.held_mods;
+        let mut one = self.transaction();
+        let state = match &mut self.playground {
+            Some(playground) => playground.key_state(&mut self.state),
+            None => Some(&mut self.state),
+        };
+        let Some(state) = state else { return false };
+        f(state, self.mods_heard, &mut one);
+        fold_live(live, true, &one);
+        merge(tx, one);
+        true
+    }
     /// The focused element's `on_physical_input` handler; true if it consumed `event`.
     fn offer_physical(&mut self, event: &PhysicalInput, tx: &mut Tx, live: &mut Option<bool>) -> bool {
-        let Some(handler) = self.focused.as_deref().and_then(|p| self.node(p))
+        let Some(handler) = self.focus.path().and_then(|p| self.node(p))
             .and_then(|n| n.focus.physical.clone()) else { return false };
         let mut one = Tx { key_repeat: matches!(event, PhysicalInput::Key { repeat: true, .. }), ..self.transaction() };
         let consumed = Tx::took(handler(states!(self), event, &mut one), &mut one);

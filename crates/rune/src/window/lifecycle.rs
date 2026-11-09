@@ -48,7 +48,7 @@ impl<S: 'static> Host<S> {
         self.idle = true;
         self.native_handle.native.number.store(native_window_number(&w.window).unwrap_or(0), Ordering::Release);
         if !built { self.rt.settle_all(); }
-        w.window.request_redraw();
+        w.request_redraw();
     }
 
     /// A hidden or released window that fits its content builds what changed while it was
@@ -104,6 +104,9 @@ impl<S: 'static> Host<S> {
         // The next frame polls for the wake.
         if wake && !quiet { self.rt.cancel_timer_frame(); }
         if requests.quit {
+            // Quitting from now on: a close later in this turn closes for the quit.
+            // `Windows::exiting` carries out its effects.
+            let _ = crate::quit::send(crate::quit::Event::Start { ending: false });
             // A tracking menu holds the event loop until it ends.
             self.popup.cancel(&mut self.rt);
             self.file_dialog.cancel(&mut self.rt);
@@ -139,7 +142,7 @@ impl<S: 'static> Host<S> {
                 self.shell(event_loop);
                 true
             }
-            Some(w) => { w.window.request_redraw(); true }
+            Some(w) => { w.request_redraw(); true }
         };
         // Neither a poll nor a frame comes to schedule the updates' `wake_after`s.
         if !polled && !framed { self.rt.schedule_pending_wakes(); }
@@ -169,7 +172,7 @@ impl<S: 'static> Host<S> {
         let now_due = self.hidden_launcher_renders();
         let Some(w) = &mut self.win else { return false };
         let render = now_due || w.first_frame.deadline.is_some() || w.hidden_pace.changed(Instant::now());
-        if render { w.window.request_redraw(); }
+        if render { w.request_redraw(); }
         render
     }
 
@@ -183,10 +186,26 @@ impl<S: 'static> Host<S> {
     /// opens the pop-up menu it asked for, if the window is still there to open it over.
     pub(super) fn shell(&mut self, event_loop: &ActiveEventLoop) {
         self.show_title();
+        if self.rt.take_toggle_maximized() && let Some(w) = self.win.as_ref().filter(|w| w.visible) {
+            chrome::toggle_maximized(&w.window);
+        }
+        if self.rt.take_toggle_full_screen() && let Some(w) = self.win.as_ref().filter(|w| w.visible) {
+            chrome::toggle_full_screen(&w.window);
+        }
+        if let Some(menu) = self.rt.take_window_menu() && let Some(w) = self.win.as_ref().filter(|w| w.visible) {
+            chrome::window_menu(&w.window, menu, None);
+        }
+        // A new `Cx::set_titlebar` or `Cx::titlebar_height` resizes the caption buttons and the band
+        // the frame hit-tests, and moves the traffic lights.
+        if self.rt.take_titlebar_changed() && let Some(w) = &self.win {
+            sync_chrome(&mut self.rt, w, self.chrome, self.titlebar);
+            if self.rt.stale() { w.request_redraw(); }
+        }
         for _ in 0..8 {
             let minimize = std::mem::take(&mut self.rt.minimize_request);
             match self.rt.shell_request.take() {
                 Some(Shell::Quit) => {
+                    let _ = crate::quit::send(crate::quit::Event::Start { ending: false });
                     self.popup.cancel(&mut self.rt);
                     self.file_dialog.cancel(&mut self.rt);
                     event_loop.exit();
@@ -208,8 +227,8 @@ impl<S: 'static> Host<S> {
             }
             let shown = self.win.as_ref().filter(|w| w.visible);
             let window = shown.map(|w| &w.window);
-            if self.popup.open(&mut self.rt, window, paints) && let Some(w) = window { w.request_redraw(); }
-            if self.file_dialog.open(&mut self.rt, window.map(|w| &**w)) && let Some(w) = window { w.request_redraw(); }
+            if self.popup.open(&mut self.rt, window, paints) && let Some(w) = shown { w.request_redraw(); }
+            if self.file_dialog.open(&mut self.rt, window.map(|w| &**w)) && let Some(w) = shown { w.request_redraw(); }
             // A callback that ran (a menu that couldn't open) may have asked to close, quit or
             // minimize.
             if self.rt.shell_request.is_none() && !self.rt.minimize_request { return; }
@@ -303,7 +322,7 @@ impl<S: 'static> Host<S> {
             w.retry = None;
             w.presented = None;
             // Its hidden frame delivers the focus loss.
-            if launcher { w.window.request_redraw(); }
+            if launcher { w.request_redraw(); }
         }
     }
 
@@ -324,11 +343,13 @@ impl<S: 'static> Host<S> {
         }
         let token = token.or(from_env);
         let Some(w) = self.win.as_mut() else {
-            self.create(event_loop, token, true);
+            // `App::open_inactive`: the first open leaves focus where it is.
+            let focus = !(self.open_inactive && !self.shown);
+            self.create(event_loop, token, focus);
             // On macOS a new window becomes key without activating the app, so activate it
             // like a reopen does. The launch open leaves activation to the platform.
             #[cfg(target_os = "macos")]
-            if self.started && let Some(w) = self.win.as_ref().filter(|w| w.visible) { w.focus(); }
+            if focus && self.started && let Some(w) = self.win.as_ref().filter(|w| w.visible) { w.focus(); }
             return;
         };
         if !w.visible {
@@ -359,12 +380,12 @@ impl<S: 'static> Host<S> {
                 // Without a token the compositor may only mark the window urgent.
                 None => w.window.request_user_attention(Some(winit::window::UserAttentionType::Informational)),
             }
-            w.window.request_redraw();
+            w.request_redraw();
             return;
         }
         let _ = token;
         w.focus();
-        w.window.request_redraw();
+        w.request_redraw();
     }
 
     /// Creates the window, or records why it can't be and leaves the app windowless; a later

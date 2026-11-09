@@ -29,6 +29,7 @@ pub mod diff;
 mod feedback;
 mod field;
 pub mod glyphs;
+pub mod image_zoom;
 mod keybind;
 pub mod kit;
 mod list;
@@ -73,7 +74,10 @@ pub use card::Card;
 pub use checkbox::Checkbox;
 pub use collapsible::Collapsible;
 pub use combobox::Combobox;
+pub use combobox::ComboboxEffect;
+pub use combobox::ComboboxEvent;
 pub use combobox::ComboboxOption;
+pub use combobox::ComboboxPhase;
 pub use combobox::ComboboxState;
 pub use dialog::Dialog;
 pub use feedback::Loader;
@@ -81,6 +85,10 @@ pub use feedback::Progress;
 pub use feedback::ProgressCircle;
 pub use feedback::Spinner;
 pub use field::Field;
+pub use image_zoom::ImageZoom;
+pub use image_zoom::Preview;
+pub use image_zoom::Stage;
+pub use image_zoom::StageZoom;
 pub use keybind::Keybind;
 pub use keybind::KeybindVariant;
 pub use kit::Elevation;
@@ -95,10 +103,14 @@ pub use list::List;
 pub use list::ListItem;
 #[cfg(feature = "markdown")]
 pub use markdown::Case;
+#[cfg(feature = "markdown")]
+pub use markdown::{CodeFrame, QuoteFrame};
 #[cfg(feature = "mermaid")]
 pub use markdown::DiagramFrame;
 #[cfg(feature = "markdown")]
 pub use markdown::Highlight;
+#[cfg(feature = "markdown")]
+pub use markdown::ImageFrame;
 #[cfg(feature = "markdown")]
 pub use markdown::Markdown;
 #[cfg(feature = "markdown")]
@@ -138,7 +150,9 @@ pub use shell::SidebarHeader;
 pub use shell::SidebarRow;
 pub use shell::SidebarSection;
 pub use shell::SplitView;
+pub use shell::TabStrip;
 pub use shell::Toolbar;
+pub use shell::WindowTitlebar;
 pub use shortcut_recorder::ShortcutRecorder;
 pub use shortcut_recorder::ShortcutRecorderState;
 pub use shortcut_recorder::shortcut_error_message;
@@ -153,7 +167,11 @@ pub use text_input::TextArea;
 pub use text_input::TextField;
 pub use text_input::TextInput;
 pub use toast::Toast;
+pub use toast::ToastEffect;
+pub use toast::ToastEntry;
+pub use toast::ToastEvent;
 pub use toast::ToastRegion;
+pub use toast::ToastStack;
 pub use tree::FileNode;
 pub use tree::FileTree;
 pub use tree::Tree;
@@ -233,13 +251,18 @@ pub(crate) fn press_over(hover: Color, pressed: Color) -> Color {
     pressed.alpha(a)
 }
 
-/// Source-over of straight-alpha colours (for forced states and static layering).
+/// Source-over of straight-alpha colours (for forced states and static layering), mixed as the
+/// window blends the same layers: in sRGB, as a browser does, in a window that blends in sRGB
+/// (the default), else in linear light.
 pub(crate) fn over(top: Color, bottom: Color) -> Color {
     let a = top.a + bottom.a * (1.0 - top.a);
     if a <= 0.0 {
         return Color::TRANSPARENT;
     }
-    let mix = |t: f32, b: f32| (t * top.a + b * bottom.a * (1.0 - top.a)) / a;
+    let srgb = rune::theme::blends_srgb();
+    let (enc, dec): (fn(f32) -> f32, fn(f32) -> f32) =
+        if srgb { (rune::theme::srgb_encode, rune::theme::srgb_decode) } else { (|c| c, |c| c) };
+    let mix = |t: f32, b: f32| dec((enc(t) * top.a + enc(b) * bottom.a * (1.0 - top.a)) / a);
     Color { r: mix(top.r, bottom.r), g: mix(top.g, bottom.g), b: mix(top.b, bottom.b), a }
 }
 

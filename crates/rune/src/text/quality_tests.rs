@@ -113,7 +113,7 @@ fn pill_chips_keep_room_and_never_overlap_at_wraps() {
         .enumerate()
         .map(|(k, label)| {
             let start = content.find(label).unwrap() as u32;
-            PillChip { start, end: start + label.len() as u32, icon: (k == 1).then_some(&DOT), bg: None, fg: None }
+            PillChip { start, end: start + label.len() as u32, icon: (k == 1).then_some(&DOT), bg: None, fg: None, bare: None }
         })
         .collect();
     let scale = 2.0;
@@ -197,7 +197,7 @@ fn a_pill_wider_than_its_line_wraps_inside_it() {
     let label = "@Migrate config loader to the new schema";
     let content = format!("as in {label} did");
     let start = content.find(label).unwrap() as u32;
-    let pills = [PillChip { start, end: start + label.len() as u32, icon: None, bg: None, fg: None }];
+    let pills = [PillChip { start, end: start + label.len() as u32, icon: None, bg: None, fg: None, bare: None }];
     let scale = 2.0;
     for width in (90..=200).step_by(7) {
         let max = width as f32 * scale;
@@ -368,7 +368,7 @@ fn atlas_capacity_never_overwrites_current_or_pinned_placements() {
 fn atlas_eviction_preserves_cached_empty_outlines() {
     let mut atlas = Atlas::new();
     let key = GlyphKey { font: 0, index: 0, glyph: 0, size: 0, coords: 0, subpx: 0, subpy: 0, dilation: 0, apple: 0, skew: 0 };
-    atlas.map.insert(key, None);
+    atlas.map.insert(key, super::atlas_fill::Residency::Blank);
     atlas.icons.insert((0, 0), None);
     atlas.evict_page(0);
     assert!(atlas.map.contains_key(&key));
@@ -448,7 +448,7 @@ fn four_hundred_scales_never_exhaust_the_atlas_or_poison_glyphs() {
         assert!(sum > 0, "fresh glyph {idx} must have nonzero coverage in page {page}");
     }
     // Whitespace is still cached as `Some(None)` so spaces don't re-enter swash every frame.
-    assert!(text.atlas.map.values().any(|v| v.is_none()), "empty space glyph is cached as None");
+    assert!(text.atlas.map.values().any(|v| v.mask().is_none()), "empty space glyph is cached as None");
 }
 
 #[test]

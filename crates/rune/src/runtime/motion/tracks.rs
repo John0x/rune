@@ -24,7 +24,7 @@ pub(super) fn word_starts(s: &str, from: usize, out: &mut Vec<u32>) {
 pub(super) fn scroll_offsets<'a>(scrolls: &'a HashMap<NodeId, ScrollState>, nodes: &'a [Node], i: usize) -> impl Iterator<Item = [f32; 2]> + 'a {
     std::iter::successors(Some(i), |&p| nodes[p].parent.filter(|_| nodes[p].above.is_none()))
         .skip(1)
-        .filter_map(|p| scrolls.get(&nodes[p].id).map(|st| [st.x.offset as f32, st.offset as f32]))
+        .filter_map(|p| scrolls.get(&nodes[p].id).map(|st| [st.x.shift() as f32, st.offset as f32]))
 }
 
 /// Marks every ancestor of a marked node.
@@ -80,9 +80,12 @@ impl<S: 'static> Runtime<S> {
             let n_rows = stack.order.len();
             let mut st_growing = !stack.pending_heights.is_empty();
             let mut st_moving = st_growing;
+            let (in_runs, run_grown) = Self::step_growth_runs(stack, &mut self.grows, steps.min(240), spec);
+            stack.grown += run_grown;
             for (k, id) in stack.order.iter().enumerate() {
                 let Some(g) = self.grows.get_mut(id) else { continue };
                 let h0 = g.h;
+                let in_run = in_runs.contains(id);
                 if let Some(&at) = stack.closing.get(id)
                     && now >= at
                 {
@@ -94,7 +97,7 @@ impl<S: 'static> Runtime<S> {
                 }
                 // A row above the tail (the last row) carries it.
                 let carrying = k + 2 == n_rows;
-                for substep in 0..steps.min(240) {
+                for substep in 0..if in_run { 0 } else { steps.min(240) } {
                     if !stack.pending_heights.is_empty() {
                         let at = now - f64::from(self.grow_acc) - f64::from((steps.min(240) - substep) as f32 * SUBSTEP);
                         if at >= stack.width_hold_until && let Some(height) = stack.pending_heights.remove(id) {
@@ -102,6 +105,13 @@ impl<S: 'static> Runtime<S> {
                         }
                     }
                     g.step(spec.spring, &spec.edge, carrying);
+                }
+                // A row nobody saw last frame draws no feather: it has none to ease, and grows one
+                // again as it comes into view.
+                if g.mask > 0.0 && self.built
+                    && self.node_index.get(id).is_some_and(|&i| !self.seen.get(i).copied().unwrap_or(true))
+                {
+                    g.mask = 0.0;
                 }
                 let r = std::mem::take(&mut g.restore);
                 if r > 0.0 { restored.push((ci, *id, r)); }
@@ -174,36 +184,35 @@ impl<S: 'static> Runtime<S> {
             };
             let laid = if axes.y() { self.ease_to_shrunk_end(i, overflow) } else { None };
             let Some(st) = self.scrolls.get_mut(&id) else { continue };
-            st.scrolling = st.direct || st.v.abs() > 1.0 || st.x.v.abs() > 1.0;
+            st.scrolling = st.direct || st.coast().abs() > 1.0 || st.x.v.abs() > 1.0;
             st.by_hand |= st.scrolling;
             st.direct = false;
             st.max = overflow.max(0.0);
-            if st.pinned && sp.stick_bottom {
-                // A reader stuck on a shrinking stack's end doesn't rise with its rows' last fraction.
-                st.offset = laid.filter(|&end| st.offset <= end + 1e-6).map_or(st.max, |end| st.max.min(end));
-                st.v = 0.0;
-                st.glide = None;
-            } else if st.glide.is_some() {
-                moving |= scroll_bottom::glide(st, dt);
-            } else if st.v.abs() > 1.0 {
-                // Exact for exponential decay, so a long frame carries the same distance as
-                // the short frames it stands for.
-                let decay = (-SCROLL_DECAY * dt).exp();
-                st.offset += f64::from(st.v * (1.0 - decay) / SCROLL_DECAY);
-                st.v *= decay;
-                if st.offset <= 0.0 || st.offset >= st.max {
-                    st.v = 0.0;
+            match st.mode {
+                ScrollMode::Pinned if sp.stick_bottom => {
+                    // A reader stuck on a shrinking stack's end doesn't rise with its rows' last fraction.
+                    st.offset = laid.filter(|&end| st.offset <= end + 1e-6).map_or(st.max, |end| st.max.min(end));
                 }
-                moving = true;
-            } else {
-                st.v = 0.0;
+                ScrollMode::Glide { .. } => moving |= scroll_bottom::glide(st, dt),
+                ScrollMode::Momentum { v } if v.abs() > 1.0 => {
+                    // Exact for exponential decay, so a long frame carries the same distance as
+                    // the short frames it stands for.
+                    let decay = (-SCROLL_DECAY * dt).exp();
+                    st.offset += f64::from(v * (1.0 - decay) / SCROLL_DECAY);
+                    let edge = st.offset <= 0.0 || st.offset >= st.max;
+                    st.mode = if edge { ScrollMode::Rest } else { ScrollMode::Momentum { v: v * decay } };
+                    moving = true;
+                }
+                ScrollMode::Momentum { .. } => st.mode = ScrollMode::Rest,
+                ScrollMode::Pinned | ScrollMode::Rest => {}
             }
             st.offset = st.offset.clamp(0.0, st.max);
             // Landed on a shrinking stack's new end: stick once its rows are within half a point
-            // of it, not while they're still short of it.
+            // of it, not while they're still short of it. A glide that reaches the end hands it
+            // to the pin.
             let shrinking = laid.is_some_and(|end| end < st.max - 0.5 && st.offset < st.max - 1e-3);
-            if sp.stick_bottom && !held && !shrinking && st.offset >= st.max - 0.5 && st.v.abs() <= 1.0 {
-                st.pinned = true;
+            if sp.stick_bottom && !held && !shrinking && st.offset >= st.max - 0.5 && st.coast().abs() <= 1.0 {
+                st.pin();
             }
             st.laid = laid;
             if sp.stick_bottom && axes.y() && slack_dt > 0.0 { moving |= self.step_slack(i, slack_dt); }

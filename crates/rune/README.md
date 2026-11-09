@@ -55,7 +55,8 @@ Rune's core crate: views, layout, animation, rendering, text and the native shel
   - The animation clock has a time scale, which the Settings speed slider drives.
 - **Renderer** (`render.rs`, `shader.wgsl`): one instanced uber-quad pipeline and one draw call per
   frame.
-  - Kinds: rounded rects (per-corner radius, border), analytic Gaussian shadows (outer and inset),
+  - Kinds: rounded rects (per-corner radius, a border drawn over the fill as CSS draws one, per-side
+    widths), analytic Gaussian shadows (outer and inset),
     vertical and angled linear gradients, circular and elliptical radial gradients (`KIND_RADIAL`),
     dashed border rings (`KIND_DASHED`), RGBA images, and glyphs from the atlas.
   - **Gradients** (`.gradient(top, bottom)`, `.radial_gradient(center, radius, stops)`,
@@ -99,16 +100,38 @@ Rune's core crate: views, layout, animation, rendering, text and the native shel
   `WindowSpec::font_smoothing`), or while running with `Tx::set_font_smoothing(mode)`, which
   rasterises the new mode's glyphs on the next frame (each mode keeps its own atlas entries, so a
   switch back is free). Modes:
-  - `On`, the default on macOS: CoreText's text with font smoothing on. Apple's pipeline (pens
-    floored to CoreGraphics' subpixel step, which depends on the ppem: fifths of a device pixel
-    below 8⅓ ppem, quarters to 11.1, thirds to 16.7, halves to 33.3 and whole pixels above; coverage
-    drawn as is; sRGB blending; CoreGraphics' curve flattening and its y autohinter at 7–18 ppem)
-    plus font smoothing's outline dilation, a radius set by the ink's luminance and the device
-    ppem (`text/macos/smoothing.rs`, `ApplePipeline::SMOOTHED`).
+  - `On`, the default on macOS and in a Mac's browser: CoreText's text with font smoothing on.
+    Apple's pipeline (pens floored to CoreGraphics' subpixel step, which depends on the ppem:
+    fifths of a device pixel below 8⅓ ppem, quarters to 11.1, thirds to 16.7, halves to 33.3 and
+    whole pixels above; coverage drawn as is; sRGB blending; CoreGraphics' curve flattening and
+    its y autohinter at 7–18 ppem) plus font smoothing's outline dilation, a radius set by the
+    ink's luminance and the device ppem (`text/macos/smoothing.rs`, `ApplePipeline::SMOOTHED`).
   - `Off`: what macOS browsers draw for `-webkit-font-smoothing: antialiased`, CoreText with font
-    smoothing off, and the default on every other platform (Linux, Windows, the web). Apple's
-    pipeline without the dilation (`ApplePipeline::UNSMOOTHED`); lighter than `On`.
-  Both work on every OS, since they are arithmetic on outlines. Blending is separate
+    smoothing off. Apple's pipeline without the dilation
+    (`ApplePipeline::UNSMOOTHED`); lighter than `On`. Coverage takes an exponent keyed to the
+    ink's luminance, the curve of Skia's grayscale text gamma.
+  - `DirectWrite`: Chromium's text on Windows. DirectWrite rasterises each
+    glyph as Skia's `SkScalerContext_DW` asks it to (the rendering mode the `gasp` table picks,
+    grid fitting on, grayscale antialiasing, the face at the run's variation coordinates, read in
+    place from Parley's bytes), pens sit on Skia's quarter pixels, and Skia's gamma tables
+    (sRGB, contrast 1, eight luminance buckets) weigh each mask by its ink
+    (`text/windows/`). Off Windows it draws as `Off`.
+  - `Windfoil`, the default everywhere but macOS and a Mac's browser: Rune's own text, the same
+    on every OS. Each glyph's exact pixel coverage from its outline, Windfoil's closed-form box filter over
+    xy-monotone quadratics (DesLauriers 2026), with CoreText's dilation (times `TEXT_WEIGHT`,
+    0.93, which puts its ink within 1% of CoreText's) and y autohint applied per pixel, pens on
+    quarter pixels, coverage drawn as is (`text/outline/`, `text/windfoil.rs`, `outline.wgsl`).
+    Masks at rest are filled on the GPU by the shader that draws text whose scale moves (a zoom,
+    a presence scale, a text flight) straight from its outlines, at its resting pen and size
+    magnified, so it stays sharp and lands on the mask it rests as. A text's raster path
+    (`text/outline/path.rs`: still, moving, landing), each mask's residency (`text/atlas_fill.rs`:
+    uploaded, pending, filled) and the renderer's shader (`render/variant.rs`: Classic, Windfoil,
+    unavailable) are state machines. CJK faces up to 24 ppem draw their TrueType-hinted outlines
+    from whole-pixel pens, at half the dilation, so dense ideographs stay legible at 1x. Renderers
+    start with the Windfoil shader everywhere but macOS, where the Classic shader keeps drawing
+    until text asks for outlines; where it can't be built, the CPU fills the same masks
+    (`text/outline/cover.rs`) and moving text draws from them.
+  `On` and `Off` work on every OS, since they are arithmetic on outlines. Blending is separate
   (`srgb_blend`).
   `cargo run -p rune --example coretext_compare [-- --smoothing on|off]` measures
   each mode against CoreText references (`tests/coretext/`, `scripts/coretext-reference.sh`). The
@@ -173,9 +196,11 @@ Rune's core crate: views, layout, animation, rendering, text and the native shel
   multiplies with `press_scale`, `live_scale` and scale transitions (`origin` applies to all of
   them; `offset` ignores it), and nested scales and turns compose. Under all of them, text, icons
   and images transform with their box (link hit boxes and a text field's caret follow). Text under
-  a still scale rasterizes at the scaled size, so it stays crisp. While a scale springs, text
-  samples its rest-size glyphs, filtered, and turns crisp when the spring settles. That way a
-  spring doesn't rasterize a glyph at every frame's size. Text under an actively moving
+  a still scale rasterizes at the scaled size, so it stays crisp. While a scale springs (or a
+  presence transition runs), text samples glyphs rasterized at its nearest still ancestor's
+  scale (1, or an app's zoom), filtered, and turns crisp when the spring settles. That way a
+  spring doesn't rasterize a glyph at every frame's size, and text that only fades or slides
+  inside a zoomed window draws exactly as it will at rest. Text under an actively moving
   `live_scale` rasterizes at logarithmic $2^{1/4}$ scale buckets and re-rasterizes crisp at the
   exact resting scale once it holds still for 0.1 s; a changing `scale` samples rest-size glyphs
   while moving and re-rasterizes crisp at the resting scale after 0.1 s. A matched flight's own
@@ -256,6 +281,36 @@ Rune's core crate: views, layout, animation, rendering, text and the native shel
   (`Some('a')` for ⌥A, which types `å`), for bindings by letter that follow the layout, as
   macOS's key bindings do; `None` where winit can't say (the web, iOS) and with no physical
   origin.
+
+  `Mods::cmd` is the primary shortcut modifier, reported with its key: ⌘ on macOS (with
+  `logo`), Ctrl elsewhere (with `ctrl`). So Ctrl+W on Windows is `{ cmd, ctrl }`, and a test
+  such as `cmd && !ctrl` never passes there. Bind shortcuts with a `Chord` instead, which
+  resolves both sides to the keys held on the platform:
+
+  ```rust
+  let reopen = Chord::parse("mod+shift+t")?;          // ⇧⌘T on macOS, Ctrl+Shift+T elsewhere
+  let next = Chord::parse("ctrl+tab")?;               // ⌃⇥ on macOS (a literal Control), Ctrl+Tab elsewhere
+  let home = Keybind::new("mod+b").on(KeyPlatform::Windows, "alt+home");
+  if reopen.matches_tx(ev, tx) { /* … */ }
+  reopen.label();                                     // "⇧⌘T" or "Ctrl+Shift+T"
+  ```
+
+  `mod` is the primary modifier; `ctrl`, `alt`, `shift` and `super` (`cmd`, `win`) are keys.
+  Off macOS Ctrl is the primary, so "mod+b" and "ctrl+b" are the same chord there
+  (`Chord::same_keys` finds such clashes); give one of them another chord on that platform
+  with `Keybind::on`. A character chord names the key unshifted ("mod+shift+[") and
+  `matches_tx` follows the layout through `tx.key_base()`; on a layout whose keys type no
+  ASCII (Cyrillic, Greek) an ASCII chord falls back to `tx.physical_key()`. A chord on a
+  shifted character ("mod+plus") matches with or without the Shift that types it.
+  `matches_on` and `Shortcut::parse_on` take the platform explicitly, for tests and keymap
+  pickers. `Display` writes the canonical string back for settings files; `Keybind` parses
+  alternatives ("mod+t, mod+n") and `Keybind::spec_on(platform)` writes one platform's chords.
+
+  A text field's edit commands (copy, cut, paste, select all, undo, redo, and Ctrl+Y redo
+  off macOS) take only the plain chord: Ctrl+Alt+V, Ctrl+Shift+V or ⌃⌘C reach `on_key`.
+  On Windows, Left Ctrl + Left Alt is AltGr, so a character typed with both inserts, and
+  Home and End move to the line's edge in a multi-line field (Ctrl+Home and Ctrl+End to
+  the text's ends).
 - **Periodic motion**: `.looping(rune_motion::LoopSpec::opacity(..))` or `LoopSpec::rotation(period)`
   (icon quads). Tracks use animation time, preserve phase when retimed and only request frames
   while visible through ancestor clips. Removal uses the existing spring presence fade. Reduced
@@ -603,9 +658,18 @@ app.run();
 
   Launch Services learns the scheme when the bundle is opened or registered (`lsregister -f
   MyApp.app`); then `open 'myapp://x'` launches or reaches the app. A bare `cargo run` binary has
-  no bundle and gets no links. iOS isn't wired yet (winit owns the scene delegate), and Windows
-  and Linux pass a link to a new process as a launch argument, so the hook never runs there;
-  read it from the arguments, with your own single-instance forwarding if you need one.
+  no bundle and gets no links. iOS isn't wired yet (winit owns the scene delegate), and Linux
+  passes a link to a new process as a launch argument, so the hook never runs there.
+- Links and relaunches on Windows: Windows starts a new process for each launch, passing a link
+  as an argument. The hook receives the links among the first process's arguments
+  (`scheme://…`) like the launching link on macOS. Call `rune::single_instance("com.example.myapp")`
+  first thing in `main` to keep one process: a later launch hands its arguments to the running
+  process over a per-user named pipe and lets it take the foreground, and `single_instance`
+  returns false so `main` returns without opening a window. Its links reach the hook; a launch
+  without links reopens the app (`App::on_reopen`, then the default, which also brings the front
+  window forward, restored). Register the scheme for the user, usually at install:
+  `HKEY_CURRENT_USER\Software\Classes\myapp` with an empty `URL Protocol` value and
+  `shell\open\command` set to `"C:\path\to\myapp.exe" "%1"`.
   `scripts/mac-app --scheme myapp` writes that entry and registers the bundle for you (see
   "Relaunching a Mac app" below).
 - Edge overlays (HUDs): see `App::overlay` below.
@@ -768,6 +832,49 @@ true
 
 Only the closure runs on the worker; the answer reaches state in `poll`, on the UI thread.
 
+### State machines (`rune::machine`)
+
+Anything with modes (a hover delay, a drag, a request and its retries, a dialog flow) is one
+`enum State` whose variants carry only what is valid in them, and one transition that returns
+what should happen instead of doing it:
+
+```rust
+use rune::machine::{Attempt, Effects, Seq};
+
+enum Tip { Idle, Waiting { attempt: Attempt, due: f64 }, Open }
+enum Event { Enter { now: f64 }, Leave, Due { attempt: Attempt, now: f64 } }
+enum Effect { WakeAt(f64) }
+
+fn step(seq: &mut Seq, tip: &mut Tip, event: Event) -> Effects<Effect> {
+    match (&*tip, event) {
+        (Tip::Idle, Event::Enter { now }) => {
+            let (attempt, due) = (seq.next(), now + 0.4);
+            *tip = Tip::Waiting { attempt, due };
+            Effects::one(Effect::WakeAt(due))
+        }
+        (Tip::Waiting { attempt, due }, Event::Due { attempt: a, now }) if *attempt == a && now >= *due => {
+            *tip = Tip::Open;
+            Effects::none()
+        }
+        (_, Event::Leave) => { *tip = Tip::Idle; Effects::none() }
+        _ => Effects::none(),
+    }
+}
+// A handler steps with `tx.clock()` and carries the effects out:
+for e in step(&mut s.seq, &mut s.tip, Event::Enter { now: tx.clock() }) {
+    match e { Effect::WakeAt(due) => tx.wake_at(due) }
+}
+```
+
+- **Illegal states don't exist.** `Waiting` without a deadline, or `Open` with one, can't be
+  built, so no code has to clear a flag another forgot.
+- **Timers are events.** Deadlines are on `Tx::clock` (the clock `poll` gets, virtual in headless
+  runs); `Tx::wake_at(due)` wakes `poll`, which feeds `Due` back into `step`.
+- **Attempts fence answers.** `Seq::next` issues an `Attempt` per request, timer or dialog; an
+  answer carrying an attempt the state no longer holds falls through to `_` and changes nothing.
+- **Effects stay inline.** `Effects<E>` holds up to two effects without allocating; `push` and
+  `extend` add more, and it iterates in order.
+
 ### Relaunching a Mac app (`scripts/mac-app`, `rune-mac`)
 
 `cargo run` starts a bare binary: no bundle, so no icon, no links, no microphone prompt, and a
@@ -915,6 +1022,20 @@ rune::App::new(spec).fit_content_height().run();
   `traffic_lights: Some((x, y))` places the close button's top-left at `x, y` points (Electron's
   `trafficLightPosition`). Rune places the buttons again after every resize, scale change, focus change
   and un-occlusion. On Windows and Linux both options do nothing; the system titlebar stays.
+- **`App::titlebar` / `WindowSpec::titlebar`** (`Titlebar::new(height)`): the app draws its own
+  titlebar `height` points tall and the window keeps its controls over it. macOS gets a full-size
+  content view with drag regions and the traffic lights centred in the band (unless
+  `Chrome::traffic_lights` places them). Windows loses its native title bar but keeps resize edges,
+  Aero Snap, the snap layouts flyout over maximize, the window menu (Alt+Space, or a right-click on a
+  `.window_drag()` region) and its animations; Rune draws the caption buttons over the trailing edge
+  (Electron's `titleBarOverlay`: 46 points wide, close turns red), as elements named Minimize,
+  Maximize or Restore, and Close for assistive technology, still in reach while the view holds a
+  modal. A window that isn't resizable never maximizes: its maximize button is dimmed, with no snap
+  layouts. `Cx::chrome_insets()` says what the controls take (`leading`, `trailing`, `height`; zero
+  where the native frame stays, as on Linux; memos rebuild when it changes), `Cx::caption_color(c)`
+  colours the caption symbols for an app theme, `Cx::titlebar_height(h)` changes the band's height
+  as the app runs (a UI zoom), and `Tx::toggle_maximized()` maximizes or restores.
+  `cargo run -p rune --example custom_titlebar` shows it.
 - **`AppSpec::new(title, size, init, view)`** fills every other field with its default; literals
   that set a few more end with `..AppSpec::new(..)`. Window chrome lives on the builders, keeping
   existing exhaustive `AppSpec` literals source-compatible.
@@ -1110,7 +1231,9 @@ with `Runtime::window_focus(bool)`.
 `[f32; 4]`, `Color`). Call `set(value)` from a producer thread; Rune coalesces a
 wake for each visible subscribed window. Equal values and hidden windows do not
 wake. Bind with `.live_opacity(&level)`, `.live_offset(&cursor)`,
-`.live_scale(&scale)`, `.live_fill(&color)` or `.live_rect(&rect)`.
+`.live_scale(&scale)`, `.live_fill(&color)` or `.live_rect(&rect)`, and colours with
+`.live_text_color`, `.live_border`, `.live_shadow` (the first shadow's colour) and
+`.live_gradient(&top, &bottom)`. A rebuild keeps what a colour binding last set.
 `cursor.smooth(Spring::new(0.16, 0.0))` opts a binding into rune-motion smoothing.
 Views and layout do not rerun. Rects are presentation `[x,y,w,h]` in parent points,
 so text does not rewrap and siblings do not reflow. See
@@ -1512,7 +1635,9 @@ Once the system drag starts, Rune drops the pointer capture and hover, so nothin
 Files are offered as copies (`DragItem::allow_move` also offers a move), an app bundle can be
 dropped into System Settings' privacy lists, and the picture under the pointer is a snapshot of
 the element unless `DragItem::image` sets one. `on_drag_end` receives `DragOutcome::Copied`,
-`Moved`, `Linked` or `Cancelled`.
+`Moved`, `Linked` or `Cancelled`. The app's own windows take no drop from its drags unless
+`DragItem::within_app` offers it to them: their `on_drop_files` targets then receive the files
+as they would from Finder (an image dragged from a list into a composer).
 
 macOS only for now. Elsewhere `drag_out` is ignored and the element keeps its press and
 `on_drag` behaviour. Headless runs record `drag-out <path>` in `--trace` and mark the node
@@ -1611,9 +1736,17 @@ row().key("theme").child(text(theme_title(&s.theme)))
 - **Platforms**: macOS uses `NSMenu`'s `popUpMenuPositioningItem:atLocation:inView:` in windows
   and overlay panels. The menu tracks from a run-loop block outside winit's handler, so frames,
   springs, the display link and `AppHandle::update` keep running while it's open. The pointer's
-  press, capture and hover are released before it opens. Elsewhere `popup_menu_supported()` is
-  false and `on_pick` gets `None` on the next frame, so keep an in-app fallback for those
-  platforms. `cargo run -p rune --example popup_menu` shows both kinds.
+  press, capture and hover are released before it opens. Windows uses `TrackPopupMenuEx`, opened
+  from a message posted to the window after winit's handler returns, so Rune keeps drawing
+  there too: frames, wakes, `wake_after` timers and overlays. It follows Windows placement: the
+  menu drops down below an element anchor (flipping up clear of it near the screen's bottom
+  edge) whether or not an item is `selected`, opens with its top-left at a point, and sizes
+  itself to its items; `.symbol` doesn't show. Menus are dark or light as the window's content
+  is (Windows 10 1903 and later), whatever the system's appearance. Keyboard navigation and
+  dismissal by a click outside (answered `None`) are the system's, overlays included. A click
+  right after the menu closes lands where the pointer is, moved or not. Elsewhere
+  `popup_menu_supported()` is false and `on_pick` gets `None` on the next frame, so keep an
+  in-app fallback for those platforms. `cargo run -p rune --example popup_menu` shows both kinds.
 - **Headless**: `--tree` has a `popupMenu` object (items, anchor, `selected`, `queued`) while a
   menu is open, and `--trace` notes `popup-menu:open`, `popup-menu:pick:{id}` and
   `popup-menu:cancel`. Scripts answer it with `{"type": "menu-pick", "id": "dark"}` or
@@ -2298,7 +2431,8 @@ $L --desktop examples/launcher/backdrop.png --script examples/launcher/scripts/d
 ```
 
 - **Scripts** are timestamped `move`, `down`, `up`, `tap` (`hold`), `double-click` (`hold`,
-  `gap`, default 0.15 s between presses) and `drag` (`dx`, `dy`, `dur`) events, at `x,y` in points or at an element by `key` (or a path suffix such as `slider/knob`).
+  `gap`, default 0.15 s between presses) and `drag` (`dx`, `dy`, `dur`) events, at `x,y` in points or at an element by `key` (or a path of keys such as `slider/knob`, where elements without keys
+  between them don't count).
   `{"reopen": true}` reopens the app, as a click on its Dock icon (see "App lifetime").
   `menu-pick` (with an `id`) and `menu-cancel` answer an open pop-up menu, `file-dialog` (with
   a `path`) and `file-dialog-cancel` an open file dialog (see "File dialogs"). `drag_files` and
@@ -2328,8 +2462,8 @@ $L --desktop examples/launcher/backdrop.png --script examples/launcher/scripts/d
   resize delivers it (content at rest follows; unlike `Tx::resize_window`). The canvas keeps its
   size, so grow only after shrinking to see the whole window.
 - **Chords**: `{"type": "shortcut", "chord": "cmd+space"}` is the user pressing a chord
-  system-wide. Register it with `App::global_shortcut` or `register_shortcut`. Only its
-  shortcut handler runs, exactly as when the OS delivers it: it never reaches `on_key`,
+  system-wide (`mod+space` is ⌘ on macOS and Ctrl elsewhere, as in a `Chord`). Register it
+  with `App::global_shortcut` or `register_shortcut`. Only its shortcut handler runs, exactly as when the OS delivers it: it never reaches `on_key`,
   focused controls or physical-input handlers, even when the window is key. An unregistered
   chord fails the script. The older `{"shortcut": "cmd+k"}` has the same semantics. To send
   a window key instead, use `{"type": "key", "cmd": true, "name": " "}`.

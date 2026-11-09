@@ -39,7 +39,7 @@ impl<S: 'static> Runtime<S> {
         let cut = f64::from(cut);
         st.offset = (st.offset - cut).max(0.0);
         st.max = (st.max - cut).max(0.0);
-        if let Some(to) = st.glide_to.as_mut() { *to = (*to - cut).max(0.0); }
+        if let ScrollMode::Glide { to: GlideTo::Offset(to) | GlideTo::ShrunkEnd(to), .. } = &mut st.mode { *to = (*to - cut).max(0.0); }
     }
 
     /// Folds `held` (id, points cut below the window) in growth stack `c` of the commit's
@@ -81,21 +81,21 @@ impl<S: 'static> Runtime<S> {
             .filter(|(id, _)| self.grows.get(id).is_some_and(|g| g.give.is_some_and(|share| (g.h - g.target) * (1.0 - share) < 0.5)))
             .map(|(_, p)| p).collect();
         if giving.is_empty() { return; }
-        let pinned = |viewport: &str| self.path_ids.get(viewport).and_then(|id| self.scrolls.get(id)).is_some_and(|st| st.pinned);
+        let pinned = |viewport: &str| self.path_ids.get(viewport).and_then(|id| self.scrolls.get(id)).is_some_and(|st| st.pinned());
         let drop: Vec<usize> = self.keeps.iter().enumerate()
             .filter(|(_, k)| k.hold.as_ref().is_some_and(|h| giving.contains(&&h.path)) && pinned(&k.viewport)).map(|(i, _)| i).collect();
         for i in drop.into_iter().rev() { self.keeps.remove(i); }
     }
 
-    /// Row `j` of the commit's `nodes`, a fold opening again while its contents draw lifted,
-    /// in growth stack `c`: with its viewport pinned to its end, or its header giving way to it
+    /// Row `j` of the commit's `nodes`, a fold opening from rest or again while its contents
+    /// draw lifted, in growth stack `c`: with its viewport pinned to its end, or its header giving way to it
     /// (`giving`), the holds on it, in it or above it let go, so it grows from its bottom with
     /// the end (or, short of it, the row below) held and its contents still, rather than pushing
     /// the end down and then snapping its header up as it lands.
     pub(super) fn ride_from_end(&mut self, nodes: &[Node], c: usize, j: usize, giving: bool) {
         let Some(s) = std::iter::successors(nodes[c].parent, |&p| nodes[p].parent)
             .find(|&p| nodes[p].scroll.is_some() && nodes[p].scroll_axes.y()) else { return };
-        let pinned = self.scrolls.get(&nodes[s].id).is_some_and(|st| st.pinned);
+        let pinned = self.scrolls.get(&nodes[s].id).is_some_and(|st| st.pinned());
         if !pinned && !giving { return; }
         let mut end = j + 1;
         while end < nodes.len() && nodes[end].parent.is_some_and(|p| p >= j) { end += 1; }
@@ -123,7 +123,8 @@ impl<S: 'static> Runtime<S> {
             Some(((self.drawn[row][1] - self.drawn[view][1]) / scale).max(0.0))
         }).flatten().unwrap_or(0.0);
         let Some(g) = self.grows.get_mut(&nodes[j].id) else { return };
-        // And what its contents hid below its bottom edge shows.
+        // And what its contents hid below its bottom edge shows: for a fold opening from rest,
+        // all it opens, so its spring carries it whole with its contents still in its layout.
         let below = (g.target - g.h - g.lift()).max(0.0);
         g.ride_up(shown + below);
     }
@@ -135,7 +136,7 @@ impl<S: 'static> Runtime<S> {
         let Some(s) = self.viewport_of(ci) else { return };
         let (path, id, scale) = (self.nodes[s].path.clone(), self.nodes[s].id, self.drawn_scale.get(s).copied().unwrap_or(1.0));
         let Some(st) = self.scrolls.get_mut(&id) else { return };
-        if st.pinned { return; }
+        if st.pinned() { return; }
         st.offset += f64::from(r);
         st.max = st.max.max(st.offset);
         let Some(&ri) = self.node_index.get(&row) else { return };

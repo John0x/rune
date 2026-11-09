@@ -24,8 +24,14 @@ mod a11y;
 mod anchor;
 mod backdrop;
 mod child_exit;
+mod direction;
 pub(crate) mod drop;
 pub(crate) mod effect;
+
+/// An effect slot (`El::effect`): size it like any box.
+pub fn effect(mark: u32) -> El {
+    base(FlexDirection::Row).effect(mark)
+}
 mod element_info;
 mod enter_delay;
 mod focus;
@@ -34,13 +40,65 @@ mod handler_set;
 mod handlers;
 mod layout;
 pub(crate) mod layout_watch;
+mod live_colors;
 pub mod motion;
 mod pills;
 mod pixel_snap;
+mod rare;
 mod ride_trailing;
 mod scroll;
+mod selection_style;
 mod sticky;
 mod text;
+
+pub fn text(content: impl Into<String>) -> El {
+    let mut e = base(FlexDirection::Row);
+    e.role = RoleTag::TEXT;
+    e.text = Some(crate::cold::SharedBox::new(TextSpec {
+        content: content.into(),
+        style: crate::tok::type_::BODY,
+        color: Color::WHITE,
+        inked: false,
+        align: Align::Start,
+        spans: Vec::new(),
+        wrap: false,
+        reveal: -1.0,
+        truncate: false,
+        elide: Elide::End,
+        max_lines: 0,
+        truncate_fade: false,
+        fade_em: TRUNCATE_FADE_EM,
+        justify: false,
+        live: None,
+        links: Vec::new(),
+        on_link: None,
+        on_link_secondary: None,
+        advance_in: None,
+        case: None,
+        source: None,
+        selectable: false,
+        selection: DEFAULT_SELECTION,
+        uncopied: Vec::new(),
+        copy_breaks: [1, 1],
+        copy_prefix: None,
+        rings: Vec::new(),
+        span_radius: crate::text::SPAN_RADIUS,
+        strikes: Vec::new(),
+        highlights: Vec::new(),
+        blocks: Vec::new(),
+        soft_breaks: Vec::new(),
+        pills: Vec::new(),
+        pill_colors: None,
+        rich_style: crate::edit::RichStyle::default(),
+        redacted: false,
+        secure_revealed: false,
+        wrap_anywhere: false,
+        exact_lines: true,
+        flow: crate::el::Flow::Ltr,
+        shape: None,
+    }));
+    e
+}
 mod text_spec;
 mod tx;
 pub(crate) mod virtual_list;
@@ -78,6 +136,10 @@ pub struct Drag {
     /// view selects by words on 2 and lines on 3, and extends by them as the drag moves.
     pub clicks: u32,
     pub(crate) cancelled: bool,
+    /// The pointer in window points.
+    pub(crate) window: [f32; 2],
+    /// The pointer in desktop pixels, when a native window hosts the view.
+    pub(crate) screen: Option<(i32, i32)>,
 }
 
 impl Drag {
@@ -86,6 +148,32 @@ impl Drag {
     pub fn cancelled(&self) -> bool {
         self.cancelled
     }
+
+    /// The pointer in window points from the window's top-left, whatever scale the element
+    /// draws at.
+    pub fn window_point(&self) -> [f32; 2] {
+        self.window
+    }
+
+    /// The pointer in physical desktop pixels, the space `WindowOptions::position` and
+    /// `WindowHandle::set_position` take: for opening a window under the pointer, as a tab
+    /// dragged out of its strip does. `None` without a native window (headless runs, the web)
+    /// and where the system hides window positions (Wayland).
+    pub fn screen_point(&self) -> Option<(i32, i32)> {
+        self.screen
+    }
+}
+
+/// What a press on an element does to the window (`El::window_drag`, `El::no_window_drag`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WindowDrag {
+    /// Nothing of its own: a press goes to what's under it.
+    #[default]
+    None,
+    /// A press moves the window, and a double press zooms it.
+    Drag,
+    /// A press stays here, inside a `Drag` element, and does nothing to the window.
+    NoDrag,
 }
 
 pub(crate) type PressFn = Rc<dyn Fn(crate::states::States<'_>, &mut Tx)>;
@@ -134,7 +222,9 @@ pub use crate::el::a11y::LiveRegion;
 
 pub(crate) use crate::el::focus::FocusSpec;
 pub(crate) use crate::el::handler_set::Handlers;
+pub(crate) use crate::el::rare::{ElCold, ElFlags, RoleTag};
 pub use crate::el::visual::{Visual, VisualCold};
+pub(crate) use crate::el::visual::VisualFlags;
 
 #[derive(Clone)]
 pub(crate) struct ModalSpec {
@@ -169,7 +259,7 @@ impl Default for GrowthSpec {
 }
 
 /// The selection highlight until [`El::selection_color`] or [`El::caret`] sets one.
-const DEFAULT_SELECTION: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.2 };
+pub(crate) const DEFAULT_SELECTION: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.2 };
 
 /// A text field bound to a [`TextEdit`] in app state.
 #[derive(Clone)]
@@ -183,6 +273,10 @@ pub struct InputSpec {
     pub selection: Color,
     /// One unwrapped line that scrolls sideways to keep the caret visible, like `<input>`.
     pub single_line: bool,
+    /// `placeholder_color`, and `caret` with `selection`, came from [`El::placeholder`] and
+    /// [`El::caret`]; the others follow the window's foreground ([`Cx::foreground`](crate::Cx::foreground)).
+    pub(crate) placeholder_inked: bool,
+    pub(crate) caret_inked: bool,
     pub(crate) revealed_override: Option<bool>,
     pub(crate) decorations: Vec<Span>,
     pub(crate) rich_style: crate::edit::RichStyle,
@@ -195,6 +289,10 @@ pub struct InputSpec {
     pub(crate) paste: Option<InputPasteFn>,
     pub(crate) press: Option<PressFn>,
     pub(crate) drag: Option<InputDragFn>,
+    /// `El::spellcheck`: the platform's checker marks misspelled words.
+    pub(crate) spellcheck: bool,
+    /// [`El::selection_style`]: the selection's highlight and ink, by window focus, over `selection`.
+    pub(crate) selection_style: Option<SelectionStyle>,
 }
 
 impl std::fmt::Debug for InputSpec {
@@ -251,7 +349,8 @@ impl From<(f32, f32)> for RadialRadius {
     }
 }
 
-pub(crate) const MAX_GRADIENT_STOPS: usize = 8;
+/// CSS writes an eased fade as a list of stops: 16 holds the eased gradients Desktop draws.
+pub(crate) const MAX_GRADIENT_STOPS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum GradientGeometry {
@@ -314,6 +413,11 @@ pub enum Align {
 }
 
 pub use crate::el::anchor::{Anchor, Side, anchor_rect};
+pub use crate::el::direction::Direction;
+pub(crate) use crate::el::direction::{DirEffect, DirEvent, Flow, Pin, mirror_anchor, mirror_visual, step as step_direction};
+pub(crate) use crate::el::scroll::FadeStyle;
+pub use crate::el::scroll::ScrollFade;
+pub use crate::el::selection_style::SelectionStyle;
 pub use crate::el::text_spec::TextSpec;
 pub(crate) use crate::el::text_spec::Elide;
 
@@ -350,6 +454,7 @@ pub(crate) struct PasteFn {
 pub(crate) type PillIconFn = Rc<dyn Fn(&str) -> Option<&'static crate::Icon>>;
 /// A pill's look by its id; see [`El::pill_style`].
 pub(crate) type PillStyleFn = Rc<dyn Fn(&str) -> PillStyle>;
+pub use pills::InlineIcon;
 
 /// How one [`Mark::Pill`](crate::Mark::Pill) chip looks: any part left unset falls back to
 /// [`El::pill_colors`] and [`El::pill_icon`], then the field's defaults. Build one with
@@ -410,6 +515,8 @@ pub(crate) type SelectionChangeFn = Rc<dyn Fn(crate::states::States<'_>, &crate:
 pub(crate) struct ScrollEdges {
     /// Fade width (points) for the top and bottom edges; 0 for none.
     pub(crate) fade: f32,
+    /// How the fade follows the content hidden under each edge (`El::scroll_fade`).
+    pub(crate) fade_style: scroll::FadeStyle,
     /// Space `Tx::scroll_into_view` leaves between a revealed row and the viewport's edge.
     pub(crate) margin: f32,
     /// The viewport keeps its top row where it is when content above it changes.
@@ -438,203 +545,81 @@ pub(crate) type LayoutFn = Rc<dyn Fn(crate::states::States<'_>, [f32; 4])>;
 pub(crate) type LayoutTxFn = Rc<dyn Fn(crate::states::States<'_>, [f32; 4], &mut Tx)>;
 pub(crate) type ScrollOffsetFn = Rc<dyn Fn(crate::ScrollPos)>;
 pub(crate) type WindowFocusFn = Rc<dyn Fn(crate::states::States<'_>, bool, &mut Tx)>;
+pub(crate) type LanguagesFn = Rc<dyn Fn(crate::states::States<'_>, Vec<String>, &mut Tx)>;
 
+/// An element: layout, paint, children and handlers. Hot fields sit inline in three cache lines;
+/// the rest wait behind `cold`, allocated on the first write.
 #[derive(Clone)]
 pub struct El {
-    pub(crate) focus: crate::cold::Cold<FocusSpec>,
-    pub(crate) handlers: crate::cold::Cold<Handlers>,
-    pub(crate) looping: Option<Box<rune_motion::LoopSpec>>,
-    pub(crate) key: Option<String>,
-    pub(crate) trace_name: Option<&'static str>,
-    pub(crate) trace_namespace: Option<(&'static str, &'static str)>,
-    #[cfg(debug_assertions)]
-    pub(crate) key_source: Option<&'static std::panic::Location<'static>>,
-    #[cfg(debug_assertions)]
-    pub(crate) scroll_source: Option<&'static std::panic::Location<'static>>,
-    #[cfg(debug_assertions)]
-    pub(crate) virtual_source: Option<&'static std::panic::Location<'static>>,
-    pub(crate) role: &'static str,
-    pub(crate) label: Option<String>,
     pub(crate) style: CompactStyle,
     pub(crate) vis: Visual,
-    pub(crate) live: Vec<crate::live::Bound>,
-    pub(crate) text: Option<crate::cold::SharedBox<TextSpec>>,
     pub(crate) children: Vec<El>,
-    /// Children a [`memo`](crate::memo) shares with its cache, before `children`.
-    pub(crate) memo_children: Option<Rc<crate::memo::Shared>>,
-    /// The cached [`memo`](crate::memo) subtree this placeholder came from, cleared if expanded or
-    /// given extra children.
-    pub(crate) memo_built: Option<Rc<crate::memo::Built>>,
-    /// Whether this element or anything under it uses `virtualize` or `virtual_rows`.
-    pub(crate) has_virtual: bool,
-    pub(crate) above: Option<Anchor>,
-    pub(crate) motion: Option<Spring>,
-    pub(crate) opacity_motion: Option<Box<Anim>>,
-    pub(crate) lead: Option<(Spring, Spring)>,
-    pub(crate) width_leads: bool,
-    pub(crate) animate_layout: bool,
-    pub(crate) instant_changes: bool,
-    pub(crate) transition: Option<Box<Transition>>,
-    pub(crate) matched: Option<Rc<str>>,
-    pub(crate) scroll: Option<ScrollSpec>,
-    pub(crate) scroll_axes: ScrollAxes,
-    pub(crate) sticky: Option<Box<Sticky>>,
-    pub(crate) scroll_edges: ScrollEdges,
-    pub(crate) growth: Option<Box<GrowthSpec>>,
-    pub(crate) virtual_estimate: Option<f32>,
-    /// Rows `El::virtual_rows` builds at layout time, in place of `children`.
-    pub(crate) virtual_rows: Option<Rc<crate::el::virtual_rows::RowSource>>,
-    /// [`El::virtual_rows_version`], hashed.
-    pub(crate) virtual_rows_version: Option<u64>,
-    pub(crate) virtual_mount: bool,
-    pub(crate) streaming: bool,
-    pub(crate) whole: bool,
-    pub(crate) glide: Option<crate::growth::FoldGlide>,
-    pub(crate) input: Option<Box<InputSpec>>,
-    pub(crate) window_drag: bool,
-    /// `El::ime_cursor`.
-    pub(crate) ime_cursor: bool,
+    pub(crate) key: Option<String>,
+    pub(crate) text: Option<crate::cold::SharedBox<TextSpec>>,
+    pub(crate) handlers: crate::cold::Cold<Handlers>,
+    /// The cached [`memo`](crate::memo) subtree this placeholder came from. Its children come
+    /// before `children`; once the placeholder is expanded or given extra children,
+    /// `ElFlags::MEMO_EXTENDED` says it is no longer that subtree itself.
+    pub(crate) memo: Option<Rc<crate::memo::Built>>,
+    pub(crate) cold: crate::cold::Cold<ElCold>,
     pub(crate) scale: f32,
-    pub(crate) time_scale: f32,
-    pub(crate) help: Option<String>,
-    /// `El::help_when_truncated`: the tooltip shows only while the text is cut short.
-    pub(crate) help_cut: bool,
-    pub(crate) material: Option<crate::SystemMaterial>,
-    /// `El::aspect_fit`'s width over height; 0 when unset.
-    pub(crate) aspect_fit: f32,
-    pub(crate) selection_group: bool,
-    /// `El::level` and `El::expanded`.
-    pub(crate) a11y: A11y,
-    pub(crate) inert: bool,
+    pub(crate) flags: ElFlags,
+    pub(crate) role: RoleTag,
+    pub(crate) vis_flags: VisualFlags,
+    #[cfg(debug_assertions)]
+    pub(crate) key_source: Option<&'static std::panic::Location<'static>>,
 }
 
+#[cfg(all(target_pointer_width = "64", not(debug_assertions)))]
+const _: () = assert!(std::mem::size_of::<El>() == 192);
+#[cfg(all(target_pointer_width = "64", not(debug_assertions)))]
+const _: () = assert!(std::mem::size_of::<Option<El>>() == 192);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Visual>() == 40);
+
+#[inline]
 fn base(dir: FlexDirection) -> El {
     El {
-        focus: Default::default(),
-        handlers: Default::default(),
-        looping: None,
-        key: None,
-        trace_name: None,
-        trace_namespace: None,
-        #[cfg(debug_assertions)]
-        key_source: None,
-        #[cfg(debug_assertions)]
-        scroll_source: None,
-        #[cfg(debug_assertions)]
-        virtual_source: None,
-        role: "group",
-        label: None,
         // Relative makes every element the containing block for its absolute children, so they
         // size and pin against their parent's padding box. Taffy's default (static) hands them
         // to the window instead, as CSS does.
         style: CompactStyle::rune_base(dir),
         vis: Visual::default(),
-        live: Vec::new(),
-        text: None,
         children: Vec::new(),
-        memo_children: None,
-        memo_built: None,
-        has_virtual: false,
-        above: None,
-        motion: None,
-        opacity_motion: None,
-        lead: None,
-        width_leads: false,
-        animate_layout: false,
-        instant_changes: false,
-        transition: None,
-        matched: None,
-        scroll: None,
-        scroll_axes: ScrollAxes::Y,
-        sticky: None,
-        scroll_edges: ScrollEdges::default(),
-        growth: None,
-        virtual_estimate: None,
-        virtual_rows: None,
-        virtual_rows_version: None,
-        virtual_mount: false,
-        streaming: false,
-        whole: false,
-        glide: None,
-        input: None,
-        window_drag: false,
-        ime_cursor: false,
+        key: None,
+        text: None,
+        handlers: crate::cold::Cold::NONE,
+        memo: None,
+        cold: crate::cold::Cold::NONE,
         scale: 1.0,
-        time_scale: 1.0,
-        help: None,
-        help_cut: false,
-        material: None,
-        aspect_fit: 0.0,
-        selection_group: false,
-        a11y: A11y::default(),
-        inert: false,
+        flags: ElFlags::default(),
+        role: RoleTag::GROUP,
+        vis_flags: VisualFlags::default(),
+        #[cfg(debug_assertions)]
+        key_source: None,
     }
 }
 
+#[inline]
 pub fn row() -> El {
     base(FlexDirection::Row)
 }
 
+#[inline]
 pub fn col() -> El {
     base(FlexDirection::Column)
 }
 
 /// A plain box.
+#[inline]
 pub fn el() -> El {
     base(FlexDirection::Row)
 }
 
-/// An effect slot (`El::effect`): size it like any box.
-pub fn effect(mark: u32) -> El {
-    base(FlexDirection::Row).effect(mark)
-}
-
 /// Takes the free space along its parent's main axis.
+#[inline]
 pub fn spacer() -> El {
     base(FlexDirection::Row).grow(1.0)
-}
-
-pub fn text(content: impl Into<String>) -> El {
-    let mut e = base(FlexDirection::Row);
-    e.role = "text";
-    e.text = Some(crate::cold::SharedBox::new(TextSpec {
-        content: content.into(),
-        style: crate::tok::type_::BODY,
-        color: Color::WHITE,
-        align: Align::Start,
-        spans: Vec::new(),
-        wrap: false,
-        reveal: -1.0,
-        truncate: false,
-        elide: Elide::End,
-        max_lines: 0,
-        truncate_fade: false,
-        fade_em: TRUNCATE_FADE_EM,
-        justify: false,
-        live: None,
-        links: Vec::new(),
-        on_link: None,
-        on_link_secondary: None,
-        advance_in: None,
-        case: None,
-        source: None,
-        selectable: false,
-        selection: DEFAULT_SELECTION,
-        uncopied: Vec::new(),
-        rings: Vec::new(),
-        strikes: Vec::new(),
-        highlights: Vec::new(),
-        blocks: Vec::new(),
-        soft_breaks: Vec::new(),
-        pills: Vec::new(),
-        pill_colors: None,
-        rich_style: crate::edit::RichStyle::default(),
-        redacted: false,
-        secure_revealed: false,
-        wrap_anywhere: false,
-        shape: None,
-    }));
-    e
 }
 
 /// Text with styled byte ranges; wraps at its width.
@@ -651,10 +636,20 @@ pub fn rich(content: impl Into<String>, spans: Vec<Span>) -> El {
     e
 }
 
-/// An SVG icon from a catalog, `size` points square, tinted with `.color()`.
+/// Parts a help text from each of its [`El::help_keys`] keycaps.
+pub(crate) const HELP_KEY: char = '\u{1f}';
+
+/// A help text as words: its keycaps after it, a space apart.
+pub(crate) fn help_words(help: &str) -> std::borrow::Cow<'_, str> {
+    if help.contains(HELP_KEY) { help.replace(HELP_KEY, " ").into() } else { help.into() }
+}
+
+/// An SVG icon from a catalog, `size` points square (or what [`crate::text::set_icon_swap_size`]
+/// gives a swapped icon), tinted with `.color()`.
 pub fn icon(i: &'static Icon, size: f32) -> El {
+    let size = crate::text::icon::swapped_size(i, size);
     let mut e = base(FlexDirection::Row).size(size, size);
-    e.role = "icon";
+    e.role = RoleTag::ICON;
     e.vis.cold_mut().icon = Some((i, Color::WHITE));
     e
 }
@@ -662,7 +657,7 @@ pub fn icon(i: &'static Icon, size: f32) -> El {
 /// An element that paints `shape`; size it like any element.
 pub fn canvas(shape: Shape) -> El {
     let mut e = base(FlexDirection::Row).shape(shape);
-    e.role = "image";
+    e.role = RoleTag::IMAGE;
     e
 }
 
@@ -679,14 +674,14 @@ pub fn text_input(edit: &TextEdit, style: TextStyle) -> El {
     edit.sync_invariants();
     let (content, _) = edit.display();
     let mut e = text(content).font(style);
-    e.role = "textbox";
-    e.a11y.secure = edit.is_secure();
+    e.role = RoleTag::TEXTBOX;
+    e.cold_mut().a11y.secure = edit.is_secure();
     if let Some(t) = &mut e.text {
         t.wrap = true;
         t.wrap_anywhere = edit.is_secure();
         t.redacted = edit.is_secure();
     }
-    e.input = Some(Box::new(InputSpec {
+    e.cold_mut().input = Some(Box::new(InputSpec {
         animate_layout: false,
         edit,
         placeholder: String::new(),
@@ -694,6 +689,8 @@ pub fn text_input(edit: &TextEdit, style: TextStyle) -> El {
         caret: Color::WHITE,
         selection: DEFAULT_SELECTION,
         single_line: false,
+        placeholder_inked: false,
+        caret_inked: false,
         revealed_override: None,
         decorations: Vec::new(),
         rich_style: crate::edit::RichStyle::default(),
@@ -706,6 +703,8 @@ pub fn text_input(edit: &TextEdit, style: TextStyle) -> El {
         paste: None,
         press: None,
         drag: None,
+        spellcheck: false,
+        selection_style: None,
     }));
     e.sync_input_pills();
     e.sync_input_rich();
@@ -732,11 +731,28 @@ impl El {
         self.handlers.on_window_focus = Some(Rc::new(move |s, focused, tx| f(downcast::<S>(s), focused, tx)));
         self
     }
+    /// On the root or around text fields: the app's spell checking setting, `on`, which the
+    /// fields' menus show as a Spellcheck item with a check mark, as a browser's do. Picking it
+    /// calls `f` with the setting flipped; the app keeps it and passes it to its fields'
+    /// [`El::spellcheck`].
+    pub fn on_spellcheck<S: 'static>(mut self, on: bool, f: impl Fn(&mut S, bool, &mut Tx) + 'static) -> Self {
+        self.handlers.on_spellcheck = Some((on, Rc::new(move |s, on, tx| f(downcast::<S>(s), on, tx))));
+        self
+    }
+    /// Beside [`El::on_spellcheck`], where the platform has dictionaries to choose
+    /// ([`crate::spell::available_languages`]): the fields' menus add a Spellcheck Languages
+    /// submenu, as Chromium's do off macOS. Picking a dictionary checks with the new choice at
+    /// once ([`crate::spell::set_languages`]) and calls `f` with it, for the app to keep and
+    /// pass to `set_languages` at its next launch.
+    pub fn on_spellcheck_languages<S: 'static>(mut self, f: impl Fn(&mut S, Vec<String>, &mut Tx) + 'static) -> Self {
+        self.handlers.on_spellcheck_languages = Some(Rc::new(move |s, tags, tx| f(downcast::<S>(s), tags, tx)));
+        self
+    }
     /// Paint the latest text in this element's fixed layout box. `text("00:00")` reserves
     /// that placeholder's size; explicit `.size(w, h)` also works. Updates never resize the
     /// box or reflow siblings, and overflow is clipped. Plain single-line text only.
     pub fn live_text(mut self, value: &crate::LiveText) -> Self {
-        assert!(self.input.is_none(), "live_text cannot bind a text editor");
+        assert!(self.cold.input.is_none(), "live_text cannot bind a text editor");
         let spec = self.text.as_mut().expect("live_text requires a text element");
         spec.live = Some(value.clone());
         self
@@ -771,8 +787,8 @@ impl El {
     /// describe the field, not contain its secret value. Links and rolling text are disabled.
     /// Pair with [`revealed`](Self::revealed) to toggle plaintext display.
     pub fn secure(mut self) -> Self {
-        self.a11y.secure = true;
-        if let Some(input) = &mut self.input {
+        self.cold_mut().a11y.secure = true;
+        if let Some(input) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
             input.edit.set_secure(true);
             let single = input.single_line;
             if let Some(text) = &mut self.text {
@@ -801,7 +817,7 @@ impl El {
     /// text, redacted [`Debug`], uncached shaping/raster, and zeroized buffers). Prefer
     /// [`TextEdit::revealed`] or [`TextEdit::set_revealed`] when an input model owns the state.
     pub fn revealed(mut self, revealed: bool) -> Self {
-        if let Some(input) = &mut self.input {
+        if let Some(input) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
             input.edit.set_revealed(revealed);
             input.revealed_override = Some(revealed);
             if let Some(text) = &mut self.text {
@@ -816,18 +832,18 @@ impl El {
     }
 
     /// A stable motion-lint name, independent of keys and generations. Defaults to the NodeId
-    /// in MotionTrace; tooling retains its keyed path fallback. Static metadata allocates nothing.
+    /// in MotionTrace; tooling retains its keyed path fallback. Stored without copying the name.
     /// Give simultaneous generations distinct names when comparing their motion separately.
     pub fn trace_name(mut self, name: &'static str) -> Self {
-        self.trace_name = Some(name);
+        self.cold_mut().trace_name = Some(name);
         self
     }
 
     /// Class and host for this subtree's trace metadata (descendants may override them).
     /// motion-lint pairs names by class too: use `("gpui", "pill")` to match a native Metal trace.
-    /// Static metadata performs no allocation, including when tracing is disabled.
+    /// The labels share the element's lazily allocated storage with its other rare fields.
     pub fn trace_namespace(mut self, class: &'static str, host: &'static str) -> Self {
-        self.trace_namespace = Some((class, host));
+        self.cold_mut().trace_namespace = Some((class, host));
         self
     }
 
@@ -866,12 +882,12 @@ impl El {
         self.bind_live(crate::live::Bound::new(value, crate::live::Property::Rect)); self
     }
     fn bind_live(&mut self, bound: crate::live::Bound) {
-        if let Some(old) = self.live.iter_mut().find(|b| b.property == bound.property) { *old = bound; }
-        else { self.live.push(bound); }
+        if let Some(old) = self.cold_mut().live.iter_mut().find(|b| b.property == bound.property) { *old = bound; }
+        else { self.cold_mut().live.push(bound); }
     }
     /// Called after a focused field's text changes, with the updated model available.
     pub fn on_input_change<S: 'static>(mut self, f: impl Fn(&mut S, &mut Tx) + 'static) -> Self {
-        if let Some(input) = &mut self.input {
+        if let Some(input) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
             input.change = Some(Rc::new(move |s, tx| f(downcast::<S>(s), tx)));
         }
         self
@@ -888,7 +904,7 @@ impl El {
     /// })
     /// ```
     pub fn on_input_paste<S: 'static>(mut self, f: impl Fn(&mut S, &crate::ClipboardContent, &mut Tx) -> bool + 'static) -> Self {
-        if let Some(input) = &mut self.input {
+        if let Some(input) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
             input.paste = Some(Rc::new(move |s, content, tx| f(downcast::<S>(s), content, tx)));
         }
         self
@@ -897,7 +913,7 @@ impl El {
     /// after the field takes focus and before the caret moves: an editor drops a selection of its
     /// own (whole blocks, say) that the press replaces.
     pub fn on_input_press<S: 'static>(mut self, f: impl Fn(&mut S, &mut Tx) + 'static) -> Self {
-        if let Some(input) = &mut self.input {
+        if let Some(input) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
             input.press = Some(Rc::new(move |s, tx| f(downcast::<S>(s), tx)));
         }
         self
@@ -906,14 +922,14 @@ impl El {
     /// points, before the selection follows it: an editor of one field per block selects whole
     /// blocks once the pointer leaves the block it started in.
     pub fn on_input_drag<S: 'static>(mut self, f: impl Fn(&mut S, f32, f32, &mut Tx) + 'static) -> Self {
-        if let Some(input) = &mut self.input {
+        if let Some(input) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
             input.drag = Some(Rc::new(move |s, x, y, tx| f(downcast::<S>(s), x, y, tx)));
         }
         self
     }
     /// Handle a focused text field's key before the editor. Return true to consume it.
     pub fn on_input_key<S: 'static>(mut self, f: impl Fn(&mut S, &crate::KeyEvent, &mut Tx) -> bool + 'static) -> Self {
-        if let Some(input) = &mut self.input {
+        if let Some(input) = self.cold.get_mut_if_some().and_then(|c| c.input.as_deref_mut()) {
             input.key = Some(Rc::new(move |s, key, tx| f(downcast::<S>(s), key, tx)));
         }
         self
@@ -927,7 +943,7 @@ impl El {
     /// list whose rows aren't all built: it keeps focus while its rows scroll in and out, and a
     /// click anywhere inside it focuses it (an NSTableView).
     pub fn on_key<S: 'static>(mut self, f: impl Fn(&mut S, &crate::KeyEvent, &mut Tx) -> bool + 'static) -> Self {
-        self.focus.key = Some(Rc::new(move |s, key, tx| f(downcast::<S>(s), key, tx)));
+        self.cold_mut().focus.key = Some(Rc::new(move |s, key, tx| f(downcast::<S>(s), key, tx)));
         self
     }
     /// Secondary release inside the captured element (right-click or macOS control-click), at a
@@ -1007,14 +1023,21 @@ impl El {
     pub fn video(self, video: &crate::Player, fit: crate::SurfaceFit) -> Self {
         self.native_surface(video.surface(), fit)
     }
-    /// Opt into keyboard and pointer focus. Disabled controls must set this false.
+    /// Opt into keyboard and pointer focus. Disabled controls must set this false, which also
+    /// keeps a pressable control out of the Tab order under [`Cx::web_focus`](crate::Cx::web_focus).
     pub fn focusable(mut self, enabled: bool) -> Self {
-        self.focus.enabled = enabled;
+        // Recorded even on a bare element: under `Cx::web_focus` it keeps a pressable control
+        // out of the Tab order.
+        let focus = &mut self.cold_mut().focus;
+        focus.enabled = enabled;
+        focus.opt_out = !enabled;
         self
     }
     /// Positive overrides precede document order (0); negative values skip Tab only.
     pub fn tab_index(mut self, order: i32) -> Self {
-        self.focus.order = order;
+        if order != 0 || !self.cold.focus.is_empty() {
+            self.cold_mut().focus.order = order;
+        }
         self
     }
     /// Arrow keys rove among focusable descendants; Tab visits only the current/selected item.
@@ -1023,11 +1046,13 @@ impl El {
     /// jump to the ends. `list`, `tree` and `grid` stop at their ends, as NSTableView does;
     /// menus, popups and segments wrap.
     pub fn focus_group(mut self) -> Self {
-        self.focus.group = true;
+        self.cold_mut().focus.group = true;
         self
     }
     pub fn focus_selected(mut self, selected: bool) -> Self {
-        self.focus.selected = selected;
+        if selected || !self.cold.focus.is_empty() {
+            self.cold_mut().focus.selected = selected;
+        }
         self
     }
     /// On a virtualized stack, reveal its selected row when the selected key changes,
@@ -1035,7 +1060,9 @@ impl El {
     /// do not scroll, so hover-driven selection does not move the row under the pointer.
     /// Off by default; useful for suggestions controlled by an outside text field.
     pub fn reveal_selected(mut self, enabled: bool) -> Self {
-        self.focus.reveal_selected = enabled;
+        if enabled || !self.cold.focus.is_empty() {
+            self.cold_mut().focus.reveal_selected = enabled;
+        }
         self
     }
     /// A press on this element or its unfocusable descendants leaves the current field
@@ -1043,20 +1070,30 @@ impl El {
     /// button, a toolbar. The press still reaches `on_press` and the other handlers, and a
     /// scroll still cancels it as usual. Focusable descendants still take focus normally.
     pub fn preserve_focus_on_press(mut self, enabled: bool) -> Self {
-        self.focus.preserve_on_press.focus = enabled;
+        if enabled || !self.cold.focus.is_empty() {
+            self.cold_mut().focus.preserve_on_press.focus = enabled;
+        }
         self
     }
     /// On a focus group: arrow keys and type-select also press the item they focus, so
     /// selection follows focus (a source list). Radio and tab items always do.
     pub fn focus_follows(mut self) -> Self {
-        self.focus.follows = true;
+        self.cold_mut().focus.follows = true;
         self
     }
     /// A menu or list row's highlight: painted while focused from the keyboard or pointer,
     /// and moving the pointer over the row focuses it, so keys and mouse share one
     /// highlight (NSMenu). Use instead of `hover` and `focus_ring`.
     pub fn focus_highlight(mut self, color: Color) -> Self {
-        self.focus.highlight = Some(color);
+        self.cold_mut().focus.highlight = Some(color);
+        self
+    }
+    /// A fill laid over this element while it shows keyboard focus, as CSS
+    /// `:focus-visible { background }` paints one: a list row that Tab reaches. Unlike
+    /// [`El::focus_highlight`] the pointer neither paints it nor moves focus. A row that shows
+    /// focus by its fill alone also sets [`El::no_focus_ring`].
+    pub fn focus_fill(mut self, color: Color) -> Self {
+        self.cold_mut().focus.fill = Some(color);
         self
     }
     /// The window's default button, which Return presses (AppKit's `keyEquivalent = "\r"`).
@@ -1067,7 +1104,7 @@ impl El {
     /// sheet's over its window's). It needs an `on_press`, and stays out of reach while hidden
     /// or behind a modal. A focused button presses on Space, and passes Return on to this.
     pub fn default_button(mut self) -> Self {
-        self.focus.default = true;
+        self.cold_mut().focus.default = true;
         self
     }
     /// A slider's keyboard, as NSSlider's: while this element is focused, Left and Down call
@@ -1076,50 +1113,85 @@ impl El {
     /// becomes focusable, and its role `slider` unless it has another. Home and End go to the
     /// ends with [`El::on_step_limit`].
     pub fn on_step<S: 'static>(mut self, f: impl Fn(&mut S, i32, &mut Tx) + 'static) -> Self {
-        self.focus.step = Some(Rc::new(move |s, delta, tx| f(downcast::<S>(s), delta, tx)));
-        self.focus.enabled = true;
-        if self.role == "group" {
-            self.role = "slider";
+        self.cold_mut().focus.step = Some(Rc::new(move |s, delta, tx| f(downcast::<S>(s), delta, tx)));
+        self.cold_mut().focus.enabled = true;
+        if self.role == RoleTag::GROUP {
+            self.role = RoleTag::SLIDER;
         }
         self
     }
     /// A slider's Home and End (see [`El::on_step`]): `f` gets `false` for Home, which goes to
     /// the minimum, and `true` for End, the maximum. Without it they scroll, as elsewhere.
     pub fn on_step_limit<S: 'static>(mut self, f: impl Fn(&mut S, bool, &mut Tx) + 'static) -> Self {
-        self.focus.step_limit = Some(Rc::new(move |s, max, tx| f(downcast::<S>(s), max, tx)));
+        self.cold_mut().focus.step_limit = Some(Rc::new(move |s, max, tx| f(downcast::<S>(s), max, tx)));
         self
     }
     /// Return focus to this keyed trigger (or its first focusable child) when removed.
     pub fn focus_return(mut self, trigger: impl Into<String>) -> Self {
-        self.focus.return_to = Some(trigger.into());
+        self.cold_mut().focus.return_to = Some(trigger.into());
+        self
+    }
+    /// The control a [`El::modal`] focuses when it opens, as HTML's `autofocus` attribute in a
+    /// dialog: a Cancel button, say. Without one the modal focuses its first text field, else
+    /// its first Tab stop, or itself under [`Cx::web_focus`](crate::Cx::web_focus).
+    pub fn autofocus(mut self) -> Self {
+        self.cold_mut().focus.autofocus = true;
         self
     }
     /// Keyboard-only ring, on this element or a visual child of the focused control. A
     /// control with no ring of its own draws the default one (see [`El::no_focus_ring`]).
     pub fn focus_ring(mut self, width: f32, offset: f32, color: Color) -> Self {
-        self.focus.ring = Some(Outline { width, offset, color });
-        self.focus.ring_off = false;
+        self.cold_mut().focus.ring = Some(Outline { width, offset, color });
+        self.cold_mut().focus.within = false;
+        self.cold_mut().focus.ring_off = false;
+        self
+    }
+    /// A ring drawn while focus is on this element or anywhere inside it, whether the pointer or
+    /// the keyboard put it there, as CSS `:focus-within` draws a text field's box: e.g.
+    /// `focus_within_ring(1.0, -1.0, c)` for `outline: 1px solid; outline-offset: -1px`, a ring
+    /// just inside the border box. It isn't a Tab stop by itself.
+    pub fn focus_within_ring(mut self, width: f32, offset: f32, color: Color) -> Self {
+        self.cold_mut().focus.ring = Some(Outline { width, offset, color });
+        self.cold_mut().focus.within = true;
+        self.cold_mut().focus.ring_off = false;
+        self
+    }
+    /// While focus is on this element or anywhere inside it, from the pointer or the keyboard,
+    /// it draws none of its [`El::box_shadow`]s and no [`El::hover`] fill, as a CSS field whose
+    /// `:focus-within` rule sets `box-shadow: none` and whose hover rule is
+    /// `:not(:focus-within)`: the [`El::focus_within_ring`] stands in for its raised edge.
+    pub fn focus_within_flat(mut self) -> Self {
+        self.cold_mut().focus.flat_within = true;
         self
     }
     /// No focus ring: not the default one, and not one set with [`El::focus_ring`]. A control
     /// that shows focus its own way (a fill, an outline it animates) sets it on itself or on
     /// the child that would draw the ring.
     ///
-    /// Without it, a `focusable` element focused from the keyboard draws AppKit's ring when
-    /// neither it nor a child (short of another focusable) sets `focus_ring`: 3 points wide
-    /// in [`Cx::focus_color`](crate::Cx::focus_color), just outside its border box, following
+    /// Without it, a `focusable` element focused from the keyboard draws the default ring when
+    /// neither it nor a child (short of another focusable) sets `focus_ring`: the view's
+    /// [`Cx::focus_ring`](crate::Cx::focus_ring), else AppKit's, 3 points wide in
+    /// [`Cx::focus_color`](crate::Cx::focus_color), just outside its border box, following
     /// its corner radii. Text fields, focused links, `focus_highlight` rows and the items of a `menu`,
     /// `listbox`, `list`, `tree` or `grid` group draw none, as in AppKit: their caret,
     /// highlight or selection shows focus.
     pub fn no_focus_ring(mut self) -> Self {
-        self.focus.ring = None;
-        self.focus.ring_off = true;
+        self.cold_mut().focus.ring = None;
+        self.cold_mut().focus.within = false;
+        self.cold_mut().focus.ring_off = true;
         self
     }
     /// Trap focus and make the background inert while mounted. Escape requests dismissal.
     pub fn modal<S: 'static>(mut self, click_outside: bool, dismiss: impl Fn(&mut S) + 'static) -> Self {
         self.handlers.modal = Some(ModalSpec { outside: click_outside,
             dismiss: Rc::new(move |s, _| dismiss(downcast::<S>(s))) });
+        self
+    }
+    /// [`El::modal`] whose dismissal gets the change's [`Tx`]: a dialog that closes at once
+    /// (`tx.instant()`), say.
+    pub fn modal_tx<S: 'static>(mut self, click_outside: bool, dismiss: impl Fn(&mut S, &mut Tx) + 'static) -> Self {
+        self.handlers.modal = Some(ModalSpec { outside: click_outside,
+            dismiss: Rc::new(move |s, tx| dismiss(downcast::<S>(s), tx)) });
         self
     }
     pub fn modal_click_outside(mut self, enabled: bool) -> Self {
@@ -1134,7 +1206,7 @@ impl El {
 
     /// A renderer-owned periodic or finite presentation track, on the shared clock.
     pub fn looping(mut self, spec: rune_motion::LoopSpec) -> Self {
-        self.looping = Some(Box::new(spec));
+        self.cold_mut().looping = Some(Box::new(spec));
         self
     }
 
@@ -1142,7 +1214,15 @@ impl El {
     /// it, each later one is renamed `key#dup1`, `key#dup2`, ... and Rune prints a warning naming
     /// both call sites once per key.
     #[cfg_attr(debug_assertions, track_caller)]
+    #[inline]
     pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.set_key(key);
+        self
+    }
+    /// [`El::key`] in place.
+    #[cfg_attr(debug_assertions, track_caller)]
+    #[inline]
+    pub fn set_key(&mut self, key: impl Into<String>) -> &mut Self {
         self.key = Some(key.into());
         #[cfg(debug_assertions)]
         { self.key_source = Some(std::panic::Location::caller()); }
@@ -1153,25 +1233,39 @@ impl El {
     /// place the caret at the nearer end, without blurring a focused field or dragging the
     /// window; buttons and other controls inside keep their own presses. With zero or more
     /// than one reachable editor inside, the container does nothing special.
+    #[inline]
     pub fn role(mut self, role: &'static str) -> Self {
-        self.role = role;
+        self.set_role(role);
         self
     }
+    /// [`El::role`] in place.
+    #[inline]
+    pub fn set_role(&mut self, role: &'static str) -> &mut Self {
+        self.set_role_name(role);
+        self
+    }
+    #[inline]
     pub fn label(mut self, label: impl Into<String>) -> Self {
-        self.label = Some(label.into());
+        self.set_label(label);
+        self
+    }
+    /// [`El::label`] in place.
+    #[inline]
+    pub fn set_label(&mut self, label: impl Into<String>) -> &mut Self {
+        self.cold_mut().label = Some(label.into());
         self
     }
     /// An outline row's depth for accessibility, 1 at the top (ARIA `aria-level`), as a
     /// `treeitem` carries it. The element tree reports it as `level`.
     pub fn level(mut self, level: u32) -> Self {
-        self.a11y.level = Some(level);
+        self.cold_mut().a11y.level = Some(level);
         self
     }
     /// Whether a disclosure (a tree row with children, a collapsible header) is open, for
     /// accessibility (ARIA `aria-expanded`). Leave it unset on an element that can't open.
     /// The element tree reports it as `expanded`.
     pub fn expanded(mut self, open: bool) -> Self {
-        self.a11y.expanded = Some(open);
+        self.cold_mut().a11y.expanded = Some(open);
         self
     }
     /// Turn this element's icon by `radians`, clockwise about its centre: a disclosure chevron
@@ -1189,47 +1283,109 @@ impl El {
     /// as SwiftUI's `.help`. A press, scroll, key or the pointer leaving hides it; it takes no
     /// input itself. On macOS it is AppKit's own tooltip; elsewhere Rune draws it. The element
     /// tree (`Runtime::elements`, `--tree`) carries it as the element's help text.
+    #[inline]
     pub fn help(mut self, text: impl Into<String>) -> Self {
+        self.set_help(text);
+        self
+    }
+    /// [`El::help`] in place.
+    pub fn set_help(&mut self, text: impl Into<String>) -> &mut Self {
         let text = text.into();
-        self.help = (!text.is_empty()).then_some(text);
-        self.help_cut = false;
+        if !text.is_empty() || !self.cold.is_empty() {
+            let cold = self.cold_mut();
+            cold.help = (!text.is_empty()).then_some(text);
+            cold.help_cut = false;
+        }
         self
     }
     /// [`El::help`] that shows only while this text is cut short ([`truncate`](Self::truncate), `max_lines`
     /// or `truncate_fade`), as AppKit's expansion tooltips show a table cell's whole text.
     pub fn help_when_truncated(self, text: impl Into<String>) -> Self {
         let mut e = self.help(text);
-        e.help_cut = true;
+        e.cold_mut().help_cut = true;
         e
     }
+    /// Keycaps drawn after this element's [`El::help`] text, as a web tooltip shows its
+    /// command's keybind: `.help("Toggle review").help_keys(["Ctrl", "Shift", "R"])`. Call it
+    /// after `help`, which replaces them. The element tree and assistive technology read them
+    /// after the text, a space apart.
+    pub fn help_keys<K: Into<String>>(mut self, keys: impl IntoIterator<Item = K>) -> Self {
+        if let Some(h) = self.cold.get_mut_if_some().and_then(|c| c.help.as_mut()) {
+            for k in keys.into_iter().map(Into::into).filter(|k| !k.is_empty()) {
+                h.push(HELP_KEY);
+                h.push_str(&k);
+            }
+        }
+        self
+    }
+    /// Shows this element's [`El::help`] tooltip above it, 4 points clear, and below only when
+    /// there's no room above, as a web page's `placement="top"` tooltip sits over its button.
+    pub fn help_above(mut self) -> Self {
+        self.cold_mut().help_above = true;
+        self
+    }
+    #[inline]
     pub fn child(mut self, child: El) -> Self {
-        self.memo_built = None;
-        self.has_virtual |= child.has_virtual;
+        self.push_child(child);
+        self
+    }
+    /// [`El::child`] in place.
+    #[inline]
+    pub fn push_child(&mut self, child: El) -> &mut Self {
+        self.flags.set(ElFlags::MEMO_EXTENDED, self.memo.is_some());
+        if child.flags.has(ElFlags::HAS_VIRTUAL) {
+            self.flags.set(ElFlags::HAS_VIRTUAL, true);
+        }
         self.children.push(child);
         self
     }
+    #[inline]
     pub fn children(mut self, children: impl IntoIterator<Item = El>) -> Self {
-        self.memo_built = None;
+        self.extend_children(children);
+        self
+    }
+    /// [`El::children`] in place.
+    #[inline]
+    pub fn extend_children(&mut self, children: impl IntoIterator<Item = El>) -> &mut Self {
+        self.flags.set(ElFlags::MEMO_EXTENDED, self.memo.is_some());
         let start = self.children.len();
         self.children.extend(children);
-        self.has_virtual |= self.children[start..].iter().any(|c| c.has_virtual);
+        if self.children[start..].iter().any(|c| c.flags.has(ElFlags::HAS_VIRTUAL)) {
+            self.flags.set(ElFlags::HAS_VIRTUAL, true);
+        }
         self
     }
 
     // Text
+    #[inline]
     pub fn color(mut self, c: Color) -> Self {
+        self.set_color(c);
+        self
+    }
+    /// [`El::color`] in place.
+    #[inline]
+    pub fn set_color(&mut self, c: Color) -> &mut Self {
         if let Some(t) = &mut self.text {
             t.color = c;
+            t.inked = true;
         }
         if let Some(cold) = self.vis.cold.get_mut_if_some() && let Some((_, ic)) = &mut cold.icon {
             *ic = c;
+            cold.icon_inked = true;
         }
-        if self.input.is_some() {
+        if self.cold.input.is_some() {
             self.sync_input_rich();
         }
         self
     }
+    #[inline]
     pub fn align(mut self, a: Align) -> Self {
+        self.set_align(a);
+        self
+    }
+    /// [`El::align`] in place.
+    #[inline]
+    pub fn set_align(&mut self, a: Align) -> &mut Self {
         if let Some(t) = &mut self.text {
             t.align = a;
         }

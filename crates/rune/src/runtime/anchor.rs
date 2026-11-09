@@ -1,7 +1,7 @@
 //! Where `El::anchored` overlays go, how long an `El::anchored_fit` one may be, and the zoom
 //! one inherits from its anchor.
 use super::*;
-use crate::el::{Anchor, Side};
+use crate::el::{Anchor, Flow, Pin, Side};
 
 /// The node an `El::above` anchor `a` names, among the `before` nodes ahead of its element.
 pub(super) fn anchor_index(nodes: &[Node], before: usize, a: &Anchor) -> Option<usize> {
@@ -52,6 +52,10 @@ pub(crate) fn anchor_position(a: &Anchor, t: [f32; 4], size: (f32, f32), vp: (f3
     // Along the main axis only keep the start edge inside; a long list may run off the far end
     // (`El::anchored_fit` bounds it instead).
     if vertical { y = y.max(margin) } else { x = x.max(margin) }
+    if a.round {
+        // `Math.round`: halves go up.
+        return ((x + 0.5).floor(), (y + 0.5).floor());
+    }
     (x, y)
 }
 
@@ -85,7 +89,14 @@ impl<S: 'static> Measurement<'_, S> {
             };
             nodes[i].id = id;
             self.node_index.insert(id, i);
-            let l = taffy.box_layout(nodes[i].taffy);
+            let mut l = taffy.box_layout(nodes[i].taffy);
+            // Right to left: laid out left to right, then mirrored inside the parent (`El::dir`).
+            if let Some(p) = nodes[i].parent.filter(|&p| nodes[p].flow == Flow::Rtl && nodes[i].pin == Pin::Flowing) {
+                l.x = nodes[p].local.w - l.x - l.w;
+            }
+            if nodes[i].flow == Flow::Rtl {
+                l.inset.swap(0, 2);
+            }
             nodes[i].local = MRect::new(l.x, l.y, l.w, l.h);
             let (px, py) = nodes[i].parent.map_or((0.0, 0.0), |p| (nodes[p].target[0], nodes[p].target[1]));
             let mut x = px + l.x;

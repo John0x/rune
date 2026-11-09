@@ -97,7 +97,7 @@ impl El {
         self
     }
     fn set_motion(&mut self, s: Spring, authored_instant: bool) {
-        self.motion = Some(s);
+        self.cold_mut().motion = Some(s);
         if authored_instant || self.vis.instant_motion {
             self.vis.cold_mut().instant_motion = authored_instant;
         }
@@ -112,7 +112,10 @@ impl El {
     /// Not for an element with a `live_offset` or a sliding loop, which own the same shift.
     pub fn offset(mut self, x: f32, y: f32) -> Self {
         let ok = |v: f32| if v.is_finite() { v } else { 0.0 };
-        self.vis.offset = [ok(x), ok(y)];
+        let o = [ok(x), ok(y)];
+        if o != [0.0; 2] || !self.vis.cold.is_empty() {
+            self.vis.cold_mut().offset = o;
+        }
         self
     }
     /// The curve [`Self::offset`] changes on.
@@ -127,7 +130,19 @@ impl El {
     /// opacity, a blur) no longer groups it. Raised elements stack in tree order. A floating
     /// sidebar sliding over the content beside it, or a dragged row over its neighbours.
     pub fn raise(mut self) -> Self {
-        self.vis.raise = true;
+        self.vis_flags.set(VisualFlags::RAISE, true);
+        self
+    }
+    /// Where this element paints among its siblings, as CSS `z-index` orders positioned
+    /// siblings: a higher order paints over siblings with a lower one, wherever they come in
+    /// the tree, and takes the pointer first where they overlap; equal orders paint in tree
+    /// order. 0 by default. Its focus order and accessibility order stay where it is in the
+    /// tree, and unlike [`Self::raise`] it stays inside its parent's layers. A floating button
+    /// placed before the page in the tree, for its Tab order, still paints over the page.
+    pub fn paint_order(mut self, order: i16) -> Self {
+        if order != 0 || !self.vis.cold.is_empty() {
+            self.vis.cold_mut().paint_order = order;
+        }
         self
     }
     /// Override the curve this element's own opacity changes on, with an optional delay
@@ -136,18 +151,18 @@ impl El {
     /// its [`transition`](Self::transition) and multiplies this opacity; hold all of it with
     /// [`enter_delay`](Self::enter_delay).
     pub fn opacity_motion(mut self, anim: impl Into<Anim>) -> Self {
-        self.opacity_motion = Some(Box::new(anim.into()));
+        self.cold_mut().opacity_motion = Some(Box::new(anim.into()));
         self
     }
     /// When this element travels, its leading edge moves on `lead` and its trailing edge on `trail`
     /// (width leads).
     pub fn lead(mut self, lead: Spring, trail: Spring) -> Self {
-        self.lead = Some((lead, trail));
+        self.cold_mut().lead = Some((lead, trail));
         self
     }
     /// The X axis springs faster (`0.78×` duration) when this element resizes or travels.
     pub fn width_leads(mut self) -> Self {
-        self.width_leads = true;
+        self.flags.set(ElFlags::WIDTH_LEADS, true);
         self
     }
     /// Spring this subtree's horizontal layout (x and width) inside a growth-stack row, and
@@ -155,7 +170,7 @@ impl El {
     /// while the row's height carries the motion, so a label that changes width in place jumps
     /// its neighbours. Vertical place stays with the row's growth.
     pub fn animate_layout(mut self) -> Self {
-        self.animate_layout = true;
+        self.flags.set(ElFlags::ANIMATE_LAYOUT, true);
         self
     }
     /// Land every change inside this element at once, as a [`Tx::instant`] commit would, even
@@ -164,7 +179,7 @@ impl El {
     /// and exit keep their transition, and colours (a hover highlight) keep their springs. A
     /// popup of search results under a field whose edits animate the layout around it.
     pub fn instant_changes(mut self) -> Self {
-        self.instant_changes = true;
+        self.flags.set(ElFlags::INSTANT_CHANGES, true);
         self
     }
     /// How this element enters and exits when mounted or removed after the first frame
@@ -179,7 +194,7 @@ impl El {
     /// on a row also slides and fades it in. Rows a virtual list remounts on scroll never replay it.
     /// [`enter_delay`](Self::enter_delay) holds the whole entrance, as a staggered list does.
     pub fn transition(mut self, t: Transition) -> Self {
-        self.transition = Some(Box::new(t));
+        self.cold_mut().transition = Some(Box::new(t));
         self
     }
     /// Shared-element motion (SwiftUI `matchedGeometryEffect`, Motion `layoutId`). When an
@@ -198,7 +213,27 @@ impl El {
     /// exits and the new one enters by their own transitions, in place.
     /// When two elements share an id in one tree, the last one in tree order is matched.
     pub fn matched(mut self, id: impl Into<String>) -> Self {
-        self.matched = Some(Rc::from(id.into()));
+        self.cold_mut().matched = Some(Rc::from(id.into()));
+        self
+    }
+    /// While this [`matched`](Self::matched) element flies, its children keep their final
+    /// layout at their own size, from the moving frame's leading edge and centred on its
+    /// height, cropped to it, rather than scaled to cover it: for a row whose width changes as
+    /// it flies, as a tab moving between a titlebar's strip and a sidebar, whose avatar and title
+    /// would otherwise scale up or slide off its leading edge.
+    pub fn matched_crop(mut self) -> Self {
+        self.vis.cold_mut().flight_crop = true;
+        self
+    }
+    /// When an animated commit changes this element's width (a side panel springing open
+    /// beside a column of text), it and everything in it take the layout they land at in
+    /// that frame, so text wraps once rather than on every frame of the travel, and the whole
+    /// slides as one: its first child that drew last frame starts where it was drawn and
+    /// glides to its new place on this element's spring. Heights its growth rows change land
+    /// with it. Motion checks take that frame's re-layout as designed. A window resize, an
+    /// instant commit and Reduce Motion land as they otherwise would.
+    pub fn hold_landing_width(mut self) -> Self {
+        self.vis.cold_mut().hold_landing = true;
         self
     }
 }

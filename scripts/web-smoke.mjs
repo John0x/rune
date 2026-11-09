@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { readFile, mkdir } from 'node:fs/promises';
 import { resolve, extname, sep } from 'node:path';
 import { inputSmoke } from './web-input-smoke.mjs';
+import { clockSmoke } from './web-clock-smoke.mjs';
 const { chromium, webkit } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const engine = process.env.WEB_ENGINE || 'chromium';
 const root = resolve(process.argv[2] || 'target/web');
@@ -139,8 +140,33 @@ try {
     }
     await page.setViewportSize({ width: 390, height: 760 });
     await inputSmoke(page, url);
+    // JPEG bytes go to the browser's codecs, PNG bytes to Rune's.
+    await page.goto(`${url}/?image-proof`);
+    await page.waitForFunction(() => window.__imageProof?.jpeg && window.__imageProof?.png);
+    assert.deepEqual(await page.evaluate(() => window.__imageProof), { jpeg: { width: 12, height: 6 }, png: { width: 12, height: 6 } });
+    // The cursor over them is the PNG at 2x, which the browser decodes and sizes in points.
+    const cursor = () => page.evaluate(() => getComputedStyle(document.querySelector('canvas')).cursor);
+    await page.mouse.move(76, 114);
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('canvas')).cursor.includes('image-set('));
+    const css = await cursor();
+    assert.match(css, /image-set\(url\("blob:[^"]+"\) 2(x|dppx)\) 1 2, auto$/, css);
+    const size = await page.evaluate(async (url) => {
+        const image = new Image();
+        image.src = url;
+        await image.decode();
+        return [image.naturalWidth, image.naturalHeight];
+    }, css.match(/blob:[^"]+/)[0]);
+    assert.deepEqual(size, [12, 6]);
+    await page.mouse.move(300, 700);
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('canvas')).cursor === 'auto');
+    // Inter's full faces load from beside app.js once the first frame is up.
+    await page.waitForFunction(() => performance.getEntriesByType('resource').filter(e => /\/Inter-\w+\.ttf$/.test(e.name) && e.responseEnd > 0).length === 3);
+    assert.deepEqual(await page.evaluate(() => performance.getEntriesByType('resource')
+        .filter(e => /\/Inter-\w+\.ttf$/.test(e.name)).map(e => e.responseStatus ?? 200)), [200, 200, 200]);
+    console.log(JSON.stringify({ ok: true, checks: ['image bytes', 'image cursor', 'full Inter faces'] }));
     assert.deepEqual(await page.evaluate(() => window.__proof.gpuErrors), []);
     assert.deepEqual(errors.filter(e => !e.includes('404')), []);
+    if (engine === 'chromium') { await clockSmoke(browser, url); console.log(JSON.stringify({ ok: true, checks: ['page clock'] })); }
     }
 } finally {
     await browser.close();

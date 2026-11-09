@@ -9,7 +9,8 @@ mod model;
 mod myers;
 mod state;
 mod view;
+mod words;
 
 pub use model::{FileDiff, FileStatus, Hunk, Line, LineKind, Side, parse};
 pub use state::{Annotation, DiffMode, DiffState, EXPAND_STEP, Expand, LineRange, LineRef};
-pub use view::DiffView;
+pub use view::{DiffView, FoldRow};

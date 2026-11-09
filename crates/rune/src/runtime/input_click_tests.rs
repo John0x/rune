@@ -139,7 +139,7 @@ fn double_and_triple_click_select_word_and_line_in_single_line_input() {
     rt.pointer_up(x, y);
     rt.frame(1.0 / 60.0);
     assert!(rt.state.single.focused);
-    assert!(!rt.keyboard_focus, "pointer focus does not turn on keyboard focus ring");
+    assert!(!rt.focus.keyboard(), "pointer focus does not turn on keyboard focus ring");
     assert_eq!(rt.state.single.anchor, rt.state.single.focus);
     assert!(rt.state.single.focus > 0 && rt.state.single.focus < 4);
 
@@ -334,7 +334,7 @@ fn timing_slop_and_target_changes_reset_multiclick_count_and_preedit_ignores_it(
     let before = (rt.state.single.anchor, rt.state.single.focus);
     click(&mut rt, pt);
     click(&mut rt, pt);
-    assert!(rt.state.single.preedit.is_some());
+    assert!(rt.state.single.preedit().is_some());
     assert_eq!((rt.state.single.anchor, rt.state.single.focus), before);
 }
 

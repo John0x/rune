@@ -22,6 +22,8 @@ pub(super) enum Action {
     ScreenLayout(String, [f32; 4]),
     /// `El::on_drawn_layout`; true when only a live value, scroll or animation moved it.
     DrawnLayout(String, [f32; 4], bool),
+    /// `El::on_visible`: the element came on screen or left it.
+    Visible(String, bool),
     Press(String, crate::PointerButton),
     DoublePress(String),
     Link(String, usize),
@@ -49,6 +51,9 @@ pub(super) enum Action {
     /// A `Tx::open_file` or `Tx::save_file` callback's id and the dialog's answer.
     FileDialog(u64, crate::file_dialog::FileDialogResult),
     Focus(String, f32, f32),
+    /// A text field's menu: the field, the window point it opens at, and where in the field a
+    /// press asked for it (none from the keyboard).
+    FieldMenu(String, (f32, f32), Option<(f32, f32)>),
     Blur,
     /// What assistive technology asked of an element (`a11y/actions.rs`).
     A11y(String, A11yAct),
@@ -106,6 +111,7 @@ pub(super) fn live_only_handler(action: &Action) -> Option<&'static str> {
     Some(match action {
         Action::WindowFocus(_) => "on_window_focus",
         Action::DrawnLayout(..) => "on_drawn_layout_tx",
+        Action::Visible(..) => "on_visible",
         Action::Layout(..) => "on_layout_tx",
         Action::PointerMove(..) => "on_pointer_move_local",
         Action::Hover(_) => "on_hover",
@@ -134,7 +140,7 @@ pub(super) fn action_path(action: &Action) -> Option<&str> {
     match action {
         Action::PointerMove(path, _) | Action::DrawnLayout(path, ..) | Action::Layout(path, _) | Action::Hover(path) | Action::HoverChange(path, _) | Action::SelectionChange(path, _) | Action::Press(path, _) | Action::DoublePress(path)
         | Action::Link(path, _) | Action::LinkSecondary(path, ..) | Action::SecondaryPress(path, _) | Action::Drag(path, ..) | Action::DragRepeat(path, ..) | Action::DragStart(path)
-        | Action::DragEnd(path, _) => Some(path),
+        | Action::DragEnd(path, _) | Action::Visible(path, _) => Some(path),
         Action::Wheel(_, chain, _) | Action::Gesture(chain, _) => chain.first().map(String::as_str),
         _ => None,
     }
@@ -183,9 +189,11 @@ pub(super) fn merge(tx: &mut Tx, one: Tx) {
     tx.scroll_pages.extend(one.scroll_pages);
     tx.scroll_offsets.extend(one.scroll_offsets);
     tx.keep_on_screen.extend(one.keep_on_screen);
+    tx.evict_memos.extend(one.evict_memos);
     tx.wakes.extend(one.wakes);
     tx.text_flights.extend(one.text_flights);
     tx.launches.extend(one.launches);
+    tx.unclipped_flights |= one.unclipped_flights;
     tx.popups.extend(one.popups);
     tx.file_dialogs.extend(one.file_dialogs);
     if let Some(request) = one.window_frame { tx.window_frame = Some(tx.window_frame.unwrap_or_default().merge(request)); }
@@ -194,6 +202,9 @@ pub(super) fn merge(tx: &mut Tx, one: Tx) {
     if one.copy.is_some() { tx.copy = one.copy; }
     tx.shell = tx.shell.max(one.shell);
     tx.minimize |= one.minimize;
+    tx.toggle_maximized |= one.toggle_maximized;
+    tx.toggle_full_screen |= one.toggle_full_screen;
+    tx.keys.extend(one.keys);
     if one.title.is_some() { tx.title = one.title; }
     tx.playground.extend(one.playground);
     tx.open_urls.extend(one.open_urls);
@@ -202,6 +213,7 @@ pub(super) fn merge(tx: &mut Tx, one: Tx) {
     if one.font_families.is_some() { tx.font_families = one.font_families; }
     if one.rewind.is_some() { tx.rewind = one.rewind; }
     tx.blur |= one.blur;
+    if one.focus_to.is_some() { tx.focus_to = one.focus_to; }
     if one.select.is_some() {
         tx.select = one.select;
         tx.select_from_change = one.select_from_change;
@@ -293,14 +305,14 @@ impl<S: 'static> Runtime<S> {
         let repeat = matches!(action, Action::DragRepeat(..));
         let ran = match action {
             Action::WindowFocus(focused) => {
-                if !focused { self.held = None; }
+                if !focused { self.held = physical_dispatch::Activation::Up; }
                 let Some(f) = self.nodes.get(self.app_root()).and_then(|n| n.handlers.on_window_focus.clone()) else { return false };
                 f(states!(self), focused, &mut one);
                 true
             }
             Action::Physical(event, fallback) => {
                 // The window lost key focus (an internal focus move also notifies handlers).
-                if matches!(event, crate::PhysicalInput::FocusLost) { self.held = None; }
+                if matches!(event, crate::PhysicalInput::FocusLost) { self.held = physical_dispatch::Activation::Up; }
                 let ran = self.dispatch_physical(event, fallback, tx);
                 let live_only = std::mem::take(&mut tx.live_only);
                 return if ran && live_only { self.skip_view("a key handler") } else { ran };
@@ -312,15 +324,19 @@ impl<S: 'static> Runtime<S> {
             Action::HoverFocus(path) => match path {
                 Some(path) => {
                     self.set_focus(Some(path), false);
-                    self.hover_focus = true;
+                    self.focus.step(focus_machine::FocusEvent::Hover(true));
                     one.instant = true;
                     true
                 }
-                None => std::mem::take(&mut self.hover_focus),
+                None => {
+                    let lit = self.focus.hovered();
+                    self.focus.step(focus_machine::FocusEvent::Hover(false));
+                    lit
+                }
             },
             Action::Dismiss(path) => {
                 let Some(f) = self.node(&path).and_then(|n| n.handlers.modal.as_ref().map(|m| m.dismiss.clone())) else { return false };
-                self.set_focus(None, self.keyboard_focus);
+                self.set_focus(None, self.focus.keyboard());
                 f(states!(self), &mut one);
                 true
             }
@@ -356,6 +372,11 @@ impl<S: 'static> Runtime<S> {
             Action::DrawnLayout(path, rect, _) => {
                 let Some(f) = self.node(&path).and_then(|n| n.handlers.on_drawn_layout.clone()) else { return false };
                 f(states!(self), rect, &mut one);
+                true
+            }
+            Action::Visible(path, on) => {
+                let Some(f) = self.node(&path).and_then(|n| n.handlers.on_visible.clone()) else { return false };
+                f(states!(self), on, &mut one);
                 true
             }
             Action::Hover(path) => {
@@ -480,9 +501,10 @@ impl<S: 'static> Runtime<S> {
             }
             Action::FileDialog(id, result) => self.run_file_dialog(id, result, &mut one),
             Action::Focus(path, x, y) => self.focus_input(path, x, y, &mut one),
+            Action::FieldMenu(path, at, local) => self.field_menu(path, at, local, &mut one),
             Action::Blur => {
-                if self.focused.is_none() { return false; }
-                self.set_focus(None, self.keyboard_focus);
+                if self.focus.path().is_none() { return false; }
+                self.set_focus(None, self.focus.keyboard());
                 true
             }
             Action::A11y(path, act) => self.run_a11y(path, act, &mut one),

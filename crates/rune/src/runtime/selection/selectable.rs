@@ -17,10 +17,17 @@
 use super::*;
 use std::ops::Range;
 
+/// A secondary press outside the selection selects the word under it first: AppKit text does,
+/// Chromium on Windows and Linux doesn't.
+const SECONDARY_SELECTS_WORD: bool = cfg!(target_os = "macos");
+
+#[path = "copy_join.rs"]
+mod copy_join;
 #[path = "toolbar.rs"]
 mod selection_toolbar;
 #[path = "text_selection.rs"]
 mod text_selection;
+pub(crate) use copy_join::CopyJoin;
 pub(crate) use selection_toolbar::OnPress;
 pub use text_selection::{SelectedText, SelectionChange, TextSelection};
 
@@ -506,19 +513,21 @@ impl<S: 'static> Runtime<S> {
 
     /// The texts of `ranges` joined as copying joins them.
     fn joined(&self, ranges: &[(usize, usize, usize)]) -> String {
-        let mut out = String::new();
+        let mut out = CopyJoin::default();
         let mut prev: Option<usize> = None;
         for &(i, a, b) in ranges {
-            let Some(piece) = self.nodes[i].text.as_ref().and_then(|t| t.copy_slice(a as u32, b as u32)) else { continue };
-            if let Some(p) = prev {
-                let (pb, nb) = (self.drawn_box(p), self.drawn_box(i));
-                if nb[1] < pb[3] - 0.5 && nb[0] >= pb[2] - 0.5 { out.push('\t'); }
-                else if !out.ends_with('\n') { out.push('\n'); }
-            }
-            out.push_str(&piece);
+            let Some(spec) = self.nodes[i].text.as_ref() else { continue };
+            let Some(piece) = spec.copy_slice(a as u32, b as u32) else { continue };
+            out.push(spec, a..b, &piece, prev.is_some_and(|p| self.beside(p, i)), usize::MAX);
             prev = Some(i);
         }
-        out
+        out.finish()
+    }
+
+    /// Text `i` was drawn beside text `p`, to its right on the same line (a table row's cells).
+    pub(crate) fn beside(&self, p: usize, i: usize) -> bool {
+        let (pb, nb) = (self.drawn_box(p), self.drawn_box(i));
+        nb[1] < pb[3] - 0.5 && nb[0] >= pb[2] - 0.5
     }
 
     /// Selects from the start of text `first` to the end of text `last`, a later text of its
@@ -530,7 +539,7 @@ impl<S: 'static> Runtime<S> {
 
     /// The held press is selecting text by dragging, and has selected some.
     pub(super) fn selected_by_drag(&self) -> bool {
-        self.text_sel.dragging && self.press_moved && (!self.selection_ranges().is_empty() || self.has_nonempty_selection())
+        self.text_sel.dragging && self.press.held().is_some_and(|h| h.moved) && (!self.selection_ranges().is_empty() || self.has_nonempty_selection())
     }
 
     pub(super) fn clear_text_selection(&mut self) {
@@ -713,12 +722,14 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// A secondary click on selectable text `path` without its own `on_secondary_press` opens the
-    /// Copy menu, selecting the word under the pointer first when the click is outside the
-    /// selection, as AppKit text does. False when the app's handler should run instead.
+    /// Copy menu. On macOS it selects the word under the pointer first when the click is outside
+    /// the selection, as AppKit text does; elsewhere the selection stays as it is, as Chromium's
+    /// does on Windows and Linux. False when the app's handler should run instead.
     pub(super) fn selection_menu(&mut self, path: &str, x: f32, y: f32) -> bool {
         let Some(i) = self.live(path) else { return false };
         if !self.is_selectable(i) || self.nodes[i].handlers.on_secondary_press.is_some() { return false; }
-        if let Some(at) = self.text_index_at(i, x, y)
+        if SECONDARY_SELECTS_WORD
+            && let Some(at) = self.text_index_at(i, x, y)
             && range_in(&self.selection_ranges(), i).is_none_or(|(a, b)| at < a || at >= b)
         {
             let content = self.content_of(i).to_owned();
@@ -730,8 +741,9 @@ impl<S: 'static> Runtime<S> {
             self.seal_between();
         }
         let text = self.copy_text();
-        let mut copy = crate::PopupItem::new("copy", "Copy").enabled(text.is_some());
-        if let Ok(shortcut) = "cmd+c".parse::<crate::Shortcut>() { copy = copy.key_equivalent(shortcut); }
+        let mut copy = crate::PopupItem::new("copy", crate::labels::label(crate::Label::Copy)).enabled(text.is_some());
+        // The primary modifier, as the copy key handler takes it: ⌘C on macOS, Ctrl+C elsewhere.
+        if let Ok(shortcut) = "mod+c".parse::<crate::Shortcut>() { copy = copy.key_equivalent(shortcut); }
         log_event!(self, "selection menu {path}");
         self.popups.push_back(crate::popup_menu::Request {
             menu: crate::PopupMenu::new().item(copy),
@@ -739,6 +751,7 @@ impl<S: 'static> Runtime<S> {
             on_pick: Box::new(move |_, picked, tx| {
                 if picked == Some("copy") && let Some(text) = text { tx.copy(text); }
             }),
+            field: None,
         });
         true
     }

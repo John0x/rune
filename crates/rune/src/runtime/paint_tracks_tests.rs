@@ -61,7 +61,7 @@ fn a_first_colour_change_still_crossfades_from_the_drawn_colour() {
     let l = label(&rt);
     let text = rt.color(l.id, P_TEXT, l.text.as_ref().unwrap().color);
     assert!(text.r > 0.0 && text.r < 1.0, "the text is between black and white: {text:?}");
-    let border = rt.color(n.id, P_BORDER, n.vis.border);
+    let border = rt.color(n.id, P_BORDER, n.vis.border());
     assert!(border.r > 0.0 && border.r < 1.0, "the border is between black and white: {border:?}");
     let shadow = rt.color(n.id, P_SHADOWS[0], n.vis.shadows[0].color);
     assert!(shadow.r > 0.0 && shadow.r < 1.0, "the shadow is between black and white: {shadow:?}");
@@ -69,7 +69,7 @@ fn a_first_colour_change_still_crossfades_from_the_drawn_colour() {
     while k < 240 && rt.frame(1.0 / 120.0) { k += 1; }
     let n = row(&rt);
     assert_eq!(rt.color(n.id, P_FILL, n.vis.fill), Color::BLACK);
-    assert_eq!(rt.color(n.id, P_BORDER, n.vis.border), Color::WHITE);
+    assert_eq!(rt.color(n.id, P_BORDER, n.vis.border()), Color::WHITE);
 }
 
 #[test]
@@ -110,11 +110,11 @@ fn rebuilding_reuses_node_paths_and_restores_on_layout_retry() {
     // Trigger both a layout-read settle retry (`tick = 1` changes `box` width) and `return_focus_to`
     // under `sheet` (whose own path was moved on the previous commit).
     let btn_path = rt.nodes.iter().find(|n| n.key.as_deref() == Some("btn")).unwrap().path.clone();
-    rt.focused = Some(btn_path);
+    rt.focus.focus = crate::runtime::focus_machine::Focus::On { path: btn_path, hovered: false, from: None };
     rt.update(|s, _| { s.open = false; s.tick = 1; });
     rt.frame(1.0 / 120.0);
     let anchor_path = rt.nodes.iter().find(|n| n.key.as_deref() == Some("anchor")).unwrap().path.clone();
-    assert_eq!(rt.focused.as_deref(), Some(anchor_path.as_str()));
+    assert_eq!(rt.focus.path(), Some(anchor_path.as_str()));
 }
 
 #[test]

@@ -61,6 +61,17 @@ pub struct Args {
     pub(crate) crop_key: Option<String>,
     /// `--whole-window`: `--snap` with `--playground` takes the whole window, not just the stage.
     pub(crate) whole_window: bool,
+    /// `--html OUT.html`: write the scene as a static page (`tooling::html`).
+    pub(crate) html: Option<PathBuf>,
+    /// `--html-widths 360,640,1000`: the widths `--html` lays the page out at, each the
+    /// narrowest its `@media` rules apply to.
+    pub(crate) html_widths: Vec<f32>,
+    /// `--html-template FILE`: the page `--html` fills at `<!-- rune:css -->` and `<!-- rune:body -->`.
+    pub(crate) html_template: Option<PathBuf>,
+    /// `--realtime`: a headless run waits for the wall clock to reach each frame's time and
+    /// prints `rune-mark NAME T` as the script passes each mark, so a live server's replies and a
+    /// harness's actions keep pace with its script.
+    pub(crate) realtime: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,8 +170,15 @@ impl Args {
                 "--pointer" => a.pointer = true,
                 "--desktop" => a.desktop = Some(val(&mut i).into()),
                 "--tree" => a.tree = Some(val(&mut i).into()),
+                "--html" => a.html = Some(val(&mut i).into()),
+                "--html-template" => a.html_template = Some(val(&mut i).into()),
+                "--html-widths" => {
+                    let v = val(&mut i);
+                    a.html_widths = v.split(',').map(|w| positive(w).unwrap_or_else(|| die(&format!("--html-widths is a list of widths above 0: {v}")))).collect();
+                }
                 "--trace" => a.trace = Some(val(&mut i).into()),
                 "--native" => a.native = true,
+                "--realtime" => a.realtime = true,
                 "--trace-all" => a.trace_all = true,
                 "--strip" => a.strip = Some(val(&mut i).into()),
                 "--crop" => {
@@ -197,6 +215,7 @@ impl Args {
         if self.snap_on_patch.is_some() { return true; }
         self.snap.is_some()
             || self.tree.is_some()
+            || self.html.is_some()
             || (!self.native
                 && (self.script.is_some() || self.trace.is_some() || self.frames.is_some() || self.duration.is_some() || self.out.is_some()))
             || self.video.is_some()
@@ -257,10 +276,16 @@ const HELP: &str = "usage: <app> [window]
   --strip out.png --crop x,y,w,h --every K    tile dumped frames into one image
                         (repeat --crop to stack several regions per frame; --cols N per row)
   --tree out.json       element tree with animated values
+  --html out.html       the page as static HTML and CSS, at rest, for a web app's first paint
+                        (no GPU); --html-widths 360,640,1000 lays it out at each width and
+                        folds them into @media rules; --html-template FILE fills
+                        <!-- rune:css --> and <!-- rune:body --> in FILE
   --trace out.jsonl     per-frame rects/opacity in motion-lint JSONL, with the tracks each frame
                         sampled (tk) and why it was animating (quality.why)
   --trace-all           trace unkeyed elements too, by path
   --native             trace native submissions; --frames N stops after N frames
+  --realtime            headless: hold each frame until the wall clock reaches its time, and
+                        print \"rune-mark NAME T\" as the script passes each mark
   --first-pixels        report when the first GPU-complete offscreen pixels are readable
   --window KEY         select a window for headless tools (run_windows, App::window)
   --list-windows       list window keys using a deterministic virtual display

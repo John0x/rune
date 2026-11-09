@@ -71,7 +71,7 @@ impl<S: 'static> Runtime<S> {
         if let Some(input) = n.input.as_deref() {
             let e = &input.edit;
             if !secure { e.text.hash(&mut h); }
-            (e.anchor, e.focus, e.preedit.as_ref().map(|p| (p.0.len(), p.1)), e.focused, &input.placeholder, input.single_line, input.access.is_some()).hash(&mut h);
+            (e.anchor, e.focus, e.preedit().map(|p| (p.0.len(), p.1)), e.focused, &input.placeholder, input.single_line, input.access.is_some()).hash(&mut h);
             self.input_scroll.get(&n.path).map(|v| v.to_bits()).hash(&mut h);
         }
         let handlers = n.handlers.get();
@@ -144,8 +144,9 @@ impl<S: 'static> Runtime<S> {
         let name = label.or(text.filter(|_| !secure).map(|t| t.source_text()));
         let help = n.help.as_deref()
             .filter(|_| !n.help_cut || n.text_cut(self.env.scale))
-            .filter(|h| name.is_none_or(|name| !h.trim().starts_with(name.trim())));
-        match more.and_then(|m| m.description.as_deref()).or(help) {
+            .filter(|h| name.is_none_or(|name| !h.trim().starts_with(name.trim())))
+            .map(crate::el::help_words);
+        match more.and_then(|m| m.description.as_deref()).or(help.as_deref()) {
             Some(d) if !d.is_empty() => node.set_description(d),
             _ => {}
         }
@@ -243,9 +244,6 @@ impl<S: 'static> Runtime<S> {
         let own = (i + 1..self.nodes.len()).take_while(inside).find(|&j| self.nodes[j].named(key));
         own.or_else(|| self.nodes.iter().position(|n| n.named(key))).filter(|&j| !self.subtree_exiting(j))
     }
-
-    /// Whether node `i` is inside the open modal, or a portal it anchors.
-    pub(super) fn modal_member(&self, i: usize) -> bool { self.modal_members.get(i).copied().unwrap_or(false) }
 
     /// Whether node `i` is an item of a focus group: a list, tabs, a radio group.
     fn in_focus_group(&self, i: usize) -> bool {
