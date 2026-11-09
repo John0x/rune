@@ -128,6 +128,8 @@ pub(crate) struct CanvasInput {
     pub smart_magnify: Option<SmartMagnifyFn>,
     /// [`PointerButton::bit`]s of the buttons besides the primary that press and drag it.
     pub buttons: u8,
+    /// [`El::on_wheel_through`]: `wheel` hears gestures over the scroll views inside it too.
+    pub wheel_through: bool,
 }
 
 impl CanvasInput {
@@ -158,6 +160,15 @@ impl El {
     /// to `on_magnify` when an element here has one.
     pub fn on_wheel<S: 'static>(mut self, f: impl Fn(&mut S, WheelEvent, &mut Tx) -> bool + 'static) -> Self {
         self.canvas_input().wheel = Some(Rc::new(move |s, e, tx| f(state::<S>(s), e, tx)));
+        self
+    }
+
+    /// [`Self::on_wheel`] that also hears gestures over the scroll views inside this element,
+    /// after the handlers inside them and before they scroll: a sidebar swiped sideways between
+    /// its pages while its pages scroll up and down. Return false to let them scroll.
+    pub fn on_wheel_through<S: 'static>(mut self, f: impl Fn(&mut S, WheelEvent, &mut Tx) -> bool + 'static) -> Self {
+        self = self.on_wheel(f);
+        self.canvas_input().wheel_through = true;
         self
     }
 

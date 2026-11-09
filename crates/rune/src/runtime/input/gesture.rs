@@ -153,8 +153,17 @@ impl<S: 'static> Runtime<S> {
             if self.subtree_exiting(i) || !self.allowed(i) { break; }
             let n = &self.nodes[i];
             if n.handlers.gestures.as_deref().is_some_and(&has) { chain.push(n.path.clone()); }
-            if stop_at_scroll && n.scroll.is_some() { break; }
             at = n.parent;
+            if stop_at_scroll && n.scroll.is_some() {
+                // Past the scroll view, only the handlers that hear through it.
+                while let Some(i) = at {
+                    if self.subtree_exiting(i) || !self.allowed(i) { break; }
+                    let n = &self.nodes[i];
+                    if n.handlers.gestures.as_deref().is_some_and(|g| g.wheel_through && has(g)) { chain.push(n.path.clone()); }
+                    at = n.parent;
+                }
+                break;
+            }
         }
         chain
     }
