@@ -44,13 +44,28 @@ const LAYOUT_BASE: usize = 2048;
 /// labels or 48 KB of paragraphs.
 pub(super) const STALE_BYTES: usize = 3 << 20;
 
+/// The stale budget in force ([`set_stale_budget`]; [`STALE_BYTES`] unless an app set its own).
+static STALE_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(STALE_BYTES);
+
+/// How many heap bytes of layouts stay shaped after the commits that used them, for every
+/// window: [`STALE_BYTES`] by default. An app whose views hold much text and are often shown
+/// again (a chat switched away from and back) keeps more, so they don't reshape.
+pub fn set_stale_budget(bytes: usize) {
+    STALE_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn stale_budget() -> usize {
+    STALE_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Drops what `cache` hasn't used in the last two commits once it outgrows [`STALE_BYTES`],
 /// least recently used first. A view's layouts all share the commit it was last shown in, so
 /// that commit's are kept while the budget lasts rather than all dropped together.
 fn evict<T>(cache: &mut Cache<T>, g: u32) {
     let stale = |used: u32| g.wrapping_sub(used) >= 2;
+    let budget = stale_budget();
     let total: usize = cache.values().filter(|e| stale(e.used)).map(|e| e.cost as usize).sum();
-    if total <= STALE_BYTES {
+    if total <= budget {
         return;
     }
     let mut ages: Vec<(u32, usize)> = cache.values().filter(|e| stale(e.used)).map(|e| (g.wrapping_sub(e.used), e.cost as usize)).collect();
@@ -59,12 +74,12 @@ fn evict<T>(cache: &mut Cache<T>, g: u32) {
     for (i, &(age, cost)) in ages.iter().enumerate() {
         if i > 0 && ages[i - 1].0 != age { younger = kept; }
         kept += cost;
-        if kept > STALE_BYTES {
+        if kept > budget {
             cutoff = age;
             break;
         }
     }
-    let mut room = STALE_BYTES - younger;
+    let mut room = budget - younger;
     cache.retain(|_, e| {
         let (age, cost) = (g.wrapping_sub(e.used), e.cost as usize);
         age < cutoff || age == cutoff && cost <= room && { room -= cost; true }

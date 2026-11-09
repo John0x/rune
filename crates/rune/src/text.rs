@@ -90,6 +90,7 @@ use hidden_axes::hidden_axes;
 use layout_cache::{Cache, Entry};
 #[cfg(test)]
 use layout_cache::STALE_BYTES;
+pub use layout_cache::set_stale_budget;
 pub use icon::{Icon, icon_coverage, set_icon_swap, set_icon_swap_size};
 pub(crate) use icon::Facing;
 use icon::rasterize_icon;
