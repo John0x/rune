@@ -105,11 +105,14 @@ pub struct TearOutSpec {
     /// A strip's only tab tears out too (off by default: a window's last tab has nowhere to go,
     /// a split pane's does).
     pub lone: bool,
+    /// Dragging a tab along the strip past its ends tears it out too, not only across it: into
+    /// a strip beside it (a split's other pane), level with this one.
+    pub along: bool,
 }
 
 impl Default for TearOutSpec {
     fn default() -> Self {
-        Self { detach_distance: 36.0, reattach_distance: 24.0, lone: false }
+        Self { detach_distance: 36.0, reattach_distance: 24.0, lone: false, along: false }
     }
 }
 
@@ -282,7 +285,9 @@ impl TabDragState {
         // within a tab of its ends, not anywhere level with it.
         let pitch = lane.pitch.max(1.0);
         let over = (((lane.lo as f32 - lane.index as f32) - 1.0) * pitch..=((lane.hi as f32 - lane.index as f32) * pitch)).contains(&along);
-        let detach = lane.tear.is_some_and(|t| if torn { across.abs() > t.reattach_distance || !over } else { across.abs() >= t.detach_distance });
+        let detach = lane.tear.is_some_and(|t| {
+            if torn { across.abs() > t.reattach_distance || !over } else { across.abs() >= t.detach_distance || (t.along && !over) }
+        });
         if detach {
             self.gesture = Gesture::Dragging { mode: TabDragMode::TearOut { from: lane.index, offset }, grab, lifted };
             return true;
