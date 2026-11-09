@@ -285,8 +285,12 @@ impl TabDragState {
         // within a tab of its ends, not anywhere level with it.
         let pitch = lane.pitch.max(1.0);
         let over = (((lane.lo as f32 - lane.index as f32) - 1.0) * pitch..=((lane.hi as f32 - lane.index as f32) * pitch)).contains(&along);
+        // Along it, a tab leaves once it's half its length past the strip's ends.
+        let past_ends = !((((lane.lo as f32 - lane.index as f32) - 0.5) * pitch)..=(((lane.hi as f32 - lane.index as f32) - 0.5) * pitch)).contains(&along);
         let detach = lane.tear.is_some_and(|t| {
-            if torn { across.abs() > t.reattach_distance || !over } else { across.abs() >= t.detach_distance || (t.along && !over) }
+            // Torn out along the strip, it docks again only back within its ends.
+            let away = if t.along { past_ends } else { !over };
+            if torn { across.abs() > t.reattach_distance || away } else { across.abs() >= t.detach_distance || (t.along && past_ends) }
         });
         if detach {
             self.gesture = Gesture::Dragging { mode: TabDragMode::TearOut { from: lane.index, offset }, grab, lifted };
