@@ -81,13 +81,13 @@ pub(super) fn build<S: 'static>(item: TabItem<'_, S>, at: Place, st: &Strip<S>, 
     pill = match (vertical, icon_only) {
         (true, _) => pill.px(st.link_inset).gap(if two_line { 6.0 } else { 8.0 }),
         (false, true) => pill.justify_center(),
-        (false, false) => pill.px(6.0).gap(6.0),
+        (false, false) => pill.px(st.inset.padding).gap(st.inset.gap),
     };
 
     // A busy icon-only tab spins in its avatar's place.
     let lead = match icon_only && busy {
         true => row().key("avatar").size(16.0, 16.0),
-        false => lead(item.avatar, item.icon, at.active, icon_only && dotted, status, k),
+        false => lead(item.avatar, item.icon, at.active, icon_only && dotted, status, if vertical { 16.0 } else { st.inset.icon }, k),
     };
     let title = (!icon_only).then(|| title(&item.title, item.editor, &at, vertical, emphasized, k));
     pill = match (item.subtitle, title) {
@@ -196,15 +196,16 @@ pub(super) fn build<S: 'static>(item: TabItem<'_, S>, at: Place, st: &Strip<S>, 
 }
 
 /// The 16 point avatar, icon or empty mark, with an icon-only tab's status badge on its corner.
-fn lead(avatar: Option<El>, glyph: Option<&'static rune::Icon>, active: bool, badge: bool, status: Option<TabItemStatus>, k: &Kit) -> El {
+#[allow(clippy::too_many_arguments)]
+fn lead(avatar: Option<El>, glyph: Option<&'static rune::Icon>, active: bool, badge: bool, status: Option<TabItemStatus>, size: f32, k: &Kit) -> El {
     let c = &k.c;
     let mark = match (avatar, glyph) {
         (Some(a), _) => a,
-        (None, Some(i)) => icon(i, 16.0).key("icon").color(if active { c.icon_base } else { c.icon_muted }),
+        (None, Some(i)) => icon(i, size).key("icon").color(if active { c.icon_base } else { c.icon_muted }),
         (None, None) => el().size(16.0, 16.0).radius(3.0).border(1.0, c.border_muted),
     };
     if !badge {
-        return row().key("avatar").size(16.0, 16.0).center().child(mark).a11y_hidden();
+        return row().key("avatar").size(size, size).center().child(mark).a11y_hidden();
     }
     // The dot sits on the avatar's corner, which is cut clear 4.5 around it (`tab-nav.css`:
     // `radial-gradient(circle 4.5px at 100% 0, transparent 4px, black 5px)`).
@@ -281,7 +282,7 @@ fn status_slot<S: 'static>(look: SlotLook, st: &Strip<S>, id: &str, k: &Kit) -> 
     }
     // The slot paints the tab under it so a long title never shows through.
     // A vertical tab's slot is clear unless the pointer or a status is on it.
-    let painted = !(active && st.clear_active) && (hovered || status.is_some() || (active && !vertical));
+    let painted = !(active && st.clear_active) && !st.quiet_close && (hovered || status.is_some() || (active && !vertical));
     let top = (h - SLOT) / 2.0;
     let mut slot = row().key("status").size(SLOT, SLOT).center();
     if painted && !(icon_only && !hovered && !busy) {
@@ -303,24 +304,46 @@ fn status_slot<S: 'static>(look: SlotLook, st: &Strip<S>, id: &str, k: &Kit) -> 
     if close {
         let lock = width.filter(|_| st.horizontal_lock).unwrap_or(0.0);
         let (access, on_close, id) = (st.access, st.handlers.close.clone(), id.to_owned());
-        let button = IconButton::new(st.close_icon.unwrap_or(k.glyph.close))
-            .control_size(ControlSize::Small)
-            .variant(IconButtonVariant::GhostMuted)
-            .label("Close tab")
-            .on_press_tx(move |s: &mut S, tx: &mut Tx| {
-                if let Some(a) = access.filter(|_| lock > 0.0) {
-                    a(s).width_lock = Some(lock);
-                }
-                if let Some(f) = &on_close {
-                    f(s, &id, tx);
-                }
-            })
-            .build(k);
+        let press = move |s: &mut S, tx: &mut Tx| {
+            if let Some(a) = access.filter(|_| lock > 0.0) {
+                a(s).width_lock = Some(lock);
+            }
+            if let Some(f) = &on_close {
+                f(s, &id, tx);
+            }
+        };
+        let glyph = st.close_icon.unwrap_or(k.glyph.close);
+        let button = match st.quiet_close {
+            // A round mark: muted, its wash and full ink only while the pointer is on it.
+            true => row()
+                .key("quiet-close")
+                .role("button")
+                .label("Close tab")
+                .size(18.0, 18.0)
+                .center()
+                .radius(9.0)
+                .hover(k.c.hover)
+                .hover_group()
+                .cursor(rune::Cursor::Pointer)
+                .child(icon(glyph, 10.0).color(k.c.icon_faint).group_color(k.c.icon_base))
+                .on_press_tx(press),
+            false => IconButton::new(glyph)
+                .control_size(ControlSize::Small)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Close tab")
+                .on_press_tx(press)
+                .build(k),
+        };
         // Pointer only unless the strip makes it a Tab stop: the strip's arrows move between tabs,
         // and keyboard focus on the tab shows it without a ring of its own.
         let button = if st.close_tab_stop { button } else { button.focusable(false).no_focus_ring() };
         // Its glyph enters with it, unseen until the pointer comes, so the wrapper lands it at once.
-        slot = slot.child(hidden(row().key("close").absolute(0.0, 0.0).group_opacity(0.0, 1.0).instant_changes().child(button)));
+        let close = row().key("close").absolute(0.0, 0.0).instant_changes().child(button);
+        // A quiet close shows on the active tab at rest too.
+        slot = slot.child(match st.quiet_close && active {
+            true => close,
+            false => hidden(close.group_opacity(0.0, 1.0)),
+        });
     }
     Some(slot)
 }

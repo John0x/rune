@@ -85,6 +85,21 @@ impl TabOverflow {
     }
 }
 
+/// How a horizontal tab sets its content: its padding at each end, the gap between its icon,
+/// title and slot, and its icon's size ([`TabStrip::inset`]; 6, 6 and 16 by default).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabInset {
+    pub padding: f32,
+    pub gap: f32,
+    pub icon: f32,
+}
+
+impl Default for TabInset {
+    fn default() -> Self {
+        Self { padding: 6.0, gap: 6.0, icon: 16.0 }
+    }
+}
+
 /// A tab's status mark, in the slot its close button takes under the pointer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TabItemStatus {
@@ -252,6 +267,8 @@ struct Strip<S> {
     access: Option<Access<S>>,
     base: Color,
     clear_active: bool,
+    inset: TabInset,
+    quiet_close: bool,
     separator: Color,
     gap: f32,
     row_height: f32,
@@ -315,6 +332,8 @@ pub struct TabStrip<'a, S: 'static> {
     drag: Option<(TabDragState, Access<S>)>,
     fill: Option<Color>,
     clear_active: bool,
+    inset: TabInset,
+    quiet_close: bool,
     close_icon: Option<&'static Icon>,
     close_tab_stop: bool,
     busy: fn(&Kit) -> El,
@@ -343,6 +362,8 @@ impl<'a, S: 'static> TabStrip<'a, S> {
             drag: None,
             fill: None,
             clear_active: false,
+            inset: TabInset::default(),
+            quiet_close: false,
             close_icon: None,
             close_tab_stop: false,
             busy: busy_ring,
@@ -435,6 +456,18 @@ impl<'a, S: 'static> TabStrip<'a, S> {
     }
     /// The active tab draws no fill, nor a ground under its close button: the app draws what
     /// it joins under it (a browser's tab running into its page).
+    pub fn inset(mut self, inset: TabInset) -> Self {
+        self.inset = inset;
+        self
+    }
+
+    /// The close button is a quiet round mark, not a button's square: shown on the active tab
+    /// and under the pointer, a round wash only while the pointer is on it.
+    pub fn quiet_close(mut self, on: bool) -> Self {
+        self.quiet_close = on;
+        self
+    }
+
     pub fn clear_active(mut self, on: bool) -> Self {
         self.clear_active = on;
         self
@@ -540,6 +573,8 @@ impl<'a, S: 'static> TabStrip<'a, S> {
             access,
             base: self.fill.unwrap_or(k.c.bg_deep),
             clear_active: self.clear_active,
+            inset: self.inset,
+            quiet_close: self.quiet_close,
             separator: if k.dark { k.c.layer_02 } else { k.c.layer_03 },
             gap,
             row_height: self.row_height,
