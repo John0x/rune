@@ -251,6 +251,7 @@ struct Strip<S> {
     drag: TabDragState,
     access: Option<Access<S>>,
     base: Color,
+    clear_active: bool,
     separator: Color,
     gap: f32,
     row_height: f32,
@@ -313,6 +314,7 @@ pub struct TabStrip<'a, S: 'static> {
     trailing_width: f32,
     drag: Option<(TabDragState, Access<S>)>,
     fill: Option<Color>,
+    clear_active: bool,
     close_icon: Option<&'static Icon>,
     close_tab_stop: bool,
     busy: fn(&Kit) -> El,
@@ -340,6 +342,7 @@ impl<'a, S: 'static> TabStrip<'a, S> {
             trailing_width: 28.0,
             drag: None,
             fill: None,
+            clear_active: false,
             close_icon: None,
             close_tab_stop: false,
             busy: busy_ring,
@@ -430,6 +433,13 @@ impl<'a, S: 'static> TabStrip<'a, S> {
         self.fill = Some(color);
         self
     }
+    /// The active tab draws no fill, nor a ground under its close button: the app draws what
+    /// it joins under it (a browser's tab running into its page).
+    pub fn clear_active(mut self, on: bool) -> Self {
+        self.clear_active = on;
+        self
+    }
+
     /// The close button's glyph (default the kit's close glyph).
     pub fn close_icon(mut self, icon: &'static Icon) -> Self {
         self.close_icon = Some(icon);
@@ -529,6 +539,7 @@ impl<'a, S: 'static> TabStrip<'a, S> {
             handlers: self.handlers,
             access,
             base: self.fill.unwrap_or(k.c.bg_deep),
+            clear_active: self.clear_active,
             separator: if k.dark { k.c.layer_02 } else { k.c.layer_03 },
             gap,
             row_height: self.row_height,

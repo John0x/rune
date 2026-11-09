@@ -96,6 +96,15 @@ impl SidebarToggle {
         self
     }
 
+    /// Points from the window's leading edge to where a title row's first item may sit past
+    /// the traffic lights and this button, with the sidebar closed: what a
+    /// [`SplitView::no_toolbar`] main pane leaves clear. `titlebar_inset` as given to
+    /// [`SplitView::titlebar_inset`].
+    pub fn clearance(&self, titlebar_inset: f32) -> f32 {
+        let lights = if titlebar_inset > 0.0 { titlebar_inset + self.past_lights } else { self.edge };
+        lights + self.side() + self.gap
+    }
+
     fn side(&self) -> f32 {
         match self.size {
             ControlSize::Mini => 16.0,
@@ -146,6 +155,7 @@ pub struct SplitView {
     peek: Option<SidebarPeek>,
     reduced: bool,
     footer: Option<El>,
+    bare: bool,
 }
 
 impl SplitView {
@@ -165,7 +175,16 @@ impl SplitView {
             peek: None,
             reduced: false,
             footer: None,
+            bare: false,
         }
+    }
+    /// No toolbar band above the main pane (and the inspector): they reach the window's top,
+    /// and the main pane draws its own title row, clearing the traffic lights and the sidebar
+    /// toggle by [`SidebarToggle::clearance`] while the sidebar is closed. For panes that each
+    /// have a title row (a browser's tabs over each split).
+    pub fn no_toolbar(mut self) -> Self {
+        self.bare = true;
+        self
     }
     /// A bar under the main card (a status bar) on the window's background: it spans the
     /// card's width and takes the place of its bottom inset.
@@ -342,7 +361,11 @@ impl SplitView {
             .padding(if sidebar_open { 12.0 } else if self.in_panel { (past_toggle - self.frame).max(12.0) } else { past_toggle })
             .build(k)
             .motion(spring);
-        let (toolbar, above) = if self.in_panel { (Some(toolbar), None) } else { (None, Some(toolbar)) };
+        let (toolbar, above) = match (self.bare, self.in_panel) {
+            (true, _) => (None, None),
+            (false, true) => (Some(toolbar), None),
+            (false, false) => (None, Some(toolbar)),
+        };
         let card = col()
             .key("main-pane")
             .role("main")

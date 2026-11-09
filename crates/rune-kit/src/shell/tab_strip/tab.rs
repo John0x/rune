@@ -56,7 +56,9 @@ pub(super) fn build<S: 'static>(item: TabItem<'_, S>, at: Place, st: &Strip<S>, 
 
     // The tab paints the window's deep background under an overlay: pressed while it's the
     // active or dragged one, the hover wash under the pointer.
-    let overlay = if at.active || lifted || editing {
+    let overlay = if at.active && st.clear_active && !lifted && !editing {
+        Color::TRANSPARENT
+    } else if at.active || lifted || editing {
         c.pressed
     } else if item.marked || hovered {
         c.hover
@@ -279,7 +281,7 @@ fn status_slot<S: 'static>(look: SlotLook, st: &Strip<S>, id: &str, k: &Kit) -> 
     }
     // The slot paints the tab under it so a long title never shows through.
     // A vertical tab's slot is clear unless the pointer or a status is on it.
-    let painted = hovered || status.is_some() || (active && !vertical);
+    let painted = !(active && st.clear_active) && (hovered || status.is_some() || (active && !vertical));
     let top = (h - SLOT) / 2.0;
     let mut slot = row().key("status").size(SLOT, SLOT).center();
     if painted && !(icon_only && !hovered && !busy) {
