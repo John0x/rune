@@ -564,7 +564,7 @@ impl<'a, S: 'static> TabStrip<'a, S> {
         let hovered = st.drag.hovered().map(str::to_owned);
         let ids: Vec<String> = self.items.iter().map(|t| t.id.clone().into_owned()).collect();
         let quiet = |i: usize| active == Some(ids[i].as_str()) || hovered.as_deref() == Some(ids[i].as_str());
-        let tear = self.tear.filter(|_| count > 1);
+        let tear = self.tear.filter(|spec| count > 1 || spec.lone);
         let mut tabs: Vec<El> = self
             .items
             .into_iter()
