@@ -1,0 +1,1 @@
+- **A native window passes modifier changes to the app.** `App::on_modifiers` now reaches its handler in a native window too, as it already did headless and on the web: a held key released (letting go of Control after Control-Tab, say) is seen.
