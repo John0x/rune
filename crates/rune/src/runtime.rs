@@ -388,6 +388,11 @@ pub struct Runtime<S: 'static> {
     /// `App::on_modifiers`, and the modifiers it last heard.
     pub(crate) on_mods: Option<fn(&mut S, crate::Mods, &mut Tx)>,
     mods_heard: crate::Mods,
+    /// `App::on_pressable_hover`, and the pressable element the pointer is over.
+    pub(crate) on_pressable_hover: Option<fn(&mut S, bool, &mut Tx)>,
+    pressable_hovered: Option<String>,
+    /// `App::on_any_press`.
+    pub(crate) on_any_press: Option<fn(&mut S, &mut Tx)>,
     /// `App::on_ime` and the composition it has open.
     pub(crate) app_ime: app_ime::AppIme<S>,
     view: fn(&S, &mut Cx<S>) -> El,
@@ -1050,6 +1055,9 @@ impl<S: 'static> Runtime<S> {
             on_focus: None,
             on_mods: None,
             mods_heard: Default::default(),
+            on_pressable_hover: None,
+            pressable_hovered: None,
+            on_any_press: None,
             app_ime: Default::default(),
             live_subscriptions: Vec::new(),
             live_dirty: false,

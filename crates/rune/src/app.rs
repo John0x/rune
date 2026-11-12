@@ -69,6 +69,8 @@ pub struct App<S: 'static> {
     pub(crate) turn_scope: Option<TurnScope<S>>,
     pub(crate) on_focus: Option<fn(&mut S, bool, &mut Tx)>,
     pub(crate) on_mods: Option<fn(&mut S, crate::Mods, &mut Tx)>,
+    pub(crate) on_pressable_hover: Option<fn(&mut S, bool, &mut Tx)>,
+    pub(crate) on_any_press: Option<fn(&mut S, &mut Tx)>,
     pub(crate) on_ime: Option<fn(&mut S, &crate::Ime, &mut Tx) -> bool>,
     pub(crate) on_reopen: Option<fn(&mut S, bool, &mut Tx) -> bool>,
     pub(crate) on_open_url: Option<crate::open_url::incoming::OnOpenUrl<S>>,
@@ -124,6 +126,8 @@ impl<S: 'static> App<S> {
             turn_scope: None,
             on_focus: None,
             on_mods: None,
+            on_pressable_hover: None,
+            on_any_press: None,
             on_ime: None,
             on_reopen: None,
             on_open_url: None,
@@ -277,6 +281,23 @@ impl<S: 'static> App<S> {
     /// ```
     pub fn on_modifiers(mut self, f: fn(&mut S, crate::Mods, &mut Tx)) -> Self {
         self.on_mods = Some(f);
+        self
+    }
+
+    /// Hear the pointer come over something pressable, an element with `on_press` or
+    /// `on_drag` (or what's inside one): `true` each time it enters one, a nested one too, and
+    /// `false` once it's over none. For feedback the whole app shares, as a trackpad's haptic
+    /// tick on hover. Pointer only; [`Tx::live_only`] says the view reads nothing that changed.
+    pub fn on_pressable_hover(mut self, f: fn(&mut S, bool, &mut Tx)) -> Self {
+        self.on_pressable_hover = Some(f);
+        self
+    }
+
+    /// Hear every press, just before the pressed element's `on_press` runs, in the same
+    /// transaction: a click, Space or Return on a focused control, an assistive press. For
+    /// feedback the whole app shares, as a tap sound.
+    pub fn on_any_press(mut self, f: fn(&mut S, &mut Tx)) -> Self {
+        self.on_any_press = Some(f);
         self
     }
 

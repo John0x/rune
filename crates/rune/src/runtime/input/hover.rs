@@ -68,6 +68,7 @@ impl<S: 'static> Runtime<S> {
         if hovered.map(|i| self.nodes[i].path.as_str()) == self.hovered.as_deref() { return; }
         self.hovered = hovered.map(|i| self.nodes[i].path.clone());
         if let Some(path) = &self.hovered { self.queue.push(Action::Hover(path.clone())); }
+        self.sync_pressable(hovered);
         // A row never takes focus from a text field (a search field above its results).
         let row = hovered.and_then(|i| self.highlight_row(i)).filter(|_| self.focused_input().is_none());
         match row {
@@ -76,6 +77,29 @@ impl<S: 'static> Runtime<S> {
             None if self.focus.hovered() => self.queue.push(Action::HoverFocus(None)),
             _ => {}
         }
+    }
+
+    /// Tells `App::on_pressable_hover` when the pointer comes over another pressable element
+    /// (`hovered` or what holds it) or leaves the last.
+    pub(super) fn sync_pressable(&mut self, hovered: Option<usize>) {
+        if self.on_pressable_hover.is_none() { return; }
+        let pressable = hovered.and_then(|i| self.pressable_of(i)).map(|i| self.nodes[i].path.clone());
+        if pressable == self.pressable_hovered { return; }
+        let entered = pressable.is_some();
+        self.pressable_hovered = pressable;
+        self.queue.push(Action::PressableHover(entered));
+    }
+
+    /// Node `i`, or the nearest element holding it, when it presses (`on_press`, `on_drag`).
+    fn pressable_of(&self, i: usize) -> Option<usize> {
+        let presses = |h: &crate::el::Handlers| h.on_press.is_some() || h.on_drag.is_some();
+        let mut at = Some(i);
+        while let Some(a) = at {
+            if self.nodes[a].handlers.get().is_some_and(presses) { return Some(a); }
+            if self.nodes[a].handlers.modal.is_some() { break; }
+            at = self.nodes[a].parent;
+        }
+        None
     }
 
     /// None when no element tracks `on_hover_change` and none is waiting on a delay.

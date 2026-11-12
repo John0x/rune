@@ -481,6 +481,7 @@ impl<S: 'static> Host<S> {
         let mut app = app;
         let comp = app.compositor.take();
         let (on_focus, on_ime, on_mods) = (app.on_focus, app.on_ime, app.on_mods);
+        let feedback = (app.on_pressable_hover, app.on_any_press);
         let titlebar = app.titlebar.filter(|_| !options.borderless);
         let chrome = app.chrome;
         let (srgb_blend, font_smoothing) = (app.srgb_blend, app.font_smoothing);
@@ -510,6 +511,7 @@ impl<S: 'static> Host<S> {
         }
         rt.on_focus = on_focus;
         rt.on_mods = on_mods;
+        (rt.on_pressable_hover, rt.on_any_press) = feedback;
         rt.app_ime.hook = on_ime;
         rt.set_modifier_keys(modifier_keys);
         rt.set_srgb_blend(srgb_blend); rt.set_font_smoothing(font_smoothing);

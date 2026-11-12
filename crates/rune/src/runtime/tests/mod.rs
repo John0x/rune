@@ -20,6 +20,7 @@ mod no_motion;
 mod one_snap;
 mod picture_scale;
 mod pointer_drag;
+mod app_feedback;
 mod pointer_hit;
 mod press_moving;
 mod relayout;

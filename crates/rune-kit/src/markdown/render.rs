@@ -322,7 +322,7 @@ impl Renderer {
     pub(super) fn para(&self, inl: &Inline, map: Option<&SpanMap>, style: TextStyle, color: Color) -> El {
         // Lines keep their own 22.4 points, as a page's do, so a long list doesn't drift a
         // point per item.
-        let e = self.with_reveal(rich(inl.text.clone(), self.spans(inl, style)).font(style).color(color).exact_lines()).w_full();
+        let e = self.with_reveal(rich(inl.text.clone(), self.spans(inl, style)).font(style).color(color).exact_lines().wrap_anywhere()).w_full();
         // A copy puts a blank line around a paragraph, one newline around a list item's first
         // with its marker before it.
         let e = match self.flow.get().lead {

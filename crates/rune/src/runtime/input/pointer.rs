@@ -346,6 +346,7 @@ impl<S: 'static> Runtime<S> {
         if !self.pointer_captured() {
             self.pointer = None;
             self.hovered = None;
+            self.sync_pressable(None);
             self.refresh_hover_within();
         } else {
             self.set_left(true);

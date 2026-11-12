@@ -1,0 +1,2 @@
+- **The app hears what's pressable and every press.** `App::on_pressable_hover` tells the app each time the pointer comes over something pressable (an element with `on_press` or `on_drag`, or what's inside one) and when it's over none; `App::on_any_press` hears every press just before the element's own `on_press`. For feedback the whole app shares: a trackpad's tick on hover, a tap sound.
+- **Markdown breaks a word too long for its line.** A long URL or hash in a paragraph wraps inside it instead of running past its edge; words that fit still break at spaces.

@@ -184,17 +184,22 @@ impl<S: 'static> Runtime<S> {
         tx.live_only = ran && live == Some(true);
         ran
     }
+    /// The state app-level hooks hear (`App::on_modifiers`, `App::on_any_press`): the
+    /// playground's while it shows, else the app's.
+    pub(super) fn app_state(&mut self) -> Option<&mut S> {
+        match &mut self.playground {
+            Some(playground) => playground.key_state(&mut self.state),
+            None => Some(&mut self.state),
+        }
+    }
     /// `App::on_modifiers`, when the held modifiers changed since it last heard them.
     fn dispatch_mods(&mut self, tx: &mut Tx, live: &mut Option<bool>) -> bool {
         let Some(f) = self.on_mods.filter(|_| self.held_mods != self.mods_heard) else { return false };
         self.mods_heard = self.held_mods;
         let mut one = self.transaction();
-        let state = match &mut self.playground {
-            Some(playground) => playground.key_state(&mut self.state),
-            None => Some(&mut self.state),
-        };
-        let Some(state) = state else { return false };
-        f(state, self.mods_heard, &mut one);
+        let mods = self.mods_heard;
+        let Some(state) = self.app_state() else { return false };
+        f(state, mods, &mut one);
         fold_live(live, true, &one);
         merge(tx, one);
         true
