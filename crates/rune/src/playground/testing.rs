@@ -14,6 +14,7 @@ impl<S: 'static> App<S> {
         let playground = self.playground.take();
         let (chrome, titlebar, borderless) = (self.chrome, self.titlebar, self.window_options.borderless);
         let (on_focus, on_ime, modifier_keys, tab_visits_controls, srgb_blend) = (self.on_focus, self.on_ime, self.modifier_keys, self.tab_visits_controls, self.srgb_blend);
+        let (on_mods, feedback) = (self.on_mods, (self.on_pressable_hover, self.on_any_press));
         let (spec, state, _) = self.into_parts(None);
         let mut rt = crate::tooling::runtime_for(&spec, state, size, env, std::sync::Arc::new(|| {}));
         if let Some(playground) = playground.filter(Playground::is_enabled) {
@@ -21,6 +22,8 @@ impl<S: 'static> App<S> {
         }
         rt.headless_chrome(chrome, titlebar, borderless);
         rt.on_focus = on_focus;
+        rt.on_mods = on_mods;
+        (rt.on_pressable_hover, rt.on_any_press) = feedback;
         rt.app_ime.hook = on_ime;
         rt.set_modifier_keys(modifier_keys);
         rt.set_tab_visits_controls(tab_visits_controls);

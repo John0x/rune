@@ -405,8 +405,8 @@ impl<S: 'static> Runtime<S> {
                 let Some(f) = self.node(&path).and_then(|n| n.handlers.on_press.clone()) else { return false };
                 log_event!(self, "press {path}");
                 one.button = button;
-                if let Some(any) = self.on_any_press && let Some(state) = self.app_state() { any(state, &mut one); }
                 f(states!(self), &mut one);
+                if let Some(any) = self.on_any_press && let Some(state) = self.app_state() { any(state, &mut one); }
                 true
             }
             Action::PressableHover(inside) => {

@@ -293,9 +293,10 @@ impl<S: 'static> App<S> {
         self
     }
 
-    /// Hear every press, just before the pressed element's `on_press` runs, in the same
+    /// Hear every press, just after the pressed element's `on_press` ran, in the same
     /// transaction: a click, Space or Return on a focused control, an assistive press. For
-    /// feedback the whole app shares, as a tap sound.
+    /// feedback the whole app shares, as a tap sound (unless the handler gave the press a sound
+    /// of its own).
     pub fn on_any_press(mut self, f: fn(&mut S, &mut Tx)) -> Self {
         self.on_any_press = Some(f);
         self

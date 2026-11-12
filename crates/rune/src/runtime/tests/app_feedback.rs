@@ -40,10 +40,10 @@ fn the_app_hears_the_pointer_enter_each_pressable_and_leave_the_last() {
 }
 
 #[test]
-fn the_app_hears_every_press_before_the_element_does() {
+fn the_app_hears_every_press_after_the_element_does() {
     let mut rt = runtime();
     rt.pointer_down(10.0, 10.0);
     rt.pointer_up(10.0, 10.0);
     rt.frame(0.0);
-    assert_eq!(rt.state.log, ["any", "inner"]);
+    assert_eq!(rt.state.log, ["inner", "any"]);
 }
