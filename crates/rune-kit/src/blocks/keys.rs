@@ -78,7 +78,7 @@ fn turn_into_shifted(ev: &KeyEvent, tx: &Tx) -> Option<Kind> {
 }
 
 /// The key of block `id`'s field in the editor keyed `editor`.
-pub(super) fn field_key(editor: &str, id: u64) -> String {
+pub fn field_key(editor: &str, id: u64) -> String {
     format!("{editor}-f{id}")
 }
 

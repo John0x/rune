@@ -228,6 +228,7 @@ impl<S: 'static> Runtime<S> {
     fn hover_files(&mut self, paths: &[PathBuf], at: Option<(f32, f32)>, tx: &mut Tx) -> bool {
         let target = self.drop_aim(paths, at);
         if self.file_drag.active { self.file_drag.aimed.clone_from(&target); }
+        tx.drop_files = paths.to_vec();
         let mut ran = self.set_drop_hover(target.clone(), at, tx);
         if let Some(aim) = target && let Some(f) = self.drop_move_fn(&aim) && let Some(p) = self.drop_point(&aim.0, at) {
             self.trace_event(format_args!("drop-move:{}", aim.0));
@@ -236,6 +237,7 @@ impl<S: 'static> Runtime<S> {
             tx.drop_point = None;
             ran = true;
         }
+        tx.drop_files.clear();
         ran
     }
 

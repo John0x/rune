@@ -31,6 +31,9 @@ type ImageView<'a> = Box<dyn Fn(&str, &str) -> El + 'a>;
 type PasteFn<S> = Rc<dyn Fn(&mut S, &rune::ClipboardContent, &mut Tx) -> bool>;
 /// The app's rows of the slash menu (see [`BlockEditor::on_slash`]).
 type SlashFn<S> = Rc<dyn Fn(&mut S, &str, &mut Tx)>;
+type KeyFn<S> = Rc<dyn Fn(&mut S, &rune::KeyEvent, &mut Tx) -> bool>;
+/// The app's own `@` menu (see [`BlockEditor::mention_menu`]).
+type MentionMenuFn<'a> = Box<dyn Fn(&Blocks, &str, &mut Vec<El>) + 'a>;
 /// What the app draws of a code block (see [`BlockEditor::preview`]).
 type Preview<'a> = Box<dyn Fn(&str, &str) -> Option<El> + 'a>;
 
@@ -43,6 +46,7 @@ pub(super) struct Wire<S> {
     pub(super) change: Option<ChangeFn<S>>,
     pub(super) paste: Option<PasteFn<S>>,
     pub(super) slash: Option<SlashFn<S>>,
+    pub(super) on_key: Option<KeyFn<S>>,
     pub(super) editor: Rc<str>,
 }
 
@@ -53,6 +57,7 @@ impl<S> Clone for Wire<S> {
             change: self.change.clone(),
             paste: self.paste.clone(),
             slash: self.slash.clone(),
+            on_key: self.on_key.clone(),
             editor: self.editor.clone(),
         }
     }
@@ -179,7 +184,9 @@ pub struct BlockEditor<'a, S> {
     image: Option<ImageView<'a>>,
     paste: Option<PasteFn<S>>,
     slash: Option<SlashFn<S>>,
+    on_key: Option<KeyFn<S>>,
     preview: Option<Preview<'a>>,
+    mention_menu: Option<MentionMenuFn<'a>>,
 }
 
 impl<'a, S: 'static> BlockEditor<'a, S> {
@@ -195,7 +202,9 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
             image: None,
             paste: None,
             slash: None,
+            on_key: None,
             preview: None,
+            mention_menu: None,
         }
     }
 
@@ -216,6 +225,22 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
     /// once its `/` is gone from the block.
     pub fn on_slash(mut self, f: impl Fn(&mut S, &str, &mut Tx) + 'static) -> Self {
         self.slash = Some(Rc::new(f));
+        self
+    }
+
+    /// Gets each key typed into the document before the editor does: true when it took it (the
+    /// host's own shortcut, ⌘↵ say), and the editor doesn't see it.
+    pub fn on_key(mut self, f: impl Fn(&mut S, &rune::KeyEvent, &mut Tx) -> bool + 'static) -> Self {
+        self.on_key = Some(Rc::new(f));
+        self
+    }
+
+    /// Draws the `@` menu in place of the editor's own list: `f` gets the document (what it offers,
+    /// [`Blocks::mention_items`], and the highlighted one), the key of the line the menu hangs
+    /// from and the overlay layer to put it in. The editor's keys still move through it and pick;
+    /// a press on a row is the app's ([`Blocks::choose_mention`]).
+    pub fn mention_menu(mut self, f: impl Fn(&Blocks, &str, &mut Vec<El>) + 'a) -> Self {
+        self.mention_menu = Some(Box::new(f));
         self
     }
 
@@ -266,6 +291,7 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
             change: self.change.clone(),
             paste: self.paste.clone(),
             slash: self.slash.clone(),
+            on_key: self.on_key.clone(),
             editor: self.key.as_str().into(),
         });
         let geometry = Rows::read(cx, &self.key, doc);
@@ -295,7 +321,11 @@ impl<'a, S: 'static> BlockEditor<'a, S> {
                 .drag_autoscroll()
                 .on_drag(marquee::handler(wire, geometry.clone(), origin.map(|o| [o[0], o[1]])));
             menu(k, doc, wire, layer);
-            mention_menu(k, doc, wire, layer);
+            match (&self.mention_menu, doc.mention) {
+                (Some(own), Some(m)) => own(doc, &field_key(&self.key, m.block), layer),
+                (Some(_), None) => {}
+                (None, _) => mention_menu(k, doc, wire, layer),
+            }
             handle::block_menu(k, doc, wire, layer);
             toolbar::toolbar(k, cx, doc, wire, layer);
         }
@@ -603,6 +633,11 @@ fn bind<S: 'static>(f: El, id: u64, caret: Option<Caret>, rows: Rows, wire: &Wir
     let (w1, w2, w3, w4, w5, w6) = (wire.clone(), wire.clone(), wire.clone(), wire.clone(), wire.clone(), wire.clone());
     f.on_edit(edit_access(move |s: &mut S| (w1.access)(s).edit_mut(id)))
         .on_input_key(move |s: &mut S, ev, tx| {
+            if let Some(on_key) = &w2.on_key
+                && on_key(s, ev, tx)
+            {
+                return true;
+            }
             let out = (w2.access)(s).key(id, ev, caret, &w2.editor, tx);
             if out == Outcome::Changed {
                 w2.changed(s, tx);

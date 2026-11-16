@@ -132,4 +132,7 @@ impl Tx {
     /// (`x`, `y`, following its scroll and transforms) and in the window's. `None` when the
     /// platform gave no position and in every other handler.
     pub fn drop_point(&self) -> Option<PointerEvent> { self.drop_point }
+    /// In [`El::on_drop_hover`] and [`El::on_drop_move`]: the files being dragged, to show what
+    /// would land (a file's name and size). Empty in every other handler.
+    pub fn drop_files(&self) -> &[std::path::PathBuf] { &self.drop_files }
 }

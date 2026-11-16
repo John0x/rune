@@ -38,8 +38,45 @@ impl Blocks {
         }
     }
 
-    pub(super) fn mention_items(&self) -> &[MentionItem] {
+    /// What the `@` menu offers now.
+    pub fn mention_items(&self) -> &[MentionItem] {
         &self.mention_items
+    }
+
+    /// The `@` menu's highlighted choice, while it's open.
+    pub fn mention_active(&self) -> Option<usize> {
+        self.mention.map(|m| m.active)
+    }
+
+    /// Takes the choice with `id`, as a press on its row does: whether it took it.
+    pub fn choose_mention(&mut self, id: &str) -> bool {
+        let done = self.mention_choose(Some(id));
+        if done {
+            self.commit(None);
+        }
+        done
+    }
+
+    /// Closes the `@` menu, keeping what's typed.
+    pub fn close_mention(&mut self) {
+        self.mention = None;
+    }
+
+    /// Replaces what's typed after the `@` with `text`, the menu staying open on it: a choice that
+    /// narrows what it offers rather than being one.
+    pub fn narrow_mention(&mut self, text: &str) -> bool {
+        let Some(menu) = self.mention else { return false };
+        let Some(i) = self.index(menu.block) else { return false };
+        let edit = &mut self.list[i].edit;
+        let caret = edit.range().1;
+        edit.set_selection(menu.at + 1, caret);
+        edit.insert(text);
+        self.mention_items.clear();
+        if let Some(m) = &mut self.mention {
+            m.active = 0;
+        }
+        self.commit(None);
+        true
     }
 
     /// Opens, follows or closes the menu after block `i`'s text changed.

@@ -58,6 +58,7 @@ mod view;
 use rune::{Mark, MarkRange, TextEdit};
 
 pub use handle::GUTTER;
+pub use keys::field_key;
 pub use marquee::selection_area;
 pub use mention::MentionItem;
 pub use menu::{SlashDoes, SlashItem};

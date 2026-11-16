@@ -66,6 +66,8 @@ pub struct Tx {
     pub(crate) keys: Vec<crate::KeyEvent>,
     /// `Tx::drop_point`.
     pub(crate) drop_point: Option<PointerEvent>,
+    /// `Tx::drop_files`.
+    pub(crate) drop_files: Vec<std::path::PathBuf>,
     pub(crate) title: Option<String>,
     pub(crate) open_urls: Vec<crate::open_url::Link>,
     pub(crate) trace: Option<TraceCalls>,
