@@ -357,9 +357,19 @@ fn layer_texel(t: vec2<i32>, size: vec2<f32>) -> vec4<f32> {
     return textureLoad(images, t, 0);
 }
 
+// The kind of shape a fragment draws: the instance's, or, in a pipeline built for one kind (render/variant.rs
+// `pinned_wgsl`), that kind, fixed when the shader compiles, so the compiler drops every other kind's code
+// and a fragment no longer pays for shapes it isn't. -1 is the shader every kind can draw with.
+const PINNED_KIND: f32 = -1.0;
+
+fn fragment_kind(i: Out) -> f32 {
+    if (PINNED_KIND >= 0.0) { return PINNED_KIND; }
+    return i.params.y;
+}
+
 @fragment
 fn fs(i: Out) -> @location(0) vec4<f32> {
-    if (i.params.y == 8.0) {
+    if (fragment_kind(i) == 8.0) {
         // Filters consume unmasked source pixels. Decode the same packed clip as primitives
         // only here, on the completed layer, including the radius in word 3.
         let screen = i.pos.xy + projection.xy;
@@ -397,7 +407,7 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
         return select(color, clamp(color, vec4(0.0), vec4(1.0)), i.params.x == 1.0) * i.fill.a
             * clip_alpha(screen, i.clip, i.fade) * hole_alpha(screen, i.radii);
     }
-    let kind = i.params.y;
+    let kind = fragment_kind(i);
     if (kind > 11.5) { discard; }
     let half = i.rect.zw * 0.5;
     let center = i.rect.xy + half;
@@ -550,7 +560,23 @@ fn fs(i: Out) -> @location(0) vec4<f32> {
             let texel = vec2<i32>(i.uv.xy + floor(screen - i.rect.xy));
             cov = textureLoad(atlas, texel, 0).r;
         }
-        col = i.fill * pow(cov, i.params.w);
+        if (i.params.w < 0.0) {
+            // An atlas fill (render/fill.rs): the coverage rounded to the R8 target's levels here,
+            // ties to even, so the target stores it exactly. A GPU's own float-to-unorm rounding
+            // differs between vendors; this is the rounding the CPU's fill uses (fill_texel).
+            col = vec4<f32>(round(cov * 255.0) / 255.0);
+        } else {
+            col = i.fill * pow(cov, i.params.w);
+        }
     }
-    return col * clip_alpha(clip_p, i.clip, i.fade);
+    let source = col * clip_alpha(clip_p, i.clip, i.fade);
+    // On a direct byte surface cpu_boot::blend converts the source *after* mask gamma,
+    // colour, shape coverage and clipping. The mask texel itself isn't the blend source.
+    let flat_fill = kind == 0.0 && i.params.x == 0.0 && i.fill.a > 0.0 && i.fill.a < 1.0;
+    let gray_mask = kind == 2.0 && i.radii.w == 0.0 && i.radii.x == 0.0 && i.params.x == 0.0 && i.uv.z == 0.0 && i.params.w >= 0.0;
+    // Keep float layers, dual-source, outline/filtered glyphs and atlas population unchanged.
+    if (g.flags.y > 0.5 && projection.z == 0.0 && (flat_fill || gray_mask)) {
+        return round(clamp(source, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0) / 255.0;
+    }
+    return source;
 }

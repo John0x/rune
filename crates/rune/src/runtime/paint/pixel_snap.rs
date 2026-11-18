@@ -66,8 +66,9 @@ pub(super) fn motion(p: &Presented, rest: Option<Rect>, s: f32, anchored: bool, 
 }
 
 /// How far a gliding box's top (device px) sits below its nearest whole pixel: its glyphs lay
-/// out from that pixel, as at rest, and move down by this ([`crate::text::TextSystem::set_glide`]),
-/// so they keep their place against the box instead of stepping a pixel at a time.
+/// out from that pixel (moved by the fraction its resting box sits off the grid, as at rest) and
+/// move down by this ([`crate::text::TextSystem::set_glide`]), so they keep their place against
+/// the box instead of stepping a pixel at a time, and its last frame lays out as rest does.
 pub(super) fn text_glide(top: f32) -> f32 {
     let g = top - top.round();
     if g.abs() < 1.0 / 64.0 { 0.0 } else { g }
@@ -112,12 +113,67 @@ pub(super) struct Inherit {
     /// The translation in points from scrolls, sticky shifts and growth rows above, which
     /// snaps as a whole.
     pub rigid: [f32; 2],
+    /// `rigid` less the scrolls' offsets, the sticky shifts and the growth offsets (`row_dy`: rows'
+    /// and stacks' windows'): the paint containments' origins alone (overlays start it again at
+    /// zero). A text lays out from its exact place against this, so while rows glide or a list
+    /// scrolls it moves in whole pixels with its box, as one piece with the lines and borders
+    /// beside it, and at rest it sits against its box the same way wherever the list is.
+    pub steady: [f32; 2],
+    /// The origin in points of the paint containment above (`El::paint_contained`), which is
+    /// part of `rigid`: what draws from its own exact box rounds against it too.
+    pub contain: [f32; 2],
+    /// `El::motion_snaps` here or above: a moving box snaps where it is each frame.
+    pub steps: bool,
+    /// An `El::offset` here or above comes to rest away from zero: a translation, as a CSS
+    /// transform is, which moves a text with its box rather than laying it out again from its
+    /// exact place (`LeafBox::exact_off` is zero under it).
+    pub shifted: bool,
     /// The nearest scaled layer above or here, as an index into this frame's layers plus one
     /// (0: none).
     pub layer: u32,
     /// The parent's edges, for centring. None when it paints nothing to centre against, its
     /// children don't share its rigid translation, or it doesn't snap on the plain grid.
     pub parent: Option<Parent>,
+}
+
+impl Inherit {
+    /// A translation that moves the subtree as a scroll does, `by` points on `axis`: a scroll's
+    /// drawn offset, a sticky shift (which, while stuck, cancels the scroll's motion), or a page's
+    /// band. It moves the subtree's boxes, which round it with the rest of `rigid`, and not what
+    /// its text lays out against, so text moves in whole pixels with its box, as Chromium draws a
+    /// scroller's contents from its pixel-snapped offset.
+    pub(super) fn scroll(&mut self, axis: usize, by: f32) {
+        self.rigid[axis] += by;
+    }
+
+    /// A growth offset `dy`: a row's, which glides, or a stack's own, its virtual window's, which
+    /// moves as a scroll does. Either moves its boxes but not what its text lays out against.
+    pub(super) fn grow(&mut self, dy: f32) {
+        self.rigid[1] += dy;
+    }
+
+    /// `El::paint_contained` at `o` (points): its children snap against it, rounded on its own.
+    pub(super) fn contain_at(&mut self, o: [f32; 2]) {
+        let c = self.contain;
+        self.rigid = [self.rigid[0] - c[0] + o[0], self.rigid[1] - c[1] + o[1]];
+        self.steady = [self.steady[0] - c[0] + o[0], self.steady[1] - c[1] + o[1]];
+        self.contain = o;
+    }
+
+    /// Its bits, for `paint_keep`'s comparison of what a subtree inherits.
+    pub(super) fn hash_bits(&self, h: &mut impl std::hash::Hasher) {
+        h.write_u8(self.off as u8);
+        h.write_u8(self.shifted as u8);
+        for v in self.rigid.iter().chain(&self.steady).chain(&self.contain) { h.write_u32(v.to_bits()); }
+        h.write_u32(self.layer);
+        match &self.parent {
+            Some(p) => {
+                h.write_u8(1);
+                for v in p.rest.exact.iter().chain(&p.rest.at).chain(&p.now.exact).chain(&p.now.at).chain(&p.left) { h.write_u32(v.to_bits()); }
+            }
+            None => h.write_u8(0),
+        }
+    }
 }
 
 /// A box's edges (device px, less its rigid translation): `exact`, and `at` where it draws them.
@@ -135,6 +191,14 @@ pub(super) struct Parent {
     rest: Rest,
     now: Rest,
     left: [f32; 4],
+}
+
+impl Parent {
+    /// How far its exact resting top-left sits from where it rests snapped (device px), `rigid`
+    /// as it was snapped with: where a text inside lays out from, at rest and through a glide alike.
+    pub(super) fn exact_off(&self, rigid: [f32; 2]) -> [f32; 2] {
+        core::array::from_fn(|a| self.rest.exact[a] + rigid[a] - self.rest.at[a] - round(rigid[a]))
+    }
 }
 
 /// The glides of the nodes moving now and the scaled layers, owned by the runtime.
@@ -161,17 +225,22 @@ pub(super) const SETTLE: f64 = 0.1;
 /// A node with its own scale, which heads a scaled layer.
 #[derive(Clone, Copy)]
 struct Layer {
-    /// Its drawn rect (device px, less its rigid translation) last frame, and when it last
-    /// moved.
+    /// Its drawn rect (device px, less its rigid translation) last frame.
     rect: [f32; 4],
-    t: f64,
     seen: u32,
-    moving: bool,
-    /// When it came to rest.
-    since: f64,
+    phase: LayerPhase,
     /// Rests it has left, each its rect there and the weight its correction was drawn with
     /// when the layer left it: the two heaviest, fading out.
     outs: [([f32; 4], f32); 2],
+}
+
+/// Whether a scaled layer moves or holds, and since when.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LayerPhase {
+    /// It moved, last at `last`: no correction to the grid.
+    Moving { last: f64 },
+    /// It holds where it came to rest at `since`, its correction easing in over `SETTLE`.
+    Rest { since: f64 },
 }
 
 /// A scaled layer's snapping this frame, handed down its subtree.
@@ -245,32 +314,32 @@ impl Glides {
     pub(super) fn layer(&mut self, id: NodeId, (r, unscaled): ([f32; 4], [f32; 4]), rigid: [f32; 2], cached: bool) -> u32 {
         let cur: [f32; 4] = core::array::from_fn(|k| r[k] - rigid[k % 2]);
         let (t, frame, size) = (self.t, self.frame, self.size);
-        let l = self.layers.entry(id).or_insert(Layer { rect: cur, t, seen: frame, moving: false, since: f64::NEG_INFINITY, outs: [(cur, 0.0); 2] });
+        let l = self.layers.entry(id).or_insert(Layer { rect: cur, seen: frame, phase: LayerPhase::Rest { since: f64::NEG_INFINITY }, outs: [(cur, 0.0); 2] });
         let eased = |since: f64| {
             let x = if cached { 1.0 } else { ((t - since) / SETTLE).clamp(0.0, 1.0) as f32 };
             x * x * (3.0 - 2.0 * x)
         };
         let to;
         if reach(affine(l.rect, cur), size) > 1.0 / 256.0 {
-            if !l.moving {
+            if let LayerPhase::Rest { since } = l.phase {
                 // It drew `f` of this rest's correction, and `1 - f` of what the rests before it
                 // still drew.
-                let f = eased(l.since);
+                let f = eased(since);
                 let [a, b] = l.outs.map(|(rest, w)| (rest, w * (1.0 - f)));
                 let mut outs = [(l.rect, f), a, b];
                 outs.sort_by(|x, y| y.1.total_cmp(&x.1));
                 l.outs = [outs[0], outs[1]];
-                l.moving = true;
             }
-            (l.rect, l.t) = (cur, t);
+            (l.rect, l.phase) = (cur, LayerPhase::Moving { last: t });
             to = 0.0;
         } else {
-            if l.moving {
+            let since = match l.phase {
                 // Still since its last paint, which already drew it here.
-                l.moving = false;
-                l.since = l.t;
-            }
-            to = eased(l.since);
+                LayerPhase::Moving { last } => last,
+                LayerPhase::Rest { since } => since,
+            };
+            l.phase = LayerPhase::Rest { since };
+            to = eased(since);
             if to == 1.0 {
                 l.outs = [(cur, 0.0); 2];
             }
@@ -510,4 +579,29 @@ fn centred(parent: Rest, (a, b): (usize, usize), (ra, rb): (f32, f32), slack: f3
     }
     let gap = round((qb - qa - (rb - ra)) / 2.0);
     (qb - qa - 2.0 * gap >= 1.0).then_some((qa + gap, qb - gap))
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+
+    #[test]
+    fn a_scaled_layer_eases_to_the_grid_from_its_last_move() {
+        let (id, frame) = (NodeId(1), 1.0 / 60.0);
+        let mut g = Glides::default();
+        let paint = |g: &mut Glides, t: f64, r: [f32; 4]| {
+            g.begin_frame(t, [800.0, 600.0]);
+            g.layer(id, (r, r), [0.0; 2], false);
+            (g.layers[&id].phase, g.now[0].to)
+        };
+        let (a, b) = ([10.3, 10.3, 50.3, 50.3], [12.6, 10.3, 52.6, 50.3]);
+        assert_eq!(paint(&mut g, 0.0, a), (LayerPhase::Rest { since: f64::NEG_INFINITY }, 1.0), "first seen still: snapped");
+        assert_eq!(paint(&mut g, frame, b), (LayerPhase::Moving { last: frame }, 0.0));
+        assert_eq!(g.layers[&id].outs[0], (a, 1.0), "the rest it left, at the weight it drew");
+        let (phase, to) = paint(&mut g, 2.0 * frame, b);
+        assert_eq!(phase, LayerPhase::Rest { since: frame }, "at rest from the paint that drew it there");
+        assert!(to > 0.0 && to < 1.0, "easing in: {to}");
+        assert_eq!(paint(&mut g, frame + 2.0 * SETTLE, b).1, 1.0);
+        assert_eq!(g.layers[&id].outs[0].1, 0.0, "the old rest let go once settled");
+    }
 }

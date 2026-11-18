@@ -6,7 +6,14 @@ impl<S: 'static> Runtime<S> {
         let (_paint_time, _blend) = (crate::frame::profile::Scope::new(crate::frame::profile::Phase::Paint), crate::theme::scope(self.srgb_blend));
         let s = self.env.scale;
         let snap_px = |v: f32| grid(v, s) * s;
+        self.keep_swap();
         self.instances.clear();
+        self.quads_frame += 1;
+        // Quads a text hasn't drawn with for a while go, with the layouts they hold.
+        if self.quads_frame % 64 == 0 {
+            let frame = self.quads_frame;
+            self.text_quads.retain(|_, (_, used)| frame - *used < 64);
+        }
         let mut pinned_pages = 0u32;
         for f in &self.flights {
             for q in &f.glyphs {
@@ -15,16 +22,19 @@ impl<S: 'static> Runtime<S> {
                 }
             }
         }
-        self.text.begin_frame_pinned(pinned_pages);
+        if let Some(after) = self.text.begin_frame_pinned(pinned_pages) {
+            self.schedule_wakes([after]);
+        }
         self.marks.clear();
         self.icon_aprons.clear();
         self.surfaces.clear();
         self.materials.clear();
         self.hits.clear();
+        self.wheel_hits.clear();
         self.clear_help_hits();
         self.clear_drop_hits();
         self.loops_active = false;
-        self.static_scale_settling = false;
+        self.scale_frame = None;
         self.videos_active = false;
         let now = crate::time::Instant::now();
         let video_clock = match self.wall_start {
@@ -53,7 +63,9 @@ impl<S: 'static> Runtime<S> {
             self.sticky_frame.resize(n_nodes, sticky::UNBOUNDED);
         }
         let sel_ranges = self.selection_ranges();
+        let mark_ranges = self.mark_ranges();
         self.ime_area = None;
+        self.ime_option_as_alt = false;
         let now = self.t;
         let vp = [0.0, 0.0, self.viewport.0 * s, self.viewport.1 * s];
         let mut glyph_count = 0usize;
@@ -85,7 +97,7 @@ impl<S: 'static> Runtime<S> {
             self.dissolve_scratch[parent] |= opacity > 0.001 && opacity < 1.0;
         }
 
-        let paint_state_hash = self.prepare_cache_layers(&sel_ranges);
+        let paint_state_hash = self.prepare_cache_layers(&sel_ranges, &mark_ranges);
 
         self.place_growth_rows();
 
@@ -100,9 +112,13 @@ impl<S: 'static> Runtime<S> {
                 || self.scene.presented(n.id).is_some_and(|p| (p.opacity > 0.0 && p.opacity < 1.0) || p.blur > 0.0 || p.transform.rotate.abs() > 1e-6))
         });
         let default_ring = self.default_ring_owner();
+        self.keep_begin(tree_order, vp, default_ring, &sel_ranges, &mark_ranges);
         let mut active_cache: Option<ActiveCache> = None;
         self.pixel_snap.begin_frame(self.t, [vp[2], vp[3]]);
+        // One past the subtree the last one copied from the last paint.
+        let mut skip_to = 0;
         for paint_index in 0..n_nodes {
+            if paint_index < skip_to { continue; }
             let i = if tree_order { self.layer_paint_order[paint_index] } else { paint_index };
             if let Some(rank) = self.paint_rank.as_mut() {
                 rank.resize(n_nodes, 0);
@@ -123,6 +139,7 @@ impl<S: 'static> Runtime<S> {
                     }
                 }
             }
+            self.keep_close(Some(node_parent), &mut layers, &mut active_cache, &mut glyph_count);
             while let Some(&(ancestor, start, surface_start)) = layers.last() {
                 let mut parent = node_parent;
                 while parent.is_some_and(|p| p != ancestor) { parent = self.nodes[parent.unwrap()].parent; }
@@ -135,6 +152,7 @@ impl<S: 'static> Runtime<S> {
                 }
                 layers.pop();
             }
+            self.keep_open(i, glyph_count, &sel_ranges, &mark_ranges);
             let n = &self.nodes[i];
             let Some(p) = self.scene.presented(n.id) else { continue };
             let mut pinh = n.parent.map_or_else(|| self.root_inh(), |pr| self.inh_scratch[pr]);
@@ -154,7 +172,7 @@ impl<S: 'static> Runtime<S> {
                 pinh.paint_opacity *= shown;
             }
             pinh.dy += self.row_dy[i];
-            pinh.snap.rigid[1] += self.row_dy[i];
+            pinh.snap.grow(self.row_dy[i]);
             if let Some(a) = &n.above
                 && let Some(j) = anchor_index(&self.nodes, i, a)
             {
@@ -178,7 +196,7 @@ impl<S: 'static> Runtime<S> {
                     pinh.paint_clip[1] = top;
                 }
                 if edge == crate::el::StickyEdge::Left { pinh.dx += shift } else { pinh.dy += shift }
-                pinh.snap.rigid[(edge != crate::el::StickyEdge::Left) as usize] += shift;
+                pinh.snap.scroll((edge != crate::el::StickyEdge::Left) as usize, shift);
                 // A sticky element stays crisp against the viewport edge it sticks to while rows
                 // scrolling under its fill fade out.
                 let slot = match edge {
@@ -195,6 +213,11 @@ impl<S: 'static> Runtime<S> {
                     pinh.paint_fade_origin[slot] = origin;
                 }
             }
+            if let Some(len) = self.keep_or_paint(i, &pinh, &mut glyph_count) {
+                skip_to = paint_index + len;
+                continue;
+            }
+            let n = &self.nodes[i];
             if raised {
                 // Out of its ancestors' layers: their opacity applies directly instead.
                 pinh.paint_opacity = pinh.opacity;
@@ -275,6 +298,10 @@ impl<S: 'static> Runtime<S> {
             } else {
                 pinh.group
             };
+            let (pressed, press_to) = match n.vis.cold.get().and_then(|c| c.press_color) {
+                Some(c) => (self.scene.get(n.id, P_PRESS).unwrap_or(0.0).clamp(0.0, 1.0), Some(c)),
+                None => (pinh.pressed, pinh.press_to),
+            };
             // Loops and reveals run on the node's clock (`El::time_scale`).
             let track = self.loops.get(&n.id);
             let lnow = if track.is_some() { self.scene.store().node_time(n.id) } else { self.t };
@@ -314,15 +341,10 @@ impl<S: 'static> Runtime<S> {
             let tracked_scale = if has_live_scale { static_k * p.transform.scale.x } else { static_k };
             let scale_settling = if tracked_scale != 1.0 || has_live_scale || self.static_scales.contains_key(&n.id) {
                 let t = self.t;
-                let seen = self.static_scales.entry(n.id).or_insert((tracked_scale, f64::NEG_INFINITY, false));
-                if self.settled {
-                    *seen = (tracked_scale, f64::NEG_INFINITY, seen.2);
-                } else if (seen.0 - tracked_scale).abs() > 1e-5 {
-                    *seen = (tracked_scale, t, true);
-                }
-                let moving = t - seen.1 < STATIC_SCALE_SETTLE;
-                if !has_live_scale {
-                    self.static_scale_settling |= moving;
+                let seen = self.static_scales.entry(n.id).or_insert(ScaleSettle::Still(tracked_scale));
+                let moving = matches!(seen.step(tracked_scale, t, self.settled, 1e-5, true), crate::machine::Effects::One(_));
+                if !has_live_scale && moving {
+                    self.scale_frame = Some(AnotherFrame);
                 }
                 moving
             } else { false };
@@ -417,7 +439,9 @@ impl<S: 'static> Runtime<S> {
             // A node the visibility test below culls paints nothing, and any clip it hands down is
             // off screen too, so it keeps its exact edges.
             let rigid = pinh.snap.rigid.map(|v| v * s);
-            let can_snap = !pinh.snap.off && !n.vis_flags.no_pixel_snap() && p.transform.rotate == 0.0;
+            // What a stepped window holds glides with its slide; the window itself snaps as a still box,
+            // and its clip glides along the slide only (`slide_anchor`).
+            let can_snap = !pinh.snap.off && !n.vis_flags.no_pixel_snap() && p.transform.rotate == 0.0 && !(self.slide_glides(i) && !self.slide_pair(i));
             let snaps = can_snap && (pinh.in_cache || {
                 let m = filter_margin + 2.0;
                 r_exact[2].max(r_exact[0]) >= clip[0].max(vp[0]) - m && r_exact[0] <= clip[2].min(vp[2]) + m
@@ -434,7 +458,8 @@ impl<S: 'static> Runtime<S> {
             } else {
                 pinh.snap.layer
             };
-            let rest = if snaps && animating { self.scene.rest(n.id) } else { None };
+            let steps = pinh.snap.steps || n.vis.cold.get().is_some_and(|c| c.motion_snaps);
+            let rest = if snaps && animating && !steps { self.scene.rest(n.id) } else { None };
             let gliding = snaps && (rest.is_some() || !unscaled);
             let (r, snap_rest) = if !snaps {
                 (r_exact, None)
@@ -532,7 +557,7 @@ impl<S: 'static> Runtime<S> {
                         && sh[3] > oc[1].max(vp[1] - filter_margin) && sh[1] < oc[3].min(vp[3] + filter_margin)
                 }
             };
-            if self.surface_visible && base_opacity >= 1.0 / 255.0 && !self.reduced_motion
+            if self.live.visible() && base_opacity >= 1.0 / 255.0 && !self.reduced_motion
                 && loop_vis
                 && let Some(track) = self.loops.get(&n.id)
             {
@@ -548,13 +573,14 @@ impl<S: 'static> Runtime<S> {
                 }
                 if self.time_scale > 0.0 && node_k > 0.0 && let Some(start) = track.pending_start(lnow) {
                     let window_start = now + (start - lnow) / node_k;
+                    self.paint_keep.cycles.other_deadline();
                     let wake = self.clock + (window_start - now) / self.time_scale as f64;
                     if self.loop_wake.is_none_or(|w| wake < w.0) { self.loop_wake = Some((wake, window_start)); }
                 }
             }
             if n.vis_flags.cache() && self.cache_live_scratch[i] {
                 if let Some(entry) = self.node_caches.get_mut(&n.id) {
-                    entry.was_live = true;
+                    entry.phase = RasterPhase::Live;
                 }
             }
             let mut skip_paint = pinh.skip_paint;
@@ -566,17 +592,10 @@ impl<S: 'static> Runtime<S> {
             let mut committed_scale_moving = false;
             if n.vis_flags.cache() && let Some(entry) = self.node_caches.get_mut(&n.id)
                 && entry.commit_gen != self.commit_gen
-                && (sc * s - entry.raster_scale).abs() > 1e-4
+                && let Some(frame) = entry.committed_scale(sc * s, now)
             {
-                if (sc * s - entry.seen_scale).abs() > 1e-4 {
-                    entry.seen_scale = sc * s;
-                    entry.scale_changed_at = now;
-                }
-                committed_scale_moving = now - entry.scale_changed_at < STATIC_SCALE_SETTLE;
-                if committed_scale_moving {
-                    entry.was_live = true;
-                    self.static_scale_settling = true;
-                }
+                committed_scale_moving = true;
+                self.scale_frame = Some(frame);
             }
             if n.vis_flags.cache() && active_cache.is_none() && !lift && !skip_paint && !self.cache_live_scratch[i]
                 && !committed_scale_moving && own_turn.is_none()
@@ -710,7 +729,7 @@ impl<S: 'static> Runtime<S> {
             let glyphs_clear = rounded.is_some_and(|(mask, radii)| {
                 self.text_clip(i, (r, r_exact), sc, clip).is_some_and(|(text, ..)| inside_rounded(text, mask, radii))
             });
-            isolate |= open_cache || (rounded.is_some() && (n.text.as_ref().is_some_and(|t| (t.truncate_fade || t.live.is_some()) && !glyphs_clear)
+            isolate |= open_cache || (rounded.is_some() && (n.text.as_ref().is_some_and(|t| (t.truncate_fade || t.cold.live.is_some()) && !glyphs_clear)
                 || n.input.as_ref().is_some_and(|i| i.single_line)));
             // A soft clip fades each primitive on its own, so where one paints over another (an
             // image over its placeholder fill, a label over its bubble) the one beneath shows
@@ -747,36 +766,16 @@ impl<S: 'static> Runtime<S> {
                         h.write_u32(pinh.group.to_bits());
                         h.finish()
                     };
-                    let (raster_scale, seen_scale, scale_changed_at, elided, cached_glyphs) =
+                    let (scale, pass, frame) =
                         if let Some(entry) = self.node_caches.get(&n.id) {
                             let is_resident = self.text.atlas.resident_caches.get(&n.id.0) == Some(&entry.signature);
-                            let env_same = (s - entry.env_scale).abs() <= 1e-4 && !self.settled;
-                            let (seen_scale, scale_changed_at) = if !env_same {
-                                (eff_scale, f64::NEG_INFINITY)
-                            } else if (eff_scale - entry.seen_scale).abs() > 1e-4 {
-                                (eff_scale, now)
-                            } else {
-                                (entry.seen_scale, entry.scale_changed_at)
-                            };
-                            let scale_diff = (eff_scale - entry.raster_scale).abs() > 1e-4;
-                            let same_commit = self.commit_gen == entry.commit_gen;
-                            let scale_settling = same_commit && scale_diff && env_same && is_resident && !entry.was_live
-                                && (now - scale_changed_at < STATIC_SCALE_SETTLE || scale_motion == ScaleMotion::Moving);
-                            self.static_scale_settling |= scale_settling;
-                            // A commit can change any paint property. Never use a partial
-                            // model hash to skip checking the actual emitted draw output.
-                            let content_same = same_commit && (!scale_diff || scale_settling);
-                            let can_elide = is_resident
-                                && !entry.was_live
-                                && content_same
-                                && paint_hash == entry.paint_state_hash
-                                && !self.cache_check_scratch[i];
-                            let raster_scale = if can_elide && scale_settling { entry.raster_scale } else { eff_scale };
-                            (raster_scale, seen_scale, scale_changed_at, can_elide, entry.glyphs)
+                            entry.open(eff_scale, s, self.settled, now, self.commit_gen, is_resident,
+                                scale_motion, paint_hash, || self.cache_check_scratch[i], glyph_count)
                         } else {
-                            (eff_scale, eff_scale, f64::NEG_INFINITY, false, 0)
+                            (ScaleSettle::Still(eff_scale), RasterPass::Paint { glyph_start: glyph_count }, None)
                         };
-                    if elided {
+                    if frame.is_some() { self.scale_frame = frame; }
+                    if matches!(pass, RasterPass::Elide { .. }) {
                         skip_paint = true;
                     }
                     active_cache = Some(ActiveCache {
@@ -786,14 +785,10 @@ impl<S: 'static> Runtime<S> {
                         origin: [r[0], r[1]],
                         size: [w, h],
                         cur_scale: eff_scale,
-                        raster_scale,
-                        seen_scale,
-                        scale_changed_at,
+                        scale,
                         env_scale: s,
                         paint_hash,
-                        glyph_start: glyph_count,
-                        cached_glyphs,
-                        elided,
+                        pass,
                     });
                 }
             }
@@ -819,7 +814,7 @@ impl<S: 'static> Runtime<S> {
                 .and_then(|_| input_caret(n, r, sc, s, gliding, &mut self.input_scroll));
             if let Some((_, area)) = input_caret
                 && n.input.as_ref().is_some_and(|input| !input.edit.is_secure()) { self.ime_area = Some(area); }
-            else if n.ime_cursor && self.ime_area.is_none() && self.allowed(i) && !self.subtree_exiting(i) { self.ime_area = Some(app_ime::area(r, s)); }
+            else if n.ime_cursor && self.ime_area.is_none() && self.allowed(i) && !self.subtree_exiting(i) { self.ime_area = Some(app_ime::area(r, s)); self.ime_option_as_alt = n.ime_option_as_alt; }
             let paint_visible = if in_cache {
                 r[2] >= clip[0] - filter_margin - 2.0
                     && r[0] <= clip[2] + filter_margin + 2.0
@@ -860,12 +855,16 @@ impl<S: 'static> Runtime<S> {
                 };
                 // `El::focus_within_flat`: focus inside drops its own shadows and hover fill.
                 let focus_flat = n.focus.flat_within && self.focus_within(i);
-                let solid = !n.vis.shadows.is_empty() && native_material.is_none() && blur_hole.is_none() && n.material.is_none()
-                    && self.color(n.id, P_FILL, n.vis.fill).a >= 1.0;
+                let casts = !n.vis.shadows.is_empty() && native_material.is_none() && blur_hole.is_none() && n.material.is_none();
+                let fill_a = if casts { self.color(n.id, P_FILL, n.vis.fill).a } else { 0.0 };
+                let solid = casts && fill_a >= 1.0;
                 // A box that paints itself solid hides the middle of its shadows (bands.rs). Dimmed
-                // (`El::dim`), it leaves that middle clear, as CSS clips box-shadow to outside the box.
+                // (`El::dim`), or filled with a translucent colour, it leaves that middle clear, as
+                // CSS clips box-shadow to outside the box: a 6% white button shows the surface
+                // under it, not its own shadows.
                 let opaque = solid && o >= 1.0 && n.vis.gradient.is_none() && n.vis.radial.is_none() && n.vis.surface.is_none();
-                let dim_hole = (solid && o < 1.0).then(|| crate::system_material::clamp_radius(radii, w, h) * if n.vis_flags.continuous_corners() { -1.0 } else { 1.0 });
+                let see_through = casts && fill_a > 0.0 && fill_a < 1.0;
+                let dim_hole = ((solid && o < 1.0) || see_through).then(|| crate::system_material::clamp_radius(radii, w, h) * if n.vis_flags.continuous_corners() { -1.0 } else { 1.0 });
                 let cast = shadow_paint::Caster {
                     rect: [r[0], r[1], w, h], radii, shape: if n.vis_flags.continuous_corners() { radii.map(|v| -v) } else { radii },
                     k_px, scale: s, opacity: o, srgb, clip, fade, hole: native_material.or(blur_hole).or(dim_hole), opaque,
@@ -901,12 +900,13 @@ impl<S: 'static> Runtime<S> {
                         overlay = over(premul(self.color(n.id, P_PRESS_C, n.vis.press()), prs_v, srgb), overlay);
                     }
                 }
+                let layered = n.vis.gradient.is_some() || n.vis.radial.is_some() || n.vis.surface.is_some();
+                let base_color = |c: Color| super::blend::flat_base(c, srgb, !layered && n.vis.border_width() == 0.0 && c.a * o < 1.0);
                 let base = match n.material {
                     _ if native_material.is_some() => [0.0; 4],
-                    Some(_) => premul(self.color(n.id, P_FILL, crate::system_material::fallback_fill(n.vis.fill, self.env.system_dark)), 1.0, srgb),
-                    None => premul(self.color(n.id, P_FILL, n.vis.fill), 1.0, srgb),
+                    Some(_) => base_color(self.color(n.id, P_FILL, crate::system_material::fallback_fill(n.vis.fill, self.env.system_dark))),
+                    None => base_color(self.color(n.id, P_FILL, n.vis.fill)),
                 };
-                let layered = n.vis.gradient.is_some() || n.vis.radial.is_some() || n.vis.surface.is_some();
                 let fill = if layered { base } else { over(overlay, base) }.map(|c| c * o);
                 let bw = pixel_snap::line_width(n.vis.border_width() * s) * sc;
                 let border = if bw > 0.0 { premul(self.color(n.id, P_BORDER, n.vis.border()), o, srgb) } else { [0.0; 4] };
@@ -1056,8 +1056,20 @@ impl<S: 'static> Runtime<S> {
                         }
                     }
                     if let Some((surface, fit)) = &n.vis.surface {
-                        if let Some(pulled) = surface.pull_video(video_clock, &self.live_wake) {
-                            self.videos_active |= pulled.active;
+                        if let Some(pulled) = surface.pull_video(video_clock, self.live.waker()) {
+                            // A clip whose next picture isn't due for a while wakes the window
+                            // then, instead of drawing every refresh in between.
+                            let wait = pulled.due.map(|due| due.saturating_duration_since(crate::time::Instant::now()).as_secs_f64());
+                            match wait {
+                                Some(wait) if pulled.active && wait > crate::video::WAKE_MIN => {
+                                    let wake = self.clock + wait;
+                                    self.paint_keep.cycles.other_deadline();
+                                    if self.loop_wake.is_none_or(|w| wake < w.0) {
+                                        self.loop_wake = Some((wake, now + wait * self.time_scale as f64));
+                                    }
+                                }
+                                _ => self.videos_active |= pulled.active,
+                            }
                             video_signature = crate::video::fold(video_signature, pulled.generation, surface.key());
                         }
                         self.surfaces.push(crate::native_surface::SurfaceDraw {
@@ -1077,6 +1089,19 @@ impl<S: 'static> Runtime<S> {
                     if fill == [0.0; 4] && border_kind == KIND_RECT && bw > 0.0 && sides.is_none() {
                         bands::push_ring(&mut self.instances, ring);
                     } else {
+                        if let Some(rune_motion::LoopKind::OpacityCycle(curve)) = n.looping.as_ref().map(|l| l.kind)
+                            && n.a11y.hidden && !next.is_some_and(|j| self.nodes[j].parent == Some(i))
+                            && !isolate && !in_cache && !skip_paint && loop_vis && base_opacity > 0.0
+                            && pinh.paint_opacity > 0.0 && loop_value.is_some_and(|v| v > 0.0) && n.vis.layer_opacity == 1.0
+                            && n.vis.paint_alpha == 1.0 && bw == 0.0 && overlay == [0.0; 4]
+                            && self.instances.len() == primitive_start && n.text.is_none() && n.input.is_none()
+                            && n.vis.shape.is_none() && n.vis.pixels.is_none() && n.vis.effect.is_none()
+                            && n.vis.shadows.is_empty() && n.handlers.get().is_none() && n.focus.get().is_none()
+                            && !n.vis_flags.hit() && node_turn.is_none() && cover.is_none() && n.help.is_none()
+                            && curve.stops.iter().all(|&(_, a)| a.is_finite() && a > 0.001 && a <= 1.0 && base[3] * a > 0.0005)
+                        {
+                            self.paint_keep.cycles.record(i, self.instances.len(), curve, (base, o / loop_value.unwrap_or(1.0)), ring.rect);
+                        }
                         self.instances.push(Instance { fill, ..ring });
                     }
                 }
@@ -1102,7 +1127,7 @@ impl<S: 'static> Runtime<S> {
                     let fade = crate::render::pack_fade(fade, clip, clip);
                     faded_slot = paint_slots::push_effect(&mut self.instances, (effect, mark), ([r[0], r[1], w, h], radii, clip, fade), k_px, o);
                 }
-                let focus_ring = if default_ring == Some(i) { Some(self.default_focus_ring()) }
+                let focus_ring = if default_ring == Some(i) || self.forced_default_ring(i) { Some(self.default_focus_ring()) }
                     else if n.focus.within { n.focus.ring.filter(|_| self.focus_within(i)) }
                     else { self.focus_ring_visible(i).then_some(n.focus.ring).flatten() };
                 if let Some(ol) = focus_ring.or(n.vis.outline) {
@@ -1127,7 +1152,18 @@ impl<S: 'static> Runtime<S> {
                     paint_content::LeafBox {
                         r,
                         r_exact,
+                        // Its exact resting place against its snapped one, inside its containment's
+                        // own rounding (`LeafBox::exact_off`).
+                        // Under an offset (`El::offset`, a translation as CSS transforms are) it moves
+                        // with its box, as it did before this: a glide toward a moving offset keeps
+                        // the text on its card, and lands as a card that never moved draws.
+                        exact_off: if pinh.snap.shifted || n.vis.offset != [0.0; 2] { [0.0; 2] } else {
+                            let o = snap_rest.map_or([0.0; 2], |p| p.exact_off(pinh.snap.steady.map(|v| v * s)));
+                            let c = pinh.snap.contain.map(|v| v * s);
+                            [o[0] + (c[0] + 0.5).floor() - c[0], o[1] + (c[1] + 0.5).floor() - c[1]]
+                        },
                         raw_size: [raw_edges[2] - raw_edges[0], raw_edges[3] - raw_edges[1]],
+                        contain: pinh.snap.contain.map(|v| v * s),
                         radii,
                         sc,
                         o,
@@ -1135,14 +1171,18 @@ impl<S: 'static> Runtime<S> {
                         clip,
                         fade,
                         group: pinh.group,
+                        pressed,
+                        press_to,
                         loop_value,
                         cover,
                         scale_motion,
                         rest: pinh.still.0,
                         gliding,
                         caret: input_caret.map(|(caret, _)| caret),
+                        shown: if node_turn.is_none() && !pinh.in_cache { [clip[1].max(vp[1] - m), clip[3].min(vp[3] + m)] } else { [clip[1], clip[3]] },
                     },
                     &sel_ranges,
+                    &mark_ranges,
                     &mut glyph_count,
                 );
             }
@@ -1169,42 +1209,46 @@ impl<S: 'static> Runtime<S> {
             }
             // A scroll viewport clips its content with a hard edge unless it sets soft ones.
             if let Some(f) = n.vis.clip.or(n.scroll.map(|_| [0.0; 4])) {
-                clip = intersect(r, clip);
-                let (own, origin) = self.scroll_edge_fade(i, f, r, sc * s, p.rect.edges()[3]);
+                let outer = [clip, fade, fade_origin];
+                // A sliding window a step moves clips from its anchor's pose (`slide_anchor`).
+                let rs = self.slide_anchor(i, rect_pt, r_exact, r, if unscaled { 1.0 } else { sc });
+                clip = intersect(rs, clip);
+                let (own, origin) = self.scroll_edge_fade(i, f, rs, sc * s, p.rect.edges()[3]);
                 inherit_fade(&mut fade, &mut fade_origin, origin, own);
+                self.note_slide(i, outer, rect_pt, rs, (if unscaled { 1.0 } else { sc }, sc));
             }
+            let n = &self.nodes[i];
             let mask = self.row_mask[i];
             if mask >= 0.0 {
                 clip[3] = clip[3].min(r[3]);
                 // A fold's lifted contents (`GrowTrack::hide_above`) never draw above its top.
                 if self.row_lifts.iter().any(|&(ri, _)| ri == i) { clip[1] = clip[1].max(r[1]); }
-                inherit_fade(&mut fade, &mut fade_origin, r, [0.0, 0.0, 0.0, mask * s]);
+                inherit_fade(&mut fade, &mut fade_origin, r, [0.0, 0.0, 0.0, self.growth_feather(i)]);
             }
             let mut dy = pinh.dy;
             let snap_off = pinh.snap.off || n.vis_flags.no_pixel_snap() || turn_index != 0;
-            let mut snap_rigid = pinh.snap.rigid;
+            let mut snap = pinh.snap;
+            // `El::paint_contained`: its children snap against the containing box's origin,
+            // rounded on its own, as a translation that snaps as a whole.
+            if let Some(o) = n.vis.cold.get().and_then(|c| c.paint_contain) {
+                snap.contain_at(o);
+            }
             if n.scroll.is_some()
                 && let Some(st) = self.scrolls.get(&n.id)
             {
                 let offset = self.stuck_offset(i, p.rect.edges()[3]).unwrap_or(st.offset);
                 let held = self.bottom_offset(i, p.rect.edges()[3]).is_some_and(|b| (offset - b).abs() < 0.5);
                 let exact = offset as f32 + st.slack.height();
-                // Hold a reversal across a rounding boundary, not a full pixel of real travel:
-                // `grid` rounds to 1/64 of a device pixel. Always land at the layout offset.
-                let rounded = grid(exact, s);
-                let step = (rounded - st.drawn[1]).signum() as i8;
-                let back = st.pinned() && rounded != grid(st.offset as f32, s) && step == -st.drawn_step && ((exact - st.drawn[1]) * s).abs() < 1.0 / 64.0;
-                let drawn = if back { st.drawn[1] } else { rounded };
-                let moved = if drawn == st.drawn[1] { st.drawn_step } else { step };
+                let (drawn, hold) = st.drawn.draw(exact, st.offset as f32, st.pinned(), s);
                 dy -= drawn;
-                snap_rigid[1] -= drawn;
-                if let Some(st) = self.scrolls.get_mut(&self.nodes[i].id) { (st.held, st.drawn[1], st.drawn_step) = (held, drawn, moved); }
+                snap.scroll(1, -drawn);
+                if let Some(st) = self.scrolls.get_mut(&self.nodes[i].id) { (st.held, st.drawn) = (held, hold); }
             }
             let (mut scale, mut anchor, mut anchor_to, mut dx) = (sc, anchor, anchor_to, pinh.dx);
             if n.scroll_axes.x() && let Some(st) = self.scrolls.get_mut(&self.nodes[i].id) {
-                st.drawn[0] = grid(st.x.shift() as f32, s);
-                dx -= st.drawn[0];
-                snap_rigid[0] -= st.drawn[0];
+                st.drawn_x = grid(st.x.shift() as f32, s);
+                dx -= st.drawn_x;
+                snap.scroll(0, -st.drawn_x);
             }
             if open_cache && sc > 1e-4 {
                 dx += (r_exact[0] / s - rect_pt[0]) / sc;
@@ -1235,11 +1279,11 @@ impl<S: 'static> Runtime<S> {
             self.inh_scratch[i] = Inh { opacity: effective_opacity, paint_opacity: o, first_fade: kids_fade,
                 clip: full_clip, fade: hit_fade, fade_origin: hit_origin,
                 paint_clip: clip, paint_fade: fade, paint_fade_origin: fade_origin, rounded, scale, anchor, anchor_to, blur, dy, dx,
-                cover: cover_offset, outer, mark, group,
+                cover: cover_offset, outer, mark, group, pressed, press_to,
                 hit_opacity: hit_opacity * kids_fade, group_rect: if hover_owner { rect_pt } else { pinh.group_rect },
                 scale_motion, still: if scale_motion == ScaleMotion::Still { (scale, anchor, anchor_to) } else { pinh.still },
                 in_cache, skip_paint, turn: turn_index,
-                snap: pixel_snap::Inherit { off: snap_off, rigid: snap_rigid, layer: if cover.is_some() { 0 } else { snap_layer }, parent: snap_rest.filter(|_| cover.is_none() && snap_rigid == pinh.snap.rigid && pixel_snap::frames(&n.vis)) } };
+                snap: pixel_snap::Inherit { off: snap_off, steps, shifted: pinh.snap.shifted || n.vis.offset != [0.0; 2], layer: if cover.is_some() { 0 } else { snap_layer }, parent: snap_rest.filter(|_| cover.is_none() && snap.rigid == pinh.snap.rigid && pixel_snap::frames(&n.vis)), ..snap } };
             // Shown only under its group's hover, it takes presses where the pointer hovers the
             // group: a press in the same frame as the move that reveals it finds it, as a page's
             // `:hover` applies before the press does.
@@ -1248,7 +1292,10 @@ impl<S: 'static> Runtime<S> {
             if self.has_sticky {
                 self.fade_below_header(i, s);
             }
+            self.keep_painted(i, own_turn.is_none() && !opens_snap_layer && snap_layer == 0 && !in_cache && !skip_paint && cover.is_none() && !lift && !raised);
         }
+        self.keep_close(None, &mut layers, &mut active_cache, &mut glyph_count);
+        self.keep_end();
         while let Some((_, start, surface_start)) = layers.pop() {
             if active_cache.is_some_and(|ac| ac.instance_start == start) {
                 let ac = active_cache.take().unwrap();
@@ -1262,6 +1309,7 @@ impl<S: 'static> Runtime<S> {
         // follow the hold this decides.
         let queued = self.queue.len();
         let held = self.pointer.map(|(x, y)| self.refresh_hover(x, y));
+        self.queue.observe_since(queued);
         self.update_help();
         self.layer_scratch = layers;
         self.built = true;
@@ -1279,7 +1327,7 @@ impl<S: 'static> Runtime<S> {
         self.ambient = ambient;
         // A live transform can change hover paint with no handler and no running spring.
         // Retarget from the new geometry and schedule the frame that samples that paint. A
-        // commit that moved the indices left keyboard focus hover (`El::hover_group_focus`) to
+        // commit that moved the indices left keyboard focus hover (`El::hover_group`) to
         // this pass too.
         let interaction = (self.pointer.is_some() || self.focus.keyboard()) && self.update_interaction(held);
         self.queue.len() > queued || interaction

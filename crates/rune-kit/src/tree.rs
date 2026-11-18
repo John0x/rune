@@ -92,12 +92,13 @@ pub struct TreeModel<T> {
     multi: bool,
     filter: Option<Filter>,
     visible: RefCell<Option<Visible>>,
-    typed: String,
-    typed_at: Option<rune::time::Instant>,
+    type_ahead: TypeAhead,
     key: String,
     /// The viewport's height in points, for Page Up and Page Down.
     viewport: f32,
     row_height: f32,
+    /// Its rows indent from the right (`Self::set_right_to_left`).
+    rtl: bool,
 }
 
 impl<T> Default for TreeModel<T> {
@@ -108,6 +109,15 @@ impl<T> Default for TreeModel<T> {
 
 /// Seconds of pause after which typing starts a new name (AppKit's type select).
 const TYPE_PAUSE: f64 = 1.0;
+
+/// The name being typed into the tree: nothing, or the prefix so far and the clock its last key
+/// came at, so a pause starts a new name.
+#[derive(Default)]
+enum TypeAhead {
+    #[default]
+    Idle,
+    Typing { prefix: String, at: f64 },
+}
 
 impl<T> TreeModel<T> {
     pub fn new() -> TreeModel<T> {
@@ -120,11 +130,11 @@ impl<T> TreeModel<T> {
             multi: false,
             filter: None,
             visible: RefCell::new(None),
-            typed: String::new(),
-            typed_at: None,
+            type_ahead: TypeAhead::Idle,
             key: "tree".into(),
             viewport: 0.0,
             row_height: 24.0,
+            rtl: false,
         }
     }
 
@@ -140,6 +150,13 @@ impl<T> TreeModel<T> {
     pub fn multi_select(mut self, on: bool) -> Self {
         self.multi = on;
         self
+    }
+
+    /// The tree lies in a right-to-left window, its rows indenting from the right: Left opens a
+    /// folder and goes into it, Right closes it and goes to its parent, as Explorer and Finder
+    /// swap them.
+    pub fn set_right_to_left(&mut self, rtl: bool) {
+        self.rtl = rtl;
     }
 
     fn dirty(&mut self) {
@@ -578,7 +595,12 @@ impl<T> TreeModel<T> {
         }
         let at = self.cursor.map(|c| self.rows().row_of[c]).filter(|&r| r != usize::MAX);
         let page = ((self.viewport / self.row_height.max(1.0)).floor() as usize).saturating_sub(1).max(1);
-        let target = match &ev.key {
+        let key = match (&ev.key, self.rtl) {
+            (Key::Left, true) => Key::Right,
+            (Key::Right, true) => Key::Left,
+            (k, _) => k.clone(),
+        };
+        let target = match &key {
             Key::Up => Some(at.map_or(len - 1, |r| r.saturating_sub(1))),
             Key::Down => Some(at.map_or(0, |r| (r + 1).min(len - 1))),
             Key::Home => Some(0),
@@ -613,10 +635,8 @@ impl<T> TreeModel<T> {
             Key::Enter => return self.activate(at, tx),
             Key::Text(t) if t == " " => return self.activate(at, tx),
             Key::Text(t) if !t.trim().is_empty() => {
-                let now = rune::time::Instant::now();
-                let pause = self.typed_at.is_none_or(|a| now.duration_since(a).as_secs_f64() > TYPE_PAUSE);
-                self.typed_at = Some(now);
-                return match self.type_select(t, pause, &label) {
+                let prefix = self.type_ahead.step(t, tx.clock());
+                return match self.type_select(&prefix, &label) {
                     Some(r) => self.go(r, false, tx),
                     None => TreeKey::Handled,
                 };
@@ -649,16 +669,12 @@ impl<T> TreeModel<T> {
         TreeKey::Handled
     }
 
-    /// The row typing `typed` jumps to: the next whose name starts with everything typed since
+    /// The row typing `prefix` jumps to: the next whose name starts with everything typed since
     /// the last pause, and the same letter again cycles through names starting with it.
-    fn type_select(&mut self, typed: &str, pause: bool, label: impl Fn(&T) -> &str) -> Option<usize> {
-        if pause {
-            self.typed.clear();
-        }
-        self.typed.push_str(&typed.to_lowercase());
-        let first = self.typed.chars().next()?;
-        let cycle = self.typed.chars().all(|c| c == first);
-        let prefix = if cycle { first.to_string() } else { self.typed.clone() };
+    fn type_select(&self, prefix: &str, label: impl Fn(&T) -> &str) -> Option<usize> {
+        let first = prefix.chars().next()?;
+        let cycle = prefix.chars().all(|c| c == first);
+        let prefix = if cycle { first.to_string() } else { prefix.to_owned() };
         let v = self.rows();
         let len = v.rows.len();
         let at = self.cursor.map(|c| v.row_of[c]).filter(|&r| r != usize::MAX);
@@ -669,6 +685,24 @@ impl<T> TreeModel<T> {
             None => 0,
         };
         (0..len).map(|k| (start + k) % len).find(|&r| label(&self.nodes[v.rows[r]].data).to_lowercase().starts_with(&prefix))
+    }
+}
+
+impl TypeAhead {
+    /// Adds `text`, typed at `now`, to the prefix: a key more than [`TYPE_PAUSE`] after the last
+    /// starts a new name. Returns the prefix to jump to, lowercased.
+    fn step(&mut self, text: &str, now: f64) -> String {
+        let paused = match self {
+            TypeAhead::Typing { at, .. } => now - *at > TYPE_PAUSE,
+            TypeAhead::Idle => true,
+        };
+        let mut prefix = match self {
+            TypeAhead::Typing { prefix, .. } if !paused => std::mem::take(prefix),
+            _ => String::new(),
+        };
+        prefix.push_str(&text.to_lowercase());
+        *self = TypeAhead::Typing { prefix: prefix.clone(), at: now };
+        prefix
     }
 }
 

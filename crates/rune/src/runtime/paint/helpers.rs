@@ -8,7 +8,7 @@ pub(super) fn emit_block_decorations(
     images: &mut crate::pixels::ImageAtlas,
     glyph_scratch: &mut Vec<crate::text::GlyphQuad>,
     spec: &TextSpec,
-    layout: &Layout<Ink>,
+    layout: TextFlow<'_>,
     origin: [f32; 2],
     (x0, x1): (f32, f32),
     s: f32,
@@ -37,7 +37,7 @@ pub(super) fn emit_block_decorations(
             let pad_y = if tk == 1.0 { (2.0 * s).round() } else { 2.0 * s * tk };
             instances.push(rect_inst(
                 [x0 + glide[0], top - pad_y + glide[1], box_w, (bot - top) + 2.0 * pad_y],
-                premul(spec.rich_style.code_block_bg, o, srgb),
+                premul(spec.rich_style().code_block_bg, o, srgb),
                 6.0 * s * tk,
                 clip,
                 fade,
@@ -51,7 +51,7 @@ pub(super) fn emit_block_decorations(
             let inset_y = if tk == 1.0 { (2.0 * s).round() } else { 2.0 * s * tk };
             instances.push(rect_inst(
                 [bar_x, top + inset_y + glide[1], bar_w, (bot - top - 2.0 * inset_y).max(4.0 * s * tk)],
-                premul(spec.rich_style.quote_bar, o, srgb),
+                premul(spec.rich_style().quote_bar, o, srgb),
                 bar_w * 0.5,
                 clip,
                 fade,
@@ -60,18 +60,13 @@ pub(super) fn emit_block_decorations(
     };
 
     let mut had_lines = false;
-    for line in layout.lines() {
+    for line in layout.block_lines(spec.style.line_px() * s) {
         had_lines = true;
-        let m = line.metrics();
-        let blk = spec.blocks.get(para_idx).copied().unwrap_or(Block::Paragraph);
-        let is_soft = spec.soft_breaks.binary_search(&(para_idx as u32)).is_ok();
-        let top = origin[1] + m.block_min_coord * tk;
-        let bot = if m.block_max_coord > m.block_min_coord {
-            origin[1] + m.block_max_coord * tk
-        } else {
-            top + line_h_default
-        };
-        let baseline = origin[1] + m.baseline * tk;
+        let blk = spec.cold.blocks.get(para_idx).copied().unwrap_or(Block::Paragraph);
+        let is_soft = spec.cold.soft_breaks.binary_search(&(para_idx as u32)).is_ok();
+        let top = origin[1] + line.top * tk;
+        let bot = origin[1] + line.bottom * tk;
+        let baseline = origin[1] + line.baseline * tk;
 
         if blk == Block::Code {
             flush_quote(instances, &mut quote_run);
@@ -122,7 +117,7 @@ pub(super) fn emit_block_decorations(
             }
         }
 
-        if line.break_reason() == parley::BreakReason::Explicit {
+        if line.last {
             para_idx += 1;
             first_line_of_para = true;
         } else {
@@ -131,7 +126,7 @@ pub(super) fn emit_block_decorations(
     }
 
     if !had_lines
-        && let Some(&blk) = spec.blocks.first()
+        && let Some(&blk) = spec.cold.blocks.first()
     {
         let top = origin[1];
         let bot = top + line_h_default;
@@ -155,7 +150,7 @@ pub(super) fn emit_block_decorations(
     flush_quote(instances, &mut quote_run);
 
     if !markers.is_empty() {
-        let marker_color = spec.rich_style.marker.unwrap_or_else(|| text_color.alpha(0.68));
+        let marker_color = spec.rich_style().marker.unwrap_or_else(|| text_color.alpha(0.68));
         let mc = premul(marker_color, o, srgb);
         for (indent_px, baseline_y, blk, num) in markers {
             match blk {
@@ -197,16 +192,17 @@ pub(super) fn emit_block_decorations(
 
 /// Pixel caret and logical-point IME area use the same shaped cursor geometry.
 pub(super) fn input_caret(n: &Node, r: [f32; 4], scale: f32, s: f32, gliding: bool, scrolls: &mut HashMap<String, f32>) -> Option<([f32; 4], [f32; 4])> {
-    let (spec, layout, input) = (n.text.as_ref()?, n.text_layout.as_ref()?, n.input.as_ref()?);
+    let (spec, laid, input) = (n.text.as_ref()?, n.text_layout.as_ref()?, n.input.as_ref()?);
+    let layout = laid.view();
     let e = &input.edit;
     let ins = n.inset.map(|v| v * scale * s);
     let (x0, x1) = (r[0] + ins[0], r[2] - ins[2]);
     // The text scales with its box, so the caret does too.
-    let mut x = text_x(spec, x0, x1, (layout.full_width() * scale).ceil(), crate::el::Flow::of_layout(layout));
-    if input.single_line { x -= single_line_scroll(scrolls, &n.path, input, &spec.content, layout, s, (x1 - x0) / scale.max(1e-4)) * scale; }
-    let ci = caret_index(e, &spec.content);
-    let cur = Cursor::from_byte_index(layout, ci, Affinity::Downstream);
-    let bb = crate::text::cursor_geometry(&cur, layout, 1.5 * s);
+    let mut x = text_x(spec, x0, x1, text_width(layout.full_width() * scale), layout.flow());
+    if input.single_line && let Some(l) = laid.single() {
+        x -= single_line_scroll(scrolls, &n.path, input, &spec.content, l, s, (x1 - x0) / scale.max(1e-4)) * scale;
+    }
+    let bb = layout.caret(caret_index(e, &spec.content), e.affinity, 1.5 * s);
     let (cx, cy) = (x + bb.x0 as f32 * scale, r[1] + ins[1] + bb.y0 as f32 * scale);
     let h = (if bb.y1 > bb.y0 { (bb.y1 - bb.y0) as f32 } else { spec.style.line_px() * s }) * scale;
     let (caret_x, caret_w) = if (scale - 1.0).abs() <= 1e-5 {
@@ -215,7 +211,19 @@ pub(super) fn input_caret(n: &Node, r: [f32; 4], scale: f32, s: f32, gliding: bo
     } else {
         (cx, (1.5 * s * scale).max(1.0))
     };
-    Some(([caret_x, cy + h * 0.1, caret_w, h * 0.8], [cx / s, cy / s, 2.0 * scale, h / s]))
+    // The candidate window opens under the clause being converted, its left edge at the
+    // clause's start, as it does in a native field; else at the caret.
+    let area = match (e.preedit_target(), e.range().0) {
+        (Some((ta, tb)), at) => {
+            let len = spec.content.len();
+            let (a, b) = (layout.caret((at + ta).min(len), e.affinity, 0.0), layout.caret((at + tb).min(len), e.affinity, 0.0));
+            let (ax, ay) = (x + a.x0 as f32 * scale, r[1] + ins[1] + a.y0 as f32 * scale);
+            let w = if (b.y0 - a.y0).abs() < 0.5 && b.x0 > a.x0 { (b.x0 - a.x0) as f32 * scale } else { 2.0 * scale * s };
+            [ax / s, ay / s, w / s, h / s]
+        }
+        (None, _) => [cx / s, cy / s, 2.0 * scale, h / s],
+    };
+    Some(([caret_x, cy + h * 0.1, caret_w, h * 0.8], area))
 }
 
 /// Whether `looping`'s sampled value multiplies the element's opacity.
@@ -232,6 +240,7 @@ pub(super) fn own_paints(n: &Node) -> usize {
         v.border_width() > 0.0 && (v.border().a > 0.0 || v.border_bottom.is_some()),
         v.gradient.is_some() || v.radial.is_some() || v.surface.is_some(),
         v.shape.is_some(),
+        v.grid.is_some(),
         v.pixels.is_some(),
         !v.shadows.is_empty(),
         n.text.is_some(),
@@ -269,7 +278,10 @@ pub(super) fn zoom_glyph(mut g: Instance, origin: [f32; 2], r_origin: [f32; 2], 
     if g.params[1] == KIND_GLYPH && g.radii[3] > 0.0 {
         // An outline glyph (`text::Outline`) magnifies its pen and pixel instead of its mask.
         g.radii = [origin[0] + (g.radii[0] - r_origin[0]) * k, origin[1] + (g.radii[1] - r_origin[1]) * k, g.radii[2], g.radii[3] * k];
-    } else if g.params[1] == KIND_GLYPH && g.uv[2] == 0.0 { (g.uv[2], g.uv[3]) = (g.rect[2], g.rect[3]); }
+    } else if g.params[1] == KIND_GLYPH && g.uv[2] == 0.0 {
+        // A subpixel mask's footprint is three texels a pixel wide.
+        (g.uv[2], g.uv[3]) = (g.rect[2] * if g.radii[0] > 0.5 { 3.0 } else { 1.0 }, g.rect[3]);
+    }
     g.rect = [
         origin[0] + (g.rect[0] - r_origin[0]) * k,
         origin[1] + (g.rect[1] - r_origin[1]) * k,
@@ -311,4 +323,28 @@ pub(super) fn rect_inst(rect: [f32; 4], fill: [f32; 4], radius: f32, clip: [f32;
         clip,
         fade: crate::render::pack_fade(fade, clip, clip),
     }
+}
+
+/// A misspelled word's marker: Chromium's red, on macOS a row of dots and elsewhere a wavy line.
+/// (Linear light: #FF3B30 on macOS, #FF0000 elsewhere.)
+pub(super) const SPELLING: Color = if cfg!(target_os = "macos") { Color { r: 1.0, g: 0.0437, b: 0.0296, a: 1.0 } } else { Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 } };
+
+/// The spelling marker from device x `x0` to `x1`, its top at `y`, `k` device px a point: on
+/// macOS 3 pt dots every 4 pt, elsewhere Chromium's 1 pt line waving 2 pt down and back every 6 pt.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn push_spelling_marker(out: &mut Vec<Instance>, x0: f32, x1: f32, y: f32, k: f32, color: [f32; 4], clip: [f32; 4], fade: [f32; 4]) {
+    if cfg!(target_os = "macos") {
+        let (d, step) = (3.0 * k, 4.0 * k);
+        let count = ((x1 - x0 - d) / step).floor().max(0.0) as usize + 1;
+        let x = x0 + ((x1 - x0) - (count - 1) as f32 * step - d) / 2.0;
+        out.extend((0..count).map(|n| rect_inst([x + n as f32 * step, y, d, d], color, d / 2.0, clip, fade)));
+        return;
+    }
+    const WAVE: [f32; 6] = [0.0, 1.0, 2.0, 2.0, 1.0, 0.0];
+    let t = k.max(1.0).round();
+    let start = x0.round();
+    out.extend((0..(x1.round() - start).max(0.0) as usize).map(|n| {
+        let wave = WAVE[(n as f32 / k) as usize % WAVE.len()];
+        rect_inst([start + n as f32, (y + wave * k).round(), 1.0, t], color, 0.0, clip, fade)
+    }));
 }

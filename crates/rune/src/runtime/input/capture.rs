@@ -1,7 +1,8 @@
 //! The pointer's hold on an element: the primary (or an extra) button's press from down to up,
 //! and the secondary button's beside it. A held press keeps what only it has (where and when it
 //! went down, whether it's still inside its element or a scroll cancelled it, whether it
-//! travelled past the click slop, whether it's the second of a double press, an armed OS drag),
+//! travelled past the click slop, whether it's the second of a double press, an armed OS drag,
+//! the link it began on),
 //! so none of it outlives the release. Between presses only the first click of a possible
 //! double press is kept. The input routes in `pointer.rs`, `gesture.rs`, `secondary.rs` and
 //! `selection/click.rs` drive it.
@@ -46,15 +47,27 @@ pub(crate) struct Held {
     pub(crate) drag_out: Option<f32>,
     /// The pointer left the window while it held; the leave lands on release.
     pub(crate) left: bool,
+    /// The link of its text it began on: a release on the same link activates it.
+    pub(crate) link: Option<usize>,
+    /// It ran its element's `on_press` as it went down (`El::press_on_down`): its release
+    /// runs nothing.
+    pub(crate) pressed_on_down: bool,
+    pub(crate) touch: bool,
 }
 
 impl Held {
     /// A press that just went down at `at`, inside its element and still.
     pub(crate) fn new(path: String, drag: Drag, button: PointerButton, at: (f32, f32), down_at: f64, second: bool, drag_out: Option<f32>) -> Self {
-        Self { path, drag, button, at, down_at, hit: Hit::Inside, moved: false, second, drag_out, left: false }
+        Self { path, drag, button, at, down_at, hit: Hit::Inside, moved: false, second, drag_out, left: false, link: None, pressed_on_down: false, touch: false }
     }
 
     pub(crate) fn inside(&self) -> bool { self.hit == Hit::Inside }
+
+    /// Began on link `link` of its text.
+    pub(crate) fn on_link(self, link: Option<usize>) -> Self { Self { link, ..self } }
+
+    /// Ran its element's `on_press` as it went down.
+    pub(crate) fn pressed_on_down(self, pressed_on_down: bool) -> Self { Self { pressed_on_down, ..self } }
 }
 
 #[derive(Clone, Debug)]
@@ -120,12 +133,38 @@ impl Press {
     pub(crate) fn hold(&mut self, held: Held) { *self = Self::Held(Box::new(held)); }
 }
 
-/// The secondary button's hold: the element whose menu it opens on release.
+/// The secondary button's hold: the element whose menu it opens on release, the link of its
+/// text it began on (`on_link_secondary`), and whether the pointer left the window meanwhile.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum Secondary {
     #[default]
     Up,
-    Held { path: String, left: bool },
+    Held { path: String, link: Option<usize>, left: bool },
+}
+
+/// The middle or secondary button held where the primary isn't: the element it shows pressed
+/// ([`El::press`](crate::El::press)) while the pointer is over it, as a browser sets `:active`
+/// for a press of any button. It's the element a primary press there would take; it hears
+/// nothing, and the release lets go of it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum Tint {
+    #[default]
+    Up,
+    Held { path: String, button: PointerButton },
+}
+
+impl Tint {
+    pub(crate) fn path(&self) -> Option<&str> {
+        match self {
+            Self::Held { path, .. } => Some(path),
+            Self::Up => None,
+        }
+    }
+
+    /// `button` came up: it lets go if it's the one holding.
+    pub(crate) fn release(&mut self, button: PointerButton) {
+        if matches!(self, Self::Held { button: b, .. } if *b == button) { *self = Self::Up; }
+    }
 }
 
 impl Secondary {

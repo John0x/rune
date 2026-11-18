@@ -2,16 +2,33 @@
 use super::*;
 
 impl<S: 'static> Runtime<S> {
+    /// rame-profile: the paths of drawn nodes whose loop is running, which wake the window.
+    #[cfg(feature = "frame-profile")]
+    pub(crate) fn fp_loops(&self) -> Vec<String> {
+        self.nodes.iter().enumerate()
+            .filter(|(i, n)| n.looping.is_some() && self.seen.get(*i).copied().unwrap_or(false) && self.loops.contains_key(&n.id))
+            .map(|(_, n)| n.path.clone()).collect()
+    }
+
+    /// Whether a drawn node's loop runs (a spinner): what a window shows would fall behind it
+    /// while the window draws nothing.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn loops_shown(&self) -> bool {
+        self.nodes.iter().enumerate().any(|(i, n)| n.looping.is_some() && self.seen.get(i).copied().unwrap_or(false) && self.loops.contains_key(&n.id))
+    }
+
     /// Clock seconds now: the wall clock in a window (input arrives between frames), the
     /// virtual clock headless.
     pub(super) fn now_clock(&self) -> f64 {
         self.wall_start.map_or(self.clock, |t| t.elapsed().as_secs_f64())
     }
 
+    /// The window's size in its points and its scale. The view lays out in them over its zoom
+    /// ([`Cx::zoom`]), at the scale times the zoom.
     pub fn set_viewport(&mut self, viewport: (f32, f32), scale: f32) {
-        // Someone resized a window that fits its content (not a page's band): back to its height.
-        if self.fit_height && !self.page.on && self.window_resting && (self.fit_asked.unwrap_or(self.viewport.1) - viewport.1).abs() > 0.5 {
-            self.fit_asked = None;
+        (self.zoom.window, self.zoom.window_scale) = (viewport, scale);
+        let (viewport, scale) = self.zoom.view();
+        if self.fit_resized(viewport.1) {
             self.relayout = true;
             self.viewport_stepped = false;
         }
@@ -22,6 +39,8 @@ impl<S: 'static> Runtime<S> {
     /// user's resize it doesn't land running motion: content at rest follows the window and
     /// springs keep going.
     pub(crate) fn step_viewport(&mut self, viewport: (f32, f32), scale: f32) {
+        (self.zoom.window, self.zoom.window_scale) = (viewport, scale);
+        let (viewport, scale) = self.zoom.view();
         let fresh = !self.relayout;
         if self.change_viewport(viewport, scale) && fresh { self.viewport_stepped = true; }
     }
@@ -45,9 +64,6 @@ impl<S: 'static> Runtime<S> {
         changed
     }
 
-    /// Whether the window has the keyboard focus, as its last focus event said.
-    pub(crate) fn has_window_focus(&self) -> bool { self.window_focused == Some(true) }
-
     /// Queue a native focus transition. Repeated notifications do not repeat the callback.
     /// Losing focus is also `keys_lost`.
     pub fn window_focus(&mut self, focused: bool) {
@@ -56,8 +72,13 @@ impl<S: 'static> Runtime<S> {
         if self.window_focused != Some(focused) {
             // Refocused, the pointer where it was hovers again; blurred, it waits for a move.
             if focused && self.window_focused == Some(false) { self.hover_paused = false; }
-            // A focused field's selection takes its active or inactive pair (`El::selection_style`).
-            if self.window_focused.is_some() && self.focused_input().is_some_and(|i| i.selection_style.is_some()) { self.dirty = true; }
+            // A selection takes its active or inactive pair (`El::selection_style`): a focused
+            // field's, or a selectable text's.
+            if self.window_focused.is_some()
+                && (self.focused_input().is_some_and(|i| i.selection_style.is_some()) || self.text_selection().is_some_and(|(_, r)| !r.is_empty()))
+            {
+                self.dirty = true;
+            }
             self.window_focused = Some(focused);
             if let Some(f) = self.on_focus { self.update(|s, tx| f(s, focused, tx)); }
             // Deliver the cancelled Up before FocusLost can commit a view that removes its
@@ -70,14 +91,12 @@ impl<S: 'static> Runtime<S> {
                 self.queue.push(Action::WindowFocus(focused));
             }
             if !focused {
+                self.finish_composition();
                 self.keys_lost();
                 // Losing the window ends hover, rather than waiting out an exit grace. A window
                 // that isn't key still hears the pointer, so its next move starts the wait again.
-                self.hover_pending.clear();
+                self.end_hover_delays();
                 self.hover_paused = true;
-                for path in std::mem::take(&mut self.hover_shown) {
-                    self.queue.push(Action::HoverChange(path, false));
-                }
             }
         }
         if !focused { self.input_click.clear(); self.wheel_lost(); }
@@ -140,21 +159,45 @@ impl<S: 'static> Runtime<S> {
     /// Returning false after changing state the view reads leaves the screen stale until the
     /// next change.
     pub fn update_if(&mut self, f: impl FnOnce(&mut S, &mut Tx) -> bool) -> bool {
+        self.update_inner(f, false).0
+    }
+
+    /// `update_if` for an update a window drain runs: a minimize it asked for comes back instead
+    /// of reaching the minimize machine, so the drain can order it against the handle requests it
+    /// took. A pick callback that replaces its `Tx` discards the minimize, as running the
+    /// callbacks before reading `Tx::minimize` does; one the callback asks for itself still
+    /// latches. Returns stale, then the minimize's order when it survived.
+    pub(crate) fn update_if_ordered(&mut self, f: impl FnOnce(&mut S, &mut Tx) -> bool) -> (bool, Option<std::num::NonZeroU64>) {
+        self.update_inner(f, true)
+    }
+
+    fn update_inner(&mut self, f: impl FnOnce(&mut S, &mut Tx) -> bool, ordered: bool) -> (bool, Option<std::num::NonZeroU64>) {
         // Its wakes count from now (`schedule_pending_wakes`), so its clock reads now too.
         let mut one = Tx { clock: self.now_clock(), ..self.transaction() };
         let changed = crate::tooling::perf_warn::timed("an `update` closure", || f(&mut self.state, &mut one));
-        let stale = changed || one.frame_work() || one.window_frame.is_some() || one.srgb_blend.is_some_and(|b| b != self.srgb_blend) || one.font_smoothing.is_some_and(|m| m != self.text.smoothing)
+        let stale = changed || one.frame_work() || one.window_frame.is_some() || one.srgb_blend.is_some_and(|b| b != self.srgb_blend) || one.font_smoothing.is_some_and(|m| m != self.text.font_smoothing())
             || self.changes_families(&one)
             || (one.blur && self.focus.path().is_some());
-        self.latch_requests(&mut one);
+        let minimize = if ordered {
+            let asked = one.minimize_order;
+            self.run_pick_reads(&mut one);
+            let survived = if asked.is_some() && one.minimize_order == asked { one.minimize_order.take() } else { None };
+            self.latch_after_picks(&mut one);
+            survived
+        } else {
+            self.latch_requests(&mut one);
+            None
+        };
         merge(&mut self.pending, one);
         self.dirty |= changed;
-        stale
+        (stale, minimize)
     }
 
     /// Takes a `Tx::minimize` that `what` can't carry out, saying so in debug builds.
     pub(crate) fn ignore_minimize(&mut self, what: &str) {
-        if std::mem::take(&mut self.minimize_request) && cfg!(debug_assertions) {
+        let field = self.minimize.field();
+        self.minimize_step(crate::window::MinimizeEvent::Lost);
+        if field && cfg!(debug_assertions) {
             eprintln!("rune: minimize ignored: {what} can't minimize");
         }
     }
@@ -164,8 +207,13 @@ impl<S: 'static> Runtime<S> {
     /// memory clipboard at once. A secret clear drops an earlier secret copy not yet written.
     pub(super) fn latch_requests(&mut self, tx: &mut Tx) {
         self.run_pick_reads(tx);
+        self.latch_after_picks(tx);
+    }
+
+    /// [`Self::latch_requests`] once the pick callbacks have run.
+    fn latch_after_picks(&mut self, tx: &mut Tx) {
         self.shell_request = self.shell_request.max(tx.shell.take());
-        self.minimize_request |= std::mem::take(&mut tx.minimize);
+        if tx.minimize_order.take().is_some() { self.minimize_step(crate::window::MinimizeEvent::Asked); }
         self.titlebar.toggle_maximized |= std::mem::take(&mut tx.toggle_maximized);
         self.titlebar.toggle_full_screen |= std::mem::take(&mut tx.toggle_full_screen);
         for ev in std::mem::take(&mut tx.keys) { self.key(ev); }
@@ -211,7 +259,9 @@ impl<S: 'static> Runtime<S> {
                 self.set_focus(None, self.focus.keyboard());
                 self.dirty = true;
             }
-            // An explicit blur is not the temporary pointer-down blur of a scrim.
+            // An explicit blur is not the temporary pointer-down blur of a scrim, and nothing
+            // hands focus on from it: only a control the user blurred and then left does.
+            self.focus.step(focus_machine::FocusEvent::Dropped);
             self.focus.step(focus_machine::FocusEvent::Settled);
         }
         if let Some(request) = tx.focus_to.take() {
@@ -219,8 +269,9 @@ impl<S: 'static> Runtime<S> {
             self.dirty = true;
         }
         if let Some(title) = tx.title.take() { self.window_title.set(title); }
+        if let Some((text, how)) = tx.announce.take() { self.announcement.say(text, how); }
         if let Some(mut request) = tx.window_frame.take() {
-            request.spring = (request.animate && !tx.instant && !self.reduced_motion).then(|| tx.motion.unwrap_or(motion::DEFAULT));
+            request.spring = (request.animate && !tx.commit.snaps() && !self.reduced_motion).then(|| tx.motion.map_or(motion::DEFAULT, MotionSource::spring));
             self.window_frame = Some(self.window_frame.unwrap_or_default().merge(request));
         }
         crate::clipboard::flush_memory(self);
@@ -228,6 +279,8 @@ impl<S: 'static> Runtime<S> {
 
     /// Host time on the logical clock.
     pub(super) fn wall_clock(&self) -> Option<f64> {
+        #[cfg(test)]
+        if let Some(clock) = &self.test_clock { return Some(clock.now()); }
         self.wall_start.map(|t0| t0.elapsed().as_secs_f64())
     }
 
@@ -244,6 +297,15 @@ impl<S: 'static> Runtime<S> {
         self.schedule_wakes_from(self.clock, wakes);
     }
 
+    /// Wakes for a frame once the clock reaches `due`, as [`Tx::wake_at`] asks from a handler (a
+    /// deadline already past wakes the next frame), for the runtime's own timers.
+    #[cfg_attr(feature = "frame-profile", track_caller)]
+    pub(super) fn wake_at(&mut self, due: f64) {
+        #[cfg(feature = "frame-profile")]
+        crate::frame::live_log::waker(std::panic::Location::caller(), std::time::Duration::from_secs_f64((due - self.clock).max(0.0)));
+        self.schedule_wakes_from(due, [std::time::Duration::ZERO]);
+    }
+
     pub(super) fn schedule_wakes_from(&mut self, now: f64, wakes: impl IntoIterator<Item = std::time::Duration>) {
         for delay in wakes {
             let deadline = now + delay.as_secs_f64();
@@ -257,7 +319,7 @@ impl<S: 'static> Runtime<S> {
 
     pub(super) fn transaction(&self) -> Tx {
         Tx { trace: self.tracing().then(crate::el::TraceCalls::default), mods: self.held_mods, selection: self.selection_snapshot(),
-            input_time: crate::input::time::current(), clock: self.clock, focus_visible: self.focus.keyboard(), ..Tx::default() }
+            input_time: crate::input::time::current(), clock: self.clock, focus_visible: self.focus.keyboard(), focused: self.focused_key(), assistive: self.a11y.is_some() || cfg!(target_arch = "wasm32"), ..Tx::default() }
     }
 
     /// A scalar from the actual draw path (e.g. `shell.width`). Values hold until resampled.
@@ -290,6 +352,17 @@ impl<S: 'static> Runtime<S> {
 
     pub(super) fn logical_wake_deadline(&self) -> Option<f64> {
         self.wake_deadlines.first().copied().into_iter().chain(self.loop_wake.map(|w| w.0)).min_by(f64::total_cmp)
+    }
+
+    /// The next due timer of `poll`'s, on `wake_deadline`'s clock.
+    pub(crate) fn poll_wake_deadline(&self) -> Option<f64> {
+        self.wake_deadlines.first().copied()
+    }
+
+    /// The next frame motion asks for at its own cadence (a loop's next step, a video's next
+    /// picture), on `wake_deadline`'s clock.
+    pub(crate) fn motion_wake_deadline(&self) -> Option<f64> {
+        self.loop_wake.map(|w| w.0)
     }
 
     /// Lands every track before the next frame: growth, reveals and follow-the-end (guarantee 8,
@@ -335,6 +408,17 @@ impl<S: 'static> Runtime<S> {
             return self.stats.commits != commits;
         }
         self.poll_hidden()
+    }
+
+    /// [`Runtime::hidden_wake`] for a shown window that can't draw (covered, minimised, on a
+    /// locked or sleeping display). While an assistive client reads its tree, what changed is
+    /// built at once, without drawing or motion, so the tree it reads and focus asked of what
+    /// the change shows (a permission's card) are current whatever the window's motion does.
+    /// Returns what `hidden_wake` does.
+    pub(crate) fn covered_wake(&mut self) -> bool {
+        let stale = self.hidden_wake();
+        if self.a11y.is_some() && self.needs_commit() { self.hidden_timer_frame(); }
+        stale
     }
 
     /// One frame in one pass that steps `catch_up + dt` seconds. Motion already running advances
@@ -398,13 +482,14 @@ impl<S: 'static> Runtime<S> {
         }
         let mut tx = std::mem::take(&mut self.pending);
         let mut ran = false;
-        let mut why = 0;
+        let mut why = if tx.polled_change && self.dirty { CommitWhy::POLL } else { 0 };
         #[cfg(debug_assertions)]
         let commits0 = self.commits;
         let shaped0 = self.text.shaped;
         self.settled = false;
         self.landing_holds.clear();
-        self.clock = self.wall_clock().unwrap_or(self.clock + elapsed);
+        // `RUNE_LOOP_CHECK=1`: the frame that runs instead of a checked step samples at its clock.
+        self.clock = self.paint_keep.cycles.check_clock.take().unwrap_or_else(|| self.wall_clock().unwrap_or(self.clock + elapsed));
         if self.wall_start.is_none() {
             crate::video::headless_frame(self.clock);
             // Fake recorders publish this frame's level to bound meters, drawn this frame.
@@ -432,11 +517,16 @@ impl<S: 'static> Runtime<S> {
         self.wake_deadlines.drain(..due);
         self.fire_hover_delays();
         self.fire_press_repeat();
-        let (wake, redraw) = crate::spell::pause::tick(&mut self.spell_watch, self.clock);
+        self.fire_edge_scroll();
+        self.fire_autoscroll();
+        self.fire_touch_hold();
+        // Marks are paint's (`paint::content`), and this frame paints: a pause that ends or words
+        // the checker brought back show without the view running again.
+        let (wake, _marked) = crate::spell::pause::tick(&mut self.spell_watch, self.clock);
         if let Some(at) = wake { self.schedule_wakes([std::time::Duration::from_secs_f64((at - self.clock).max(0.0))]); }
-        if redraw { self.dirty = true; }
         if let Some(poll) = self.poll.filter(|_| !polled) {
             let mut one = self.transaction();
+            one.input_waiting = self.queue.has_input();
             // Scheduling does not imply a model change.
             if self.idle_meter.polled(crate::tooling::perf_warn::timed("poll", || app_call!(poll, &mut self.state, self.clock, &mut one))) {
                 ran = true;
@@ -469,38 +559,67 @@ impl<S: 'static> Runtime<S> {
         #[cfg(debug_assertions)]
         let mut ran_other = ran;
         let mut pointer_hover = false;
-        for Queued { action, at } in queue {
-            let _input = crate::input::time::scope(at);
+        for Queued { action, at, input } in queue {
+            if matches!(action, Action::Key { stage: false, .. } | Action::Physical(crate::PhysicalInput::Key { pressed: true, .. }, _)) { crate::marks::input_handled(true); }
             pointer_hover |= matches!(action, Action::Hover(_));
+            // The user's own key or press takes over from a `Tx::focus_when_shown` still waiting.
+            if matches!(action, Action::Key { stage: false, .. } | Action::Physical(crate::PhysicalInput::Key { pressed: true, .. }, _) | Action::Press(..) | Action::Focus(..)) {
+                self.focus_owed = None;
+            }
             // State may have requested focus on a newly mounted field. Resolve the
             // new tree before routing this frame's text, not after it has gone to
             // the previous field. The same boundary covers an earlier handler, and lets a
             // file drag find only what is mounted and reachable now (a covered window builds
             // nothing until this).
-            let routed = matches!(&action, Action::Key { .. } | Action::KeyUp(_) | Action::Physical(..) | Action::Ime(_) | Action::Paste(..) | Action::Files(_));
+            let routed = matches!(&action, Action::Key { .. } | Action::KeyUp(_) | Action::Physical(..) | Action::Ime(_) | Action::FinishIme | Action::Paste(..) | Action::Files(_));
             // So is a playground an earlier handler opened or moved.
             if routed { self.latch_playground(&mut tx); }
-            if (ran || self.dirty || !tx.scroll_to.is_empty()) && routed {
+            // Both callbacks see ordinary &mut S. After the next mutation a single view
+            // cannot tell which one introduced a row. Observe the poll's tree now, without
+            // drawing it or advancing time. A key already needed this same routing boundary.
+            let split = self.motion_needs_cause && why & CommitWhy::POLL != 0 && (input || routed);
+            if split || (ran || self.dirty || !tx.scroll_to.is_empty()) && routed {
+                if split {
+                    let links = std::mem::take(&mut tx.open_urls);
+                    self.latch_requests(&mut tx);
+                    tx.open_urls = links;
+                }
                 if ran || self.dirty {
                     self.capture_flights(&mut tx);
                     if self.settle { tx.settle(); }
-                    self.settled |= tx.settle;
+                    self.settled |= tx.commit.lands();
                     #[cfg(debug_assertions)]
                     if ran_other || self.dirty || ran_layout { self.live_check = None; }
                     self.capture_keeps(&mut tx);
-                    self.commit_for(&tx, std::mem::take(&mut why) | CommitWhy::ROUTE | if self.dirty { CommitWhy::DIRTY } else { 0 });
+                    tx.unprompted = self.motion_needs_cause && why & CommitWhy::INPUT == 0 && !tx.asked_motion;
+                    if split && tx.unprompted { tx.commit = tx.commit.without_input(); }
+                    if routed { why |= CommitWhy::ROUTE; }
+                    if self.dirty { why |= CommitWhy::DIRTY; }
+                    self.commit_for(&tx, std::mem::take(&mut why));
                     #[cfg(debug_assertions)]
                     { let check = self.live_check.take(); self.compare_live_check(check); ran_other = false; }
                     self.apply_keeps();
                     ran = false;
                 }
-                if !tx.scroll_to.is_empty() {
+                if split {
+                    self.finish_scroll_requests(&mut tx, false);
+                    // The poll's motion policy belongs to the tree just applied, not to
+                    // the handler about to run. Shell requests and timers still go out once.
+                    tx.commit = Commit::Animate;
+                    tx.unprompted = false;
+                    tx.asked_motion = false;
+                    tx.live_growth.clear(); tx.tail_rooms.clear();
+                    tx.motion = None;
+                    tx.color_motion = None;
+                    tx.follow_edge = false;
+                    tx.unclipped_flights = false;
+                    ran_layout = false;
+                } else if !tx.scroll_to.is_empty() {
                     self.drop_scroll_holds();
-                    for r in std::mem::take(&mut tx.scroll_to) {
-                        self.reveal_row(&r, tx.instant);
-                    }
+                    for r in tx.scroll_to.drain(..) { self.reveal_row(&r, tx.commit.snaps()); }
                 }
             }
+            let _input = crate::input::time::scope(at);
             // A selection an earlier handler asked for is what this key copies.
             if matches!(action, Action::Key { .. } | Action::Physical(..)) && let Some(request) = tx.select.take() {
                 let from_change = std::mem::take(&mut tx.select_from_change);
@@ -515,7 +634,7 @@ impl<S: 'static> Runtime<S> {
                 #[cfg(debug_assertions)]
                 { ran_other |= r && checks == self.live_checks; }
                 ran |= r;
-                if r { why |= CommitWhy::INPUT; }
+                if r { why |= if input { CommitWhy::INPUT } else { CommitWhy::DIRTY }; }
             }
             self.run_pick_reads(&mut tx);
         }
@@ -526,8 +645,10 @@ impl<S: 'static> Runtime<S> {
             let r = self.run_action(action, &mut tx);
             #[cfg(debug_assertions)]
             { ran_other |= r && checks == self.live_checks; }
-            if r { ran = true; why |= CommitWhy::INPUT; }
+            if r { ran = true; why |= CommitWhy::DIRTY; }
         }
+        #[cfg(target_os = "linux")]
+        self.note_primary_selection();
         let mut open_urls = std::mem::take(&mut tx.open_urls);
         self.latch_requests(&mut tx);
         // A handler asked for a menu: the hover it takes ends in this commit, not a frame later.
@@ -539,7 +660,7 @@ impl<S: 'static> Runtime<S> {
                 let r = self.run_action(queued.action, &mut tx);
                 #[cfg(debug_assertions)]
                 { ran_other |= r && checks == self.live_checks; }
-                if r { ran = true; why |= CommitWhy::INPUT; }
+                if r { ran = true; why |= if queued.input { CommitWhy::INPUT } else { CommitWhy::DIRTY }; }
             }
             open_urls.extend(std::mem::take(&mut tx.open_urls));
             self.latch_requests(&mut tx);
@@ -560,15 +681,20 @@ impl<S: 'static> Runtime<S> {
                 if self.viewport_stepped { tx.window_step = true } else { tx.relayout = true }
             }
             if self.settle {
-                tx.instant = true;
-                tx.settle = true;
+                tx.commit = Commit::Settle;
             }
-            self.settled = tx.settle;
+            self.settled = tx.commit.lands();
             self.state_unchanged = !ran && !self.dirty && !ran_layout && !self.settle && self.commits > 0;
             #[cfg(debug_assertions)]
             if ran_other || besides || ran_layout || read_moved { self.live_check = None; }
             self.capture_keeps(&mut tx);
             let flag = |on: bool, bit: u16| if on { bit } else { 0 };
+            // Motion has a cause: the user, in this window. A commit nothing in this frame's
+            // input asked for shows what it brings in its final state (`Tx::unprompted`).
+            tx.unprompted = self.motion_needs_cause && why & CommitWhy::INPUT == 0 && !tx.asked_motion;
+            // Its layout lands too, as an instant change's does: a container that grows to fit what a
+            // server brought doesn't ease to its height (motion already running keeps on).
+            if tx.unprompted { tx.commit = tx.commit.without_input(); }
             self.commit_for(&tx, why | flag(self.dirty, CommitWhy::DIRTY) | flag(self.relayout, CommitWhy::RELAYOUT) | flag(self.settle, CommitWhy::SETTLE)
                 | flag(shifted, CommitWhy::VIRTUAL) | flag(ran_layout, CommitWhy::LAYOUT) | flag(read_moved, CommitWhy::READ));
             #[cfg(debug_assertions)]
@@ -578,47 +704,26 @@ impl<S: 'static> Runtime<S> {
         #[cfg(debug_assertions)]
         { self.live_check = None; }
         tx.keep_on_screen.clear();
-        let mut scroll_to = std::mem::take(&mut tx.scroll_to);
         for (path, v) in &mut self.virtuals {
             if let Some(key) = v.reveal_selected.take() && !pointer_hover {
                 // Use the keyed ancestor path so identical row keys in other lists do not
                 // intercept the reveal, including when this row is still virtual.
                 let scope = path.split('/').filter(|seg| !seg.starts_with('#')).collect::<Vec<_>>().join("/");
                 let key = if scope.is_empty() { key } else { format!("{scope}/{key}") };
-                scroll_to.push(ScrollReveal::into_view(None, key));
+                tx.scroll_to.push(ScrollReveal::into_view(None, key));
             }
         }
-        let mut scroll_bottom = std::mem::take(&mut tx.scroll_bottom);
-        let scroll_pages = std::mem::take(&mut tx.scroll_pages);
-        let mut scroll_offsets = std::mem::take(&mut tx.scroll_offsets);
-        if tx.instant {
-            for (_, animated) in &mut scroll_bottom { *animated = false; }
-            for r in &mut scroll_offsets { r.glide = None; }
-        }
         #[cfg(debug_assertions)]
-        self.watch_frame(commits0, scroll_offsets.iter().find(|r| r.glide.is_none()).map(|r| r.key.as_str()));
+        self.watch_frame(commits0, tx.scroll_offsets.iter().find(|r| tx.commit.snaps() || r.glide.is_none()).map(|r| r.key.as_str()));
         let follow = std::mem::take(&mut self.caret_follow);
-        let destination = !scroll_bottom.is_empty() || !scroll_pages.is_empty() || !scroll_offsets.is_empty();
-        if !scroll_to.is_empty() || destination || follow {
-            self.drop_scroll_holds();
-        }
-        for r in &scroll_to { self.reveal_row(r, tx.instant); }
-        if destination || follow {
-            self.step_scroll(0.0);
-        }
-        if follow { self.follow_caret(); }
-        if !scroll_bottom.is_empty() { self.scroll_to_bottom(scroll_bottom); }
-        if !scroll_pages.is_empty() { self.scroll_pages(scroll_pages); }
-        if !scroll_offsets.is_empty() { self.scroll_to_offsets(scroll_offsets); }
-        // Explicit destinations processed after a reveal win for its entire lifetime.
-        if destination { self.scroll_reveals.clear(); }
+        self.finish_scroll_requests(&mut tx, follow);
         // Those scrolls moved the caret after the commit a view placed from it saw.
-        if self.caret_watch && self.caret_moved(None) { self.commit(&Tx { instant: true, ..Tx::default() }); }
+        if self.caret_watch && self.caret_moved(None) { self.commit(&Tx { commit: Commit::Instant, ..Tx::default() }); }
         if let Some(request) = tx.select.take() {
             let from_change = std::mem::take(&mut tx.select_from_change);
             self.apply_select_request(request, from_change);
         }
-        if let Some((key, x, y)) = tx.place_caret.take() { self.place_caret(&key, x, y); }
+        if let Some((key, x, y)) = tx.place_caret.take() { self.place_caret_on(&key, x, y); }
         // What the commit or a `Tx::select_text` changed is heard next frame.
         let changes = self.selection_changes();
         self.queue.extend(changes);
@@ -627,14 +732,14 @@ impl<S: 'static> Runtime<S> {
         if let Some(publish) = tests::MID_FRAME.with(|hook| hook.borrow_mut().take()) { publish(); }
         // Poll and input can publish after the initial wake read without committing. Sample
         // those values now, but retain the wake: a picture may still need next frame's layout.
-        let live_animating = self.latch_live(live_woke || self.live_pending());
+        let live_pending = live_woke || self.live_pending();
+        let live_animating = self.latch_live(live_pending);
         if let Some(trace) = tx.trace.take() {
             for event in trace.events { self.trace_event(event); }
             for (name, kind, value) in trace.channels { self.trace_channel(name, kind, value); }
         }
-        self.fit_held = std::mem::take(&mut self.fit_hold);
-        let dt = if self.fit_held { 0.0 } else { dt };
-        let instant_scroll = tx.instant || self.settled;
+        let dt = if self.fit_frame_holds() { 0.0 } else { dt };
+        let instant_scroll = tx.commit.snaps() || self.settled;
         let animating = self.step_motion(dt, instant_scroll) || live_animating;
         self.stats.shaped = self.text.shaped - shaped0;
         let filling = self.virtual_filling();
@@ -652,9 +757,18 @@ impl<S: 'static> Runtime<S> {
     /// frame then runs at exactly that time, however long the host slept. A hidden window
     /// sleeps through it; showing it settles.
     fn wake_for_motion(&mut self, at: f64) {
-        if !self.surface_visible || self.time_scale <= 0.0 { return; }
+        self.paint_keep.cycles.other_deadline();
+        if !self.live.visible() || self.time_scale <= 0.0 { return; }
         let wake = self.clock + (at - self.t).max(0.0) / self.time_scale as f64;
         if self.loop_wake.is_none_or(|w| wake < w.0) { self.loop_wake = Some((wake, at)); }
+    }
+
+    /// Wakes for one frame at clock time `due` and draws nothing before it, as a delayed start
+    /// does: an instant scroll's hover hold asks for the frame it lets go on this way, so a
+    /// resting window draws no frame while the hold waits.
+    pub(super) fn wake_for_clock(&mut self, due: f64) {
+        let at = self.t + (due - self.clock).max(0.0) * self.time_scale as f64;
+        self.wake_for_motion(at);
     }
 
     pub(super) fn catch_up_motion(&mut self, dt: f64) {
@@ -663,7 +777,7 @@ impl<S: 'static> Runtime<S> {
         self.scene.set_time(self.t);
         self.caught_up += step as f32;
         self.step_growth(step as f32);
-        self.step_scroll(step as f32);
+        self.step_scroll_by(step as f32, true);
     }
 
     pub(super) fn step_motion(&mut self, dt: f64, instant_scroll: bool) -> bool {
@@ -692,6 +806,7 @@ impl<S: 'static> Runtime<S> {
         self.end_unseen_exits();
         let out = self.scene.frame();
         let (mut animating, exited) = (out.animating, !out.exited.is_empty());
+        self.paint_keep.frame += 1;
         // Tracks that only wait for a delayed start (`El::enter_delay`, a delayed `Anim`)
         // draw nothing new until it: sleep, and wake for it after the build.
         let mut waits = if animating { self.scene.store().waiting_until() } else { None };
@@ -717,12 +832,14 @@ impl<S: 'static> Runtime<S> {
         animating |= source(self.step_growth(step as f32), AnimSource::GROWTH);
         animating |= source(self.step_drag_autoscroll(step as f32), AnimSource::SCROLL);
         animating |= source(self.step_scroll(step as f32), AnimSource::SCROLL);
-        animating |= source(self.step_nudges(), AnimSource::SCROLL);
+        // A hold draws nothing while it waits: its wake asks for the one frame that ends it.
+        let hold_wake = self.step_nudges();
         for stack in self.stacks.values_mut() { stack.grown = 0.0; }
         animating |= source(self.reveals_active(), AnimSource::REVEAL);
         // Values set from `on_scroll_offset` show in the frame that scrolled.
         if self.tell_scroll_offsets(instant_scroll) {
-            let live = self.latch_live(self.take_live_wake());
+            let took = self.take_live_wake();
+            let live = self.latch_live(took);
             if live { sources |= AnimSource::LIVE; }
             let running = self.scene.store().running();
             waits = running.then(|| self.scene.store().waiting_until()).flatten();
@@ -730,6 +847,8 @@ impl<S: 'static> Runtime<S> {
             animating = sources != 0;
             self.scene.present();
         }
+        self.paint_keep.moved.extend(self.scene.changed().iter().map(|p| p.node));
+        if self.fill_text() { animating = true; sources |= AnimSource::TEXT_FILL; }
         let mut source = |on: bool, bit: u16| { if on { sources |= bit; } on };
         self.begin_exit_mask();
         animating |= self.build();
@@ -740,6 +859,8 @@ impl<S: 'static> Runtime<S> {
         }
         self.finish_keeps();
         animating |= self.write_drawn_rects();
+        // A selection's edge scroll stepped: it follows the pointer over this layout, and shows.
+        if self.laid_edge_scroll() { animating |= self.build(); }
         self.report_at_bottom();
         animating |= self.report_visible_rows();
         self.report_layout();
@@ -748,10 +869,17 @@ impl<S: 'static> Runtime<S> {
         self.end_exit_mask();
         self.record_rewind();
         animating |= source(self.loops_active, AnimSource::LOOP);
-        animating |= source(self.static_scale_settling || self.pixel_snap.easing(), AnimSource::SCALE_SETTLE);
+        animating |= source(self.scale_frame.is_some() || self.pixel_snap.easing(), AnimSource::SCALE_SETTLE);
         animating |= source(self.videos_active, AnimSource::VIDEO);
         animating |= source(self.draw_text_flights(), AnimSource::TEXT_FLIGHT);
+        animating |= source(self.text_fill_due(), AnimSource::TEXT_FILL);
+        if !animating && raster_check::on() {
+            self.check_resting_raster();
+        }
         if let Some(at) = waits { self.wake_for_motion(at); }
+        // An instant scroll's hold draws nothing until it ends: wake for the one frame that
+        // resolves hover then, taken from the state each frame so a re-arm moves it on.
+        if let Some(due) = hold_wake { self.wake_for_clock(due); }
         self.images.end_frame();
         if self.track_marks {
             self.marks.resize(self.instances.len(), 0);

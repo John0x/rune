@@ -15,9 +15,20 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 mod cloak;
 pub(crate) mod dark_mode;
+pub(crate) mod dcomp_handover;
+pub(crate) mod dib;
 mod dpi_drag;
+pub(crate) mod drop_target;
 mod frame;
+pub(crate) mod jump_list;
+pub(crate) mod occlusion;
+mod placement;
+pub(crate) mod press_point;
 mod pointer;
+#[cfg(not(feature = "segmenter-dictionaries"))]
+pub(crate) mod segmenter;
+pub(crate) mod session_lock;
+pub(crate) mod taskbar;
 
 pub(crate) use cloak::Cloak;
 pub(crate) use dpi_drag::follow_suggested_rect;
@@ -26,10 +37,144 @@ pub(crate) use frame::CustomFrame;
 pub(crate) use frame::has_window_menu;
 pub(crate) use frame::request_inner_size;
 pub(crate) use frame::window_menu;
+pub(crate) use placement::restore_frame;
 
 pub(crate) fn hwnd(window: &winit::window::Window) -> Option<HWND> {
     let RawWindowHandle::Win32(h) = window.window_handle().ok()?.as_raw() else { return None };
     Some(h.hwnd.get() as HWND)
+}
+
+/// When the display shows its next refresh after `now`, from DWM's timing (`now` plus a 60 Hz
+/// frame when DWM won't say).
+pub(crate) fn next_vblank(now: std::time::Instant) -> std::time::Instant {
+    use windows_sys::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
+    // The first ask comes from the window's first frame, as DWM shows the window: the query then
+    // waits on DWM for 2-2.5 ms, in front of the first input. A refresh from now does for that one.
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return now + std::time::Duration::from_micros(16_667);
+    }
+    use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    // SAFETY: plain out-parameters.
+    unsafe {
+        let mut t: DWM_TIMING_INFO = std::mem::zeroed();
+        t.cbSize = size_of::<DWM_TIMING_INFO>() as u32;
+        let (mut qpc, mut freq) = (0i64, 0i64);
+        if DwmGetCompositionTimingInfo(std::ptr::null_mut(), &mut t) < 0 || t.qpcRefreshPeriod == 0
+            || QueryPerformanceCounter(&mut qpc) == 0 || QueryPerformanceFrequency(&mut freq) == 0 || freq <= 0 {
+            return now + std::time::Duration::from_micros(16_667);
+        }
+        let (period, last) = (t.qpcRefreshPeriod as i64, t.qpcVBlank as i64);
+        let next = last + ((qpc - last) / period + 1) * period;
+        now + std::time::Duration::from_nanos(((next - qpc).max(0) as i128 * 1_000_000_000 / freq as i128) as u64)
+    }
+}
+
+/// Whether a screen reader is running (`SPI_GETSCREENREADER`).
+pub(crate) fn screen_reader() -> bool {
+    let mut on = 0i32;
+    // SAFETY: SPI_GETSCREENREADER writes one BOOL.
+    unsafe { SystemParametersInfoW(SPI_GETSCREENREADER, 0, (&raw mut on).cast(), 0) != 0 && on != 0 }
+}
+
+/// Whether the system asks `window` to paint part of itself again (an update region): it threw
+/// away what the window showed, as when a window covered whole comes back.
+pub(crate) fn repaint_owed(window: &winit::window::Window) -> bool {
+    use windows_sys::Win32::Graphics::Gdi::GetUpdateRect;
+    let Some(hwnd) = hwnd(window) else { return false };
+    // SAFETY: a live window this thread owns; no rectangle asked for.
+    unsafe { GetUpdateRect(hwnd, std::ptr::null_mut(), 0) != 0 }
+}
+
+/// Raises D3D12's "D3D Background Thread"s, once, from idle priority to below normal, on a thread of
+/// its own. D3D12 starts them at idle priority (base 1) for the driver's shader work, and a thread
+/// has to run to end: on a busy machine they sat Ready, never scheduled, after the process was
+/// ended (a kill, the uninstaller closing running copies), keeping it alive for seconds, once
+/// 106 s. Called once a first GPU frame is done; a second pass 2 s later takes any D3D12 started
+/// since. Returns how many it raised.
+pub(crate) fn unidle_d3d_threads_soon() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| { let _ = std::thread::Builder::new().name("rune-unidle".into()).spawn(|| { unidle_d3d_threads(); std::thread::sleep(std::time::Duration::from_secs(2)); unidle_d3d_threads(); }); });
+}
+
+/// This process's threads by name and priority, counted (`name (priority) xN`, unnamed ones as
+/// `?`), for saying what a quit waits on.
+pub(crate) fn threads_summary() -> String {
+    let mut seen: Vec<(String, i32, usize)> = Vec::new();
+    for_each_own_thread(|thread| {
+        let name = thread_name(thread).filter(|n| !n.is_empty()).unwrap_or_else(|| "?".into());
+        // SAFETY: a thread handle `for_each_own_thread` opened for querying.
+        let priority = unsafe { windows_sys::Win32::System::Threading::GetThreadPriority(thread) };
+        match seen.iter_mut().find(|(n, p, _)| *n == name && *p == priority) {
+            Some(s) => s.2 += 1,
+            None => seen.push((name, priority, 1)),
+        }
+    });
+    seen.iter().map(|(n, p, c)| if *c > 1 { format!("{n} ({p}) x{c}") } else { format!("{n} ({p})") }).collect::<Vec<_>>().join(", ")
+}
+
+/// Raises this process's threads whose name passes `named` and whose priority is under `floor` to
+/// `floor` (a `THREAD_PRIORITY_*`); returns how many. Walks only this process's threads.
+pub fn raise_threads(named: impl Fn(&str) -> bool, floor: i32) -> usize {
+    use windows_sys::Win32::System::Threading::{GetThreadPriority, SetThreadPriority};
+    let mut raised = 0;
+    for_each_own_thread(|thread| {
+        // SAFETY: a thread handle `for_each_own_thread` opened for querying and setting.
+        unsafe {
+            if GetThreadPriority(thread) < floor && thread_name(thread).is_some_and(|n| named(&n)) && SetThreadPriority(thread, floor) != 0 {
+                raised += 1;
+            }
+        }
+    });
+    raised
+}
+
+fn unidle_d3d_threads() -> usize {
+    raise_threads(|name| name.starts_with("D3D Background Thread"), windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL)
+}
+
+/// Calls `f` with a handle to each of this process's threads, open for querying and setting its
+/// priority, walking this process's own thread list (`NtGetNextThread`). A Toolhelp snapshot lists
+/// every thread on the machine: 67-75 ms a walk on a busy one, twice per launch.
+fn for_each_own_thread(mut f: impl FnMut(windows_sys::Win32::Foundation::HANDLE)) {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SET_INFORMATION};
+    type NextThread = unsafe extern "system" fn(HANDLE, HANDLE, u32, u32, u32, *mut HANDLE) -> i32;
+    static NEXT: std::sync::OnceLock<Option<NextThread>> = std::sync::OnceLock::new();
+    // SAFETY: ntdll is loaded in every process; NtGetNextThread has this signature since Vista.
+    let next = *NEXT.get_or_init(|| unsafe {
+        let ntdll = GetModuleHandleW("ntdll.dll\0".encode_utf16().collect::<Vec<_>>().as_ptr());
+        if ntdll.is_null() { return None; }
+        GetProcAddress(ntdll, c"NtGetNextThread".as_ptr().cast()).map(|p| std::mem::transmute::<_, NextThread>(p))
+    });
+    let Some(next) = next else { return };
+    let mut prev: HANDLE = std::ptr::null_mut();
+    loop {
+        let mut thread: HANDLE = std::ptr::null_mut();
+        // SAFETY: this process's pseudo-handle and the last thread handle it returned (or none);
+        // each handle it returns is closed once the next is taken.
+        let status = unsafe { next(GetCurrentProcess(), prev, THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_INFORMATION, 0, 0, &mut thread) };
+        if !prev.is_null() { unsafe { CloseHandle(prev) }; }
+        if status < 0 || thread.is_null() { return; }
+        f(thread);
+        prev = thread;
+    }
+}
+
+/// A thread's description (`SetThreadDescription`), if it has one.
+fn thread_name(thread: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::System::Threading::GetThreadDescription;
+    let mut desc = std::ptr::null_mut();
+    // SAFETY: a live thread handle; the description is read to its NUL and freed with LocalFree.
+    unsafe {
+        if GetThreadDescription(thread, &mut desc) < 0 || desc.is_null() { return None; }
+        let len = (0..).take_while(|&i| *desc.add(i) != 0).count();
+        let name = String::from_utf16_lossy(std::slice::from_raw_parts(desc, len));
+        LocalFree(desc.cast());
+        Some(name)
+    }
 }
 
 /// Drops the paint the system still owes `window`, which the loop just painted itself.
@@ -276,4 +421,40 @@ pub(crate) fn work_area(monitor: &winit::monitor::MonitorHandle) -> Option<(i32,
     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     // SAFETY: GetMonitorInfoW fills `info`, whose cbSize says which struct it is.
     (unsafe { GetMonitorInfoW(monitor.hmonitor() as _, &mut info) } != 0).then_some((info.rcWork.top, info.rcWork.bottom))
+}
+
+/// Destroys this thread's windows at once, for a fast exit: each gets the default window procedure
+/// first, so neither winit's nor a subclass runs while the process is ending.
+pub(crate) fn destroy_own_windows() {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::EnumThreadWindows;
+    unsafe extern "system" fn add(hwnd: HWND, list: LPARAM) -> BOOL {
+        // SAFETY: `list` is the Vec `destroy_own_windows` passes, alive for the enumeration.
+        unsafe { (*(list as *mut Vec<HWND>)).push(hwnd) };
+        TRUE
+    }
+    let mut windows: Vec<HWND> = Vec::new();
+    // SAFETY: this thread's own top-level windows; each is destroyed by the thread that made it.
+    unsafe {
+        EnumThreadWindows(GetCurrentThreadId(), Some(add), (&raw mut windows) as LPARAM);
+    }
+    for hwnd in windows { destroy(hwnd); }
+}
+
+/// Destroys `window` at once, for the last window of an app that ends fast (`Host::close`):
+/// what's left of the quit runs without it.
+pub(crate) fn destroy_window_now(window: &winit::window::Window) {
+    if let Some(hwnd) = hwnd(window) { destroy(hwnd); }
+}
+
+/// Destroys `hwnd` with the default window procedure in place, so neither winit's nor a subclass
+/// runs while the process is ending.
+fn destroy(hwnd: windows_sys::Win32::Foundation::HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, DestroyWindow, GWLP_WNDPROC, SetWindowLongPtrW};
+    // SAFETY: a window of this thread's; nothing of this process's uses it after.
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, DefWindowProcW as usize as isize);
+        DestroyWindow(hwnd);
+    }
 }

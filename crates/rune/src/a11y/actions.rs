@@ -46,17 +46,17 @@ impl<S: 'static> Runtime<S> {
         let (expanded, steps, scrolls) = (n.a11y.expanded, n.focus.step.is_some(), n.scroll.is_some());
         let focusable = self.can_focus(i);
         let action = match (request.action, link) {
-            (Ak::Click, Some(k)) => Action::Link(path, k),
+            (Ak::Click, Some(k)) => Action::Link(path, k, crate::PointerButton::Primary),
             (Ak::ShowContextMenu, Some(k)) => {
                 let Some((_, r)) = self.link_boxes(i, self.drawn_box(i)).into_iter().find(|(j, _)| *j == k) else { return false };
                 Action::LinkSecondary(path, k, self.pointer_event(i, r[0], r[3]))
             }
             (Ak::Focus, Some(k)) if focusable => Action::A11y(path, A11yAct::Focus(Some(k))),
-            (Ak::Click, None) if pressable => Action::Press(path, crate::PointerButton::Primary),
+            (Ak::Click, None) if pressable => Action::Press(path, crate::PointerButton::Primary, false),
             (Ak::Click, None) if input => Action::A11y(path, A11yAct::Focus(None)),
             (Ak::Focus, None) if focusable => Action::A11y(path, A11yAct::Focus(None)),
             (Ak::Expand | Ak::Collapse, None) if pressable && expanded == Some(request.action == Ak::Collapse) => {
-                Action::Press(path, crate::PointerButton::Primary)
+                Action::Press(path, crate::PointerButton::Primary, false)
             }
             (Ak::ShowContextMenu, None) if secondary => {
                 let r = self.drawn_box(i);
@@ -85,7 +85,14 @@ impl<S: 'static> Runtime<S> {
             },
             (Ak::SetTextSelection, None) if editable => {
                 let Some(ActionData::SetTextSelection(sel)) = &request.data else { return false };
-                let lines = self.a11y_lines(i).unwrap_or_default();
+                // A field past its runs: bytes of its value, on the field itself (`a11y_text_nodes`).
+                if let Some(input) = n.input.as_deref() && split_id(sel.anchor.node) == (id, 0) && split_id(sel.focus.node) == (id, 0) {
+                    let at = |b: usize| input.edit.display_index(input.edit.text.floor_char_boundary(b.min(input.edit.text.len())));
+                    let (a, b) = (at(sel.anchor.character_index), at(sel.focus.character_index));
+                    self.queue.push(Action::A11y(path, A11yAct::Select(a, b)));
+                    return true;
+                }
+                let Some((_, lines)) = self.a11y_lines(i) else { return false };
                 let byte = |p: accesskit::TextPosition| {
                     let (pid, line) = split_id(p.node);
                     if pid != id || line == 0 { return None; }

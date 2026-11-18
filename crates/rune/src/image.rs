@@ -93,6 +93,8 @@ enum Input {
     /// A decoder that panics, standing in for a codec bug.
     #[cfg(test)]
     Panic,
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    Gated(Box<Input>, mpsc::Receiver<()>),
 }
 
 impl Input {
@@ -121,6 +123,11 @@ impl Input {
             Input::Url(url, _) => Err(ImageError(format!("{url}: fetched, not decoded"))),
             #[cfg(test)]
             Input::Panic => panic!("decoder bug"),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            Input::Gated(input, release) => {
+                release.recv().map_err(|_| ImageError("test gate dropped".into()))?;
+                input.decode()
+            }
         }
     }
 
@@ -134,18 +141,55 @@ impl Input {
         })
     }
 }
-struct Job { image: Image, input: Input }
-/// Decoder threads per cache, at most one per core.
+#[cfg(not(target_arch = "wasm32"))]
+struct Job { image: Image, input: Input, waker: crate::Waker }
+/// Decoder threads for the process, at most one per core.
 #[cfg(not(target_arch = "wasm32"))]
 const DECODERS: usize = 4;
+/// Straight RGBA images up to this many pixels (64 x 64) finish on the calling thread.
+#[cfg(not(target_arch = "wasm32"))]
+const INLINE_RGBA_PIXELS: u64 = 64 * 64;
+
+/// The process's decoder threads, shared by every cache and started by the first image to
+/// decode: an app that makes a cache per feature, or shows no image, pays no thread for it.
+/// The caller starts one; that one starts the others, so the first image (often in a window's
+/// first frame) costs its thread one spawn, not four.
+#[cfg(not(target_arch = "wasm32"))]
+fn decoders() -> &'static mpsc::Sender<Job> {
+    static JOBS: OnceLock<mpsc::Sender<Job>> = OnceLock::new();
+    JOBS.get_or_init(|| {
+        let (jobs, receive) = mpsc::channel::<Job>();
+        // A session opening on several screenshots decodes them side by side, not one by one.
+        let receive = Arc::new(Mutex::new(receive));
+        let count = DECODERS.min(std::thread::available_parallelism().map_or(1, |n| n.get()));
+        let first = receive.clone();
+        std::thread::Builder::new().name("rune-images".into()).spawn(move || {
+            for _ in 1..count {
+                let receive = receive.clone();
+                let _ = std::thread::Builder::new().name("rune-images".into()).spawn(move || decode_jobs(&receive));
+            }
+            decode_jobs(&first);
+        }).expect("image worker");
+        jobs
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn decode_jobs(receive: &Mutex<mpsc::Receiver<Job>>) {
+    loop {
+        let Ok(job) = receive.lock().unwrap_or_else(|e| e.into_inner()).recv() else { return };
+        job.image.finish(job.input.decode_caught());
+        (job.waker)();
+    }
+}
 
 /// Construct once during app setup. The cache deduplicates by content, not a path or pointer;
-/// dropping all handles releases decoded pixels. Dropping the cache stops its worker after
-/// queued requests complete. The waker should be the one supplied by `AppSpec::setup`.
+/// dropping all handles releases decoded pixels. Its images decode on the process's decoder
+/// threads, which every cache shares. The waker should be the one supplied by `AppSpec::setup`.
 pub struct ImageCache {
     entries: Mutex<HashMap<ImageId, Weak<State>>>,
     #[cfg(not(target_arch = "wasm32"))]
-    jobs: mpsc::Sender<Job>,
+    waker: crate::Waker,
     #[cfg(target_arch = "wasm32")]
     wake: crate::Waker,
 }
@@ -156,20 +200,7 @@ impl ImageCache {
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(waker: crate::Waker) -> Self {
-        let (jobs, receive) = mpsc::channel::<Job>();
-        // A session opening on several screenshots decodes them side by side, not one by one.
-        let receive = Arc::new(Mutex::new(receive));
-        for _ in 0..DECODERS.min(std::thread::available_parallelism().map_or(1, |n| n.get())) {
-            let (receive, waker) = (receive.clone(), waker.clone());
-            std::thread::Builder::new().name("rune-images".into()).spawn(move || {
-                loop {
-                    let Ok(job) = receive.lock().unwrap_or_else(|e| e.into_inner()).recv() else { return };
-                    job.image.finish(job.input.decode_caught());
-                    waker();
-                }
-            }).expect("image worker");
-        }
-        Self { entries: Mutex::new(HashMap::new()), jobs }
+        Self { entries: Mutex::new(HashMap::new()), waker }
     }
 
     /// PNG (APNG animates), JPEG, GIF and WebP (both animate), BMP, ICO, AVIF (with the `avif`
@@ -283,8 +314,20 @@ impl ImageCache {
         };
         let image = Image::new(Arc::new(State { id, pixels: crate::Pixels::from_url(url, srcset), decoded: OnceLock::new() }));
         entries.insert(id, Arc::downgrade(&image.0));
+        // A small straight RGBA image (a 16 pt tile at 2x) is ready at once: its mips take
+        // microseconds, less than handing it to a decoder, and the view that asked for it draws it
+        // in the same frame rather than a placeholder first. It still wakes the app once, as a
+        // decoded one does: a caller outside a view's build (an overlay's state, a poll) is
+        // redrawn by that wake alone.
         #[cfg(not(target_arch = "wasm32"))]
-        if self.jobs.send(Job { image: image.clone(), input }).is_err() {
+        if let Input::Rgba(w, h, _) = &input && u64::from(*w) * u64::from(*h) <= INLINE_RGBA_PIXELS {
+            image.finish(input.decode_caught());
+            drop(entries);
+            (self.waker)();
+            return image;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if decoders().send(Job { image: image.clone(), input, waker: self.waker.clone() }).is_err() {
             let _ = image.0.decoded.set(Err(ImageError("image worker stopped".into())));
         }
         #[cfg(target_arch = "wasm32")]
@@ -445,27 +488,96 @@ fn linux_icon(path: &std::path::Path, px: u32) -> Result<(u32, u32, Vec<u8>), Im
     Ok((image.width(), image.height(), image.into_raw()))
 }
 
+/// Options for `usvg` that resolve nothing outside the SVG's own bytes: non-`data:` `<image>` and
+/// `<feImage>` `href`s never touch the filesystem or UNC paths, and `data:` URLs accept raster
+/// formats only (`image/svg+xml` and `text/plain` SVG fall-through are refused).
+///
+/// Rune builds `resvg` with `raster-images` off, so those raster arms are resolved in the tree but
+/// never drawn today; they—and raster decoder pixel/memory bounds—become live if `raster-images` is
+/// ever enabled (for example via feature unification).
+#[cfg(feature = "svg")]
+fn svg_options() -> resvg::usvg::Options<'static> {
+    use resvg::usvg::{ImageHrefResolver, ImageKind, Options};
+    let raster = |data: Arc<Vec<u8>>| {
+        if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some(ImageKind::PNG(data))
+        } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
+            Some(ImageKind::JPEG(data))
+        } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+            Some(ImageKind::GIF(data))
+        } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+            Some(ImageKind::WEBP(data))
+        } else {
+            None
+        }
+    };
+    Options {
+        image_href_resolver: ImageHrefResolver {
+            resolve_string: Box::new(|_, _| None),
+            resolve_data: Box::new(move |mime, data, _| match mime {
+                "image/png" => Some(ImageKind::PNG(data)),
+                "image/jpg" | "image/jpeg" => Some(ImageKind::JPEG(data)),
+                "image/gif" => Some(ImageKind::GIF(data)),
+                "image/webp" => Some(ImageKind::WEBP(data)),
+                "text/plain" => raster(data),
+                _ => None,
+            }),
+        },
+        ..Options::default()
+    }
+}
+
+#[cfg(feature = "svg")]
+fn svg_tree(bytes: &[u8]) -> Result<resvg::usvg::Tree, ImageError> {
+    if bytes.len() > 32 << 20 { return Err(ImageError("SVG is too large".into())); }
+    resvg::usvg::Tree::from_data(bytes, &svg_options()).map_err(|e| ImageError(format!("SVG: {e}")))
+}
+
+#[cfg(feature = "svg")]
+fn demultiply_rgba(pixmap: &resvg::tiny_skia::Pixmap) -> Vec<u8> {
+    pixmap.pixels().iter().flat_map(|p| {
+        let c = p.demultiply();
+        [c.red(), c.green(), c.blue(), c.alpha()]
+    }).collect()
+}
+
 /// An SVG scaled to fit `px` square, keeping its aspect ratio, as straight-alpha sRGB RGBA8.
 /// `px == 0` rasterizes at twice the drawing's own size, at most 4096 pixels per side.
 #[cfg(feature = "svg")]
 pub(crate) fn svg_rgba(bytes: &[u8], px: u32) -> Result<(u32, u32, Vec<u8>), ImageError> {
-    use resvg::{tiny_skia, usvg};
-    if bytes.len() > 32 << 20 { return Err(ImageError("SVG is too large".into())); }
-    let tree = usvg::Tree::from_data(bytes, &usvg::Options::default()).map_err(|e| ImageError(format!("SVG: {e}")))?;
+    use resvg::tiny_skia;
+    let tree = svg_tree(bytes)?;
     let size = tree.size();
     let px = if px == 0 { (size.width().max(size.height()) * 2.0).ceil().clamp(1.0, 4096.0) as u32 } else { px };
     let k = px as f32 / size.width().max(size.height());
     let (w, h) = (((size.width() * k).round() as u32).clamp(1, px), ((size.height() * k).round() as u32).clamp(1, px));
     let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or_else(|| ImageError("empty SVG".into()))?;
     resvg::render(&tree, tiny_skia::Transform::from_scale(k, k), &mut pixmap.as_mut());
-    Ok((w, h, pixmap.pixels().iter().flat_map(|p| {
-        let c = p.demultiply();
-        [c.red(), c.green(), c.blue(), c.alpha()]
-    }).collect()))
+    Ok((w, h, demultiply_rgba(&pixmap)))
 }
 
 #[cfg(not(feature = "svg"))]
 pub(crate) fn svg_rgba(_: &[u8], _: u32) -> Result<(u32, u32, Vec<u8>), ImageError> {
+    Err(ImageError("SVG images need rune's `svg` feature".into()))
+}
+
+/// An SVG centre-cropped to fill `px` square (`object-fit: cover`), as straight-alpha sRGB RGBA8,
+/// decoded through the same sandboxed `usvg` options as [`ImageCache`].
+#[cfg(feature = "svg")]
+pub fn svg_rgba_cover(bytes: &[u8], px: u32) -> Result<Vec<u8>, ImageError> {
+    use resvg::tiny_skia;
+    if px == 0 || px > 4096 { return Err(ImageError("invalid SVG raster size".into())); }
+    let tree = svg_tree(bytes)?;
+    let size = tree.size();
+    let k = px as f32 / size.width().min(size.height());
+    let t = tiny_skia::Transform::from_row(k, 0.0, 0.0, k, (px as f32 - size.width() * k) / 2.0, (px as f32 - size.height() * k) / 2.0);
+    let mut pixmap = tiny_skia::Pixmap::new(px, px).ok_or_else(|| ImageError("empty SVG".into()))?;
+    resvg::render(&tree, t, &mut pixmap.as_mut());
+    Ok(demultiply_rgba(&pixmap))
+}
+
+#[cfg(not(feature = "svg"))]
+pub fn svg_rgba_cover(_: &[u8], _: u32) -> Result<Vec<u8>, ImageError> {
     Err(ImageError("SVG images need rune's `svg` feature".into()))
 }
 
@@ -648,6 +760,15 @@ fn decode(bytes: &[u8]) -> Result<Decoded, ImageError> {
     mip_chain(image.width(), image.height(), image.as_raw())
 }
 
+/// A PNG decoded to 8-bit RGBA by the PNG decoder alone. `image::load_from_memory_with_format`
+/// dispatches on the format at run time, which links every codec the crate is built with (JPEG,
+/// WebP, GIF, BMP, ICO) into an app that only ever reads PNGs from the clipboard or a cursor.
+/// The same decoder and limits as that call's PNG arm.
+pub(crate) fn png_rgba8(bytes: &[u8]) -> image::ImageResult<image::RgbaImage> {
+    let decoder = image::codecs::png::PngDecoder::with_limits(std::io::Cursor::new(bytes), image::Limits::default())?;
+    Ok(image::DynamicImage::from_decoder(decoder)?.into_rgba8())
+}
+
 fn icns_png(bytes: &[u8]) -> Result<&[u8], ImageError> {
     let invalid = || ImageError("invalid ICNS container or no supported PNG representation".into());
     let len = u32::from_be_bytes(bytes.get(4..8).ok_or_else(invalid)?.try_into().unwrap()) as usize;
@@ -676,6 +797,7 @@ pub(crate) mod animated;
 mod avif;
 mod from_url;
 mod mips;
+pub(crate) mod pixels;
 use mips::mip_chain;
 #[cfg(test)]
 use mips::byte;
@@ -716,29 +838,41 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), [(true, Some([2, 1]))]);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn a_small_image_queued_behind_a_large_one_decodes_without_waiting_for_it() {
         if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 { return; }
         let (tx, rx) = mpsc::channel();
-        let cache = ImageCache::new(Arc::new(move || { let _ = tx.send(()); }));
-        let large = cache.rgba(3000, 3000, vec![128; 3000 * 3000 * 4]);
-        let small = cache.rgba(1, 1, vec![20, 40, 60, 255]);
-        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert!(small.is_ready() && !large.is_ready());
-        rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
-        assert!(large.is_ready());
+        let caller = std::thread::current().id();
+        let cache = ImageCache::new(Arc::new(move || { let _ = tx.send(std::thread::current().id()); }));
+        let (release, gate) = mpsc::channel();
+        let input = Input::Rgba(128, 128, vec![128; 128 * 128 * 4].into());
+        let large = cache.request([8; 32], Input::Gated(Box::new(input), gate));
+        let inline = cache.rgba(64, 64, vec![255; 64 * 64 * 4]);
+        assert_eq!(inline.size(), Some([64, 64]));
+        assert_eq!(rx.try_recv(), Ok(caller));
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+        // Just over the inline limit: a second worker must finish this one.
+        let small = cache.rgba(65, 64, vec![255; 65 * 64 * 4]);
+        assert_ne!(rx.recv_timeout(std::time::Duration::from_secs(120)).unwrap(), caller);
+        assert_eq!(small.size(), Some([65, 64]));
+        assert!(!large.is_ready());
+        release.send(()).unwrap();
+        rx.recv_timeout(std::time::Duration::from_secs(120)).unwrap();
+        assert_eq!(large.size(), Some([128, 128]));
     }
 
     #[test]
     fn cache_deduplicates_and_wakes_after_async_completion() {
         let (tx, rx) = mpsc::channel();
         let cache = ImageCache::new(Arc::new(move || { tx.send(()).unwrap(); }));
-        let first = cache.rgba(1, 1, vec![20, 40, 60, 255]);
-        let second = cache.rgba(1, 1, vec![20, 40, 60, 255]);
+        let queued = || cache.rgba(65, 64, [20, 40, 60, 255].repeat(65 * 64));
+        let first = queued();
+        let second = queued();
         assert!(Arc::ptr_eq(&first.0, &second.0));
         rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert_eq!(first.size(), Some([1, 1]));
-        assert_eq!(first.decoded().unwrap().unwrap().mips[0].pixels, [20, 40, 60, 255]);
+        assert_eq!(first.size(), Some([65, 64]));
+        assert_eq!(first.decoded().unwrap().unwrap().mips[0].pixels, [20, 40, 60, 255].repeat(65 * 64));
         let invalid = cache.load(vec![0, 1, 2]);
         rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(invalid.error().is_some());
@@ -755,12 +889,15 @@ mod tests {
         assert!(!wanted(&weak), "a guess replaced before its fetch runs fetches nothing");
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn drawn_pixels_keep_their_image_cached_after_the_handle_drops() {
         let (tx, rx) = mpsc::channel();
-        let cache = ImageCache::new(Arc::new(move || { tx.send(()).unwrap(); }));
+        let cache = ImageCache::new(Arc::new(move || { let _ = tx.send(()); }));
         let image = cache.rgba(1, 1, vec![20, 40, 60, 255]);
-        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(image.size(), Some([1, 1]));
+        assert_eq!(rx.try_recv(), Ok(()), "a fresh inline decode wakes before returning");
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
         // A view keeps only the pixels in its element, then asks again on the next build.
         let drawn = image.pixels().clone();
         let first = Arc::downgrade(&image.0);
@@ -768,12 +905,8 @@ mod tests {
         let again = cache.rgba(1, 1, vec![20, 40, 60, 255]);
         assert!(std::ptr::eq(first.as_ptr(), Arc::as_ptr(&again.0)), "the same entry, not a new request");
         assert!(again.is_ready());
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty), "a cache hit does not wake");
         drop((again, drawn));
-        // The worker drops its own handle just after it wakes us.
-        for _ in 0..200 {
-            if first.upgrade().is_none() { break }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
         assert!(first.upgrade().is_none(), "nothing left draws it, so it's released");
     }
 
@@ -843,9 +976,9 @@ mod tests {
         let broken = cache.request([7; 32], Input::Panic);
         rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(broken.error(), Some(&ImageError("image decoder panicked: decoder bug".into())));
-        let next = cache.rgba(1, 1, vec![20, 40, 60, 255]);
+        let next = cache.rgba(65, 64, vec![255; 65 * 64 * 4]);
         rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert_eq!(next.size(), Some([1, 1]), "later images still load");
+        assert_eq!(next.size(), Some([65, 64]), "later queued images still load");
     }
 
     #[cfg(feature = "svg")]

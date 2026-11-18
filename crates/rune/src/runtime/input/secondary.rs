@@ -26,15 +26,18 @@ impl<S: 'static> Runtime<S> {
     /// Capture a secondary gesture without activating primary actions or text selection.
     pub fn secondary_down(&mut self, x: f32, y: f32) {
         self.pointer = Some((x, y));
+        if self.autoscroll_press(crate::PointerButton::Secondary) { return; }
+        self.tint_down(x, y, crate::PointerButton::Secondary);
         self.release_hover_hold();
         self.focus.step(focus_machine::FocusEvent::Pointed);
         self.dismiss_help();
-        self.secondary = match self.secondary_target(x, y) {
-            Some(path) => capture::Secondary::Held { path: path.to_owned(), left: false },
+        let path = self.secondary_target(x, y).map(str::to_owned);
+        let i = path.as_ref().and_then(|p| self.nodes.iter().position(|n| n.path == *p));
+        self.secondary = match path {
+            Some(path) => capture::Secondary::Held { path, link: i.and_then(|i| self.secondary_link_at(i, x, y)), left: false },
             None => capture::Secondary::Up,
         };
         self.secondary_region_down(x, y, self.secondary.is_held());
-        let i = self.secondary.path().and_then(|p| self.nodes.iter().position(|n| n.path == p));
         // Under `Cx::web_focus` a right-click focuses the control it's on, as Chromium's
         // mousedown does, so focus is back on it when its menu closes.
         if self.defaults.web_focus
@@ -43,16 +46,57 @@ impl<S: 'static> Runtime<S> {
         {
             self.queue.push(Action::FocusControl(self.nodes[c].path.clone()));
         }
-        self.secondary_link_down(i, x, y);
+    }
+
+    /// A middle or secondary press at (x, y), with no primary press held: what a primary press
+    /// there would take shows pressed until the button comes up (`capture::Tint`).
+    pub(super) fn tint_down(&mut self, x: f32, y: f32, button: crate::PointerButton) {
+        if self.press.held().is_some_and(|h| h.button == crate::PointerButton::Primary) { return; }
+        let path = self.primary_target(x, y).filter(|&i| self.allowed(i) && !self.subtree_exiting(i)).map(|i| self.nodes[i].path.clone());
+        self.tint = path.map_or(capture::Tint::Up, |path| capture::Tint::Held { path, button });
+    }
+
+    /// What the secondary press being held is on, for a browser that shows its own context
+    /// menu: `"app"` when an element's menu or a link's takes it (Rune draws that), `"field"` on
+    /// a text field, `"text"` on selectable text alone, `""` on nothing of Rune's.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn secondary_claim(&self) -> &'static str {
+        let capture::Secondary::Held { path, link, .. } = &self.secondary else { return "" };
+        let Some(n) = self.nodes.iter().find(|n| n.path == *path) else { return "" };
+        if link.is_some() || n.handlers.on_secondary_press.is_some() { return "app"; }
+        // On a misspelled word, Rune's own field menu: it has the suggestions, the browser's
+        // can't (its checker never sees the field).
+        if n.input.as_ref().is_some_and(|i| i.access.is_some()) { return if self.on_misspelled_word(path) { "app" } else { "field" }; }
+        "text"
+    }
+
+    /// The pointer is over a word field `path`'s spell checker marks.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn on_misspelled_word(&self, path: &str) -> bool {
+        let Some(i) = self.live(path) else { return false };
+        let n = &self.nodes[i];
+        let (Some(input), Some((x, y)), Some(layout)) = (n.input.as_deref(), self.pointer, n.text_layout.as_ref()) else { return false };
+        if !input.spellcheck || input.edit.is_secure() { return false; }
+        let [lx, ly] = self.to_local(i, x, y);
+        let scroll = self.input_scroll.get(path).copied().unwrap_or(0.0);
+        let caret = super::input_click::hit(&input.edit, layout.view(), lx - n.inset[0] + scroll, ly - n.inset[1], self.env.scale, input.single_line).caret;
+        crate::spell::misspelled_at(&input.edit.text, caret).is_some()
+    }
+
+    /// The secondary press went to the browser's own menu: its release opens none of Rune's.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub(crate) fn secondary_abandon(&mut self) {
+        self.secondary = capture::Secondary::Up;
     }
 
     pub fn secondary_up(&mut self, x: f32, y: f32) {
         self.pointer = Some((x, y));
-        let down_link = self.take_secondary_link();
+        self.tint.release(crate::PointerButton::Secondary);
+        if self.autoscroll_release(crate::PointerButton::Secondary) { return; }
         self.secondary_region_up(x, y);
-        let (path, left) = match std::mem::take(&mut self.secondary) {
-            capture::Secondary::Held { path, left } => (Some(path), left),
-            capture::Secondary::Up => (None, false),
+        let (path, down_link, left) = match std::mem::take(&mut self.secondary) {
+            capture::Secondary::Held { path, link, left } => (Some(path), link, left),
+            capture::Secondary::Up => (None, None, false),
         };
         if let Some(path) = path
             && self.secondary_target(x, y) == Some(path.as_str())

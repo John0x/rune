@@ -22,7 +22,7 @@ fn pills_record_sorted_chips_and_skip_bad_ranges() {
         (0..body.len() + 1, PillStyle::new()),
     ]);
     let t = e.text.as_ref().unwrap();
-    let got: Vec<(u32, u32, Option<Color>, Option<Color>)> = t.pills.iter().map(|p| (p.start, p.end, p.bg, p.fg)).collect();
+    let got: Vec<(u32, u32, Option<Color>, Option<Color>)> = t.cold.pills.iter().map(|p| (p.start, p.end, p.bg, p.fg)).collect();
     assert_eq!(got, [(agent.start as u32, agent.end as u32, None, Some(INK)), (file.start as u32, file.end as u32, Some(CHIP), None)]);
 }
 
@@ -39,7 +39,7 @@ fn a_pill_colours_its_label_and_keeps_it_through_later_spans() {
 #[test]
 fn a_field_ignores_static_pills() {
     let e = text_input(&TextEdit::new("ask @reviewer"), TextStyle::new(14.0, 400.0)).pill(4..13, PillStyle::new().fg(INK));
-    assert!(e.text.as_ref().unwrap().pills.is_empty());
+    assert!(e.text.as_ref().unwrap().cold.pills.is_empty());
 }
 
 #[test]
@@ -97,7 +97,7 @@ mod live {
     /// Each line's byte range in the text's layout.
     fn lines(rt: &Runtime<S>) -> Vec<Range<usize>> {
         let n = rt.nodes.iter().find(|n| n.key.as_deref() == Some("t")).unwrap();
-        n.text_layout.as_ref().unwrap().lines().map(|l| l.text_range()).collect()
+        n.text_layout.as_ref().and_then(crate::text::TextLayout::single).unwrap().lines().map(|l| l.text_range()).collect()
     }
 
     fn drag(rt: &mut Runtime<S>, from: (f32, f32), to: (f32, f32)) {
@@ -132,7 +132,12 @@ mod live {
         let rt = runtime(body, &pills, 260.0);
         let ls = lines(&rt);
         assert!(ls.len() >= 2, "narrow enough to wrap: {ls:?}");
-        for p in &pills {
+        let n = rt.nodes.iter().find(|n| n.key.as_deref() == Some("t")).unwrap();
+        let t = n.text.as_ref().unwrap();
+        for (authored, chip) in pills.iter().zip(&t.cold.pills) {
+            // Layout ranges include each pill's bidi isolate marks.
+            let p = chip.start as usize..chip.end as usize;
+            assert_eq!(&t.content[p.clone()], &body[authored.clone()]);
             assert!(!ls.iter().any(|l| l.start > p.start && l.start < p.end), "{p:?} splits across {ls:?}");
         }
     }
@@ -142,13 +147,14 @@ mod live {
         let mut rt = runtime("ask @reviewer", &[4..13], 400.0);
         let pilled = |rt: &Runtime<S>| {
             let n = rt.nodes.iter().find(|n| n.key.as_deref() == Some("t")).unwrap();
-            n.text.as_ref().unwrap().pills.iter().map(|p| p.start..p.end).collect::<Vec<_>>()
+            let t = n.text.as_ref().unwrap();
+            t.cold.pills.iter().map(|p| (p.start..p.end, t.content[p.start as usize..p.end as usize].to_owned())).collect::<Vec<_>>()
         };
         let mut w = rect(&rt)[2];
         for more in [" to", " look at", " the é diff"] {
             rt.update(|s, _| s.body.push_str(more));
             rt.frame(1.0 / 60.0);
-            assert_eq!(pilled(&rt), [4..13 as u32], "after {more:?}");
+            assert_eq!(pilled(&rt), [(7..16, "@reviewer".into())], "after {more:?}");
             assert!(rect(&rt)[2] >= w);
             w = rect(&rt)[2];
         }
@@ -156,7 +162,7 @@ mod live {
         let e = rt.state.body.find('é').unwrap();
         rt.update(|s, _| s.pills = vec![4..13, e + 1..e + 2, 30..400, 20..20]);
         rt.frame(2.0 / 60.0);
-        assert_eq!(pilled(&rt), [4..13 as u32]);
+        assert_eq!(pilled(&rt), [(7..16, "@reviewer".into())]);
         rt.update(|s, _| s.body.truncate(8));
         rt.frame(3.0 / 60.0);
         assert!(pilled(&rt).is_empty(), "a range the text no longer reaches is dropped");

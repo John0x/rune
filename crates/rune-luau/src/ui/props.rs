@@ -77,6 +77,7 @@ atoms! {
     ScrollX = "scrollX",
     StickBottom = "stickBottom",
     OnPress = "onPress",
+    MenuTrigger = "menuTrigger",
     Color = "color",
     Size = "size",
     Weight = "weight",
@@ -93,8 +94,10 @@ atoms! {
     Version = "version",
     RenderRow = "renderRow",
     RowKey = "rowKey",
+    RowVersions = "rowVersions",
     OnVisibleRows = "onVisibleRows",
     OnHover = "onHover",
+    OnMiddlePress = "onMiddlePress",
     HoverTransition = "hoverTransition",
     HoverGroup = "hoverGroup",
     HoverGroupColor = "hoverGroupColor",
@@ -107,6 +110,7 @@ atoms! {
     Disabled = "disabled",
     HelpSide = "helpSide",
     FadeOut = "fadeOut",
+    Dir = "dir",
 }
 
 /// Every prop name the built-in nodes read.
@@ -193,9 +197,11 @@ const LEFT: u8 = 8;
 /// it: the press handler needs the key, `pad` yields to the sides set beside it, a text node's
 /// style and colour land together, and `center`, `corners`, `selected` and `disabled` overrule
 /// the props they overlap.
+#[derive(Clone)]
 pub(crate) struct Props {
     pub(crate) key: Option<String>,
     pub(crate) on_hover: Option<Rc<Callback>>,
+    pub(crate) on_middle_press: Option<Rc<Callback>>,
     pad: Option<f32>,
     sides: u8,
     role: Option<&'static str>,
@@ -203,6 +209,8 @@ pub(crate) struct Props {
     corners: Option<[f32; 4]>,
     selected: bool,
     pub(crate) disabled: bool,
+    /// `menuTrigger`: the `onPress` opens a menu, so a mouse runs it as its button goes down.
+    menu_trigger: bool,
     text: TextStyle,
     color: Option<Color>,
     truncate: bool,
@@ -214,6 +222,9 @@ pub(crate) struct Props {
     border: (Option<f32>, Option<Color>),
     pub(crate) scroll: Option<(bool, bool)>,
     stick_bottom: bool,
+    /// A prop whose effect depends on more than its value and the colours (`shadow`): the node
+    /// can't be a template.
+    pub(crate) uncacheable: bool,
 }
 
 impl Props {
@@ -222,6 +233,7 @@ impl Props {
         Props {
             key: None,
             on_hover: None,
+            on_middle_press: None,
             pad: None,
             sides: 0,
             role: None,
@@ -229,6 +241,7 @@ impl Props {
             corners: None,
             selected: false,
             disabled: false,
+            menu_trigger: false,
             text: env.text,
             color: None,
             truncate: false,
@@ -240,16 +253,25 @@ impl Props {
             border: (None, None),
             scroll: None,
             stick_bottom: false,
+            uncacheable: false,
         }
     }
 
-    /// Applies what waited for the whole table: the press and hover handlers (`press` is the
-    /// node's `onPress`), then the props that depend on others, the text style and the key.
+    /// Applies what waited for the whole table: the press, middle-click and hover handlers (`press`
+    /// is the node's `onPress`), then the props that depend on others, the text style and the key.
     pub(crate) fn finish(self, e: &mut El, env: &Env, is_text: bool, press: Option<Rc<Callback>>, attach: &'static Attach) {
         let press = press.filter(|_| !self.disabled);
-        let key: Option<Rc<str>> = (press.is_some() || self.on_hover.is_some()).then(|| self.key.as_deref().map(Into::into)).flatten();
+        let middle = self.on_middle_press.filter(|_| !self.disabled);
+        let key: Option<Rc<str>> = (press.is_some() || middle.is_some() || self.on_hover.is_some()).then(|| self.key.as_deref().map(Into::into)).flatten();
         if let Some(cb) = press {
             (attach.press)(e, cb, key.clone(), Rc::new([]));
+            // Kobalte's `Menu.Trigger` opens on a mouse's `pointerdown`; keys and taps on the click.
+            if self.menu_trigger {
+                with(e, El::press_on_down);
+            }
+        }
+        if let Some(cb) = middle {
+            with(e, |e| (attach.middle)(e, cb, key.clone()));
         }
         if let Some(cb) = self.on_hover {
             with(e, |e| (attach.hover)(e, cb, key));
@@ -507,6 +529,7 @@ impl Props {
             }
             Atom::Shadow => match v {
                 Value::Str(s) => {
+                    self.uncacheable = true;
                     if let Some(shadows) = env.shadows.as_ref().and_then(|f| f(s, env.dark)) {
                         // In CSS order, the first on top.
                         with(e, |e| shadows.into_iter().rev().fold(e, El::box_shadow));
@@ -522,12 +545,30 @@ impl Props {
                 }
             }
             Atom::Disabled => self.disabled = flag(v)?,
+            Atom::MenuTrigger => self.menu_trigger = flag(v)?,
             Atom::HelpSide => {
-                if matches!(v, Value::Str("top")) {
-                    with(e, El::help_above);
+                let side = match v {
+                    Value::Str("top") => Some(rune::Side::Top),
+                    Value::Str("left") => Some(rune::Side::Left),
+                    Value::Str("right") => Some(rune::Side::Right),
+                    _ => None,
+                };
+                if let Some(side) = side {
+                    with(e, |e| e.help_side(side));
                 }
             }
             Atom::FadeOut => self.fade_out = flag(v)?,
+            // HTML's `dir`: `ltr` or `rtl` lays the subtree out that way whatever the window's
+            // direction, `auto` takes a text's first strong direction.
+            Atom::Dir => {
+                let dir = match string(v)? {
+                    "ltr" => rune::Direction::Ltr,
+                    "rtl" => rune::Direction::Rtl,
+                    "auto" => rune::Direction::Auto,
+                    s => return Err(format!("unknown dir {s}")),
+                };
+                with(e, |e| e.dir(dir));
+            }
             // Tables, read off the stack by `decode_at`.
             Atom::Corners | Atom::Pin => return Err(format!("{name} must be a table, got {}", self::name(v))),
             Atom::LineHeight => self.text = self.text.lh(num(v)?),
@@ -559,7 +600,7 @@ impl Props {
                 })
             }
             // Read by the node that takes them; elsewhere they mean nothing.
-            Atom::OnPress | Atom::OnHover | Atom::Count | Atom::EstimatedRowHeight | Atom::Version | Atom::RenderRow | Atom::RowKey | Atom::OnVisibleRows => {
+            Atom::OnPress | Atom::OnHover | Atom::OnMiddlePress | Atom::Count | Atom::EstimatedRowHeight | Atom::Version | Atom::RenderRow | Atom::RowKey | Atom::RowVersions | Atom::OnVisibleRows => {
                 env.warn_once(format!("{name} has no effect on this node"));
             }
         }
@@ -643,6 +684,7 @@ fn role(s: &str) -> Option<&'static str> {
         "heading" => "heading",
         "img" => "img",
         "status" => "status",
+        "alert" => "alert",
         _ => return None,
     })
 }
@@ -660,5 +702,13 @@ pub(crate) fn name(v: Value<'_>) -> &'static str {
 
 /// A number as Luau prints it: `3`, not `3.0`.
 pub(crate) fn format_num(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e15 { format!("{}", n as i64) } else { n.to_string() }
+    let mut s = String::new();
+    push_num(&mut s, n);
+    s
+}
+
+/// [`format_num`] onto the end of `out`.
+pub(crate) fn push_num(out: &mut String, n: f64) {
+    use std::fmt::Write;
+    let _ = if n.fract() == 0.0 && n.abs() < 1e15 { write!(out, "{}", n as i64) } else { write!(out, "{n}") };
 }

@@ -19,8 +19,8 @@ fn spans_with(src: &str, style: &MarkdownStyle, highlighter: Highlighter) -> Vec
         }
     }
     let (blocks, sources, tasks, _, _) = doc_cached(src);
-    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_help: None, link_ring: None, on_task: None,
-        tasks_read_only: false, selectable: false, scroll_wide: false, highlighter, sources: sources.clone(),
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_help: None, link_ring: None, code_link: None, on_task: None,
+        tasks_read_only: false, selectable: false, scroll_wide: false, tentative: None, highlighter, sources: sources.clone(),
         next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
         #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None, flow: Cell::default() };
     let mut found = Vec::new();
@@ -47,14 +47,14 @@ fn known_languages_are_coloured_and_others_stay_plain() {
     let got = spans(src, &style);
     assert_eq!(got.len(), 6);
     let (ts, s) = &got[0];
-    assert_eq!(coloured(ts, s, style.syntax.color(Syntax::Keyword)), ["const"]);
+    assert_eq!(coloured(ts, s, style.syntax.color(Syntax::Keyword)), ["const "]);
     assert_eq!(coloured(ts, s, style.syntax.color(Syntax::Number)), ["1"]);
     assert!(s.iter().all(|s| s.color.is_some() && s.weight.is_none() && !s.italic && !s.mono && s.size.is_none() && s.bg.is_none()));
     for (code, s) in &got[1..4] {
         assert!(s.is_empty(), "{code:?} stays plain");
     }
     assert_eq!(coloured(&got[4].0, &got[4].1, style.syntax.color(Syntax::Function)), ["f"]);
-    assert_eq!(coloured(&got[5].0, &got[5].1, style.syntax.color(Syntax::Keyword)), ["select"]);
+    assert_eq!(coloured(&got[5].0, &got[5].1, style.syntax.color(Syntax::Keyword)), ["select "]);
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn syntax_builders_override_and_switch_off_colour() {
     let src = "```rust\nlet x = 1;\n```";
     let style = MarkdownStyle::neutral(true).syntax(Syntax::Keyword, red);
     let (code, s) = &spans(src, &style)[0];
-    assert_eq!(coloured(code, s, red), ["let"]);
+    assert_eq!(coloured(code, s, red), ["let "]);
     assert!(spans(src, &style.syntax_highlight(false))[0].1.is_empty());
 }
 
@@ -272,8 +272,8 @@ fn link_spans_come_before_inner_inline_styles_so_bold_em_and_code_keep_theirs() 
     });
     let (blocks, sources, tasks, _, _) = doc_cached("[**bold** *em* `code` plain](session:1)");
     let Block::Para(inl) = &blocks[0] else { panic!() };
-    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_help: None, link_ring: None, on_task: None,
-        tasks_read_only: false, selectable: false, scroll_wide: false, highlighter: Highlighter::builtin(), sources,
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_help: None, link_ring: None, code_link: None, on_task: None,
+        tasks_read_only: false, selectable: false, scroll_wide: false, tentative: None, highlighter: Highlighter::builtin(), sources,
         next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
         #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None, flow: Cell::default() };
     let spans = r.spans(inl, style.body);

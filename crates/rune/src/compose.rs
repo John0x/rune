@@ -55,6 +55,13 @@ pub trait Compositor<S: 'static>: 'static {
         false
     }
 
+    /// Whether the last frame drew anything of the compositor's own, besides `Frame::draw_ui`.
+    /// False lets the window treat it as Rune's default frame: a due timer whose frame would
+    /// build the same instances draws nothing, as in a window with no compositor. A compositor
+    /// that only sometimes draws (Office pages in their slots) says false while it doesn't.
+    fn draws_own(&self) -> bool {
+        true
+    }
     /// Printed after a headless run (e.g. GPU timings).
     fn summary(&mut self, _device: &wgpu::Device) -> Option<String> {
         None
@@ -120,7 +127,7 @@ impl<S: 'static> Frame<'_, S> {
     /// The default frame: every instance into the target, cleared to the window colour.
     pub fn draw_ui(&mut self) {
         let clear = self.rt.clear_color();
-        self.ui.prepare(self.device, self.queue, &mut self.rt.text.atlas, &self.rt.instances, self.size);
+        self.ui.prepare_ui(self.device, self.queue, &mut self.rt.text.atlas, &self.rt.instances, self.size);
         self.ui.draw(self.encoder, self.target, clear);
     }
 }

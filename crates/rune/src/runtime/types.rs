@@ -18,7 +18,7 @@ pub(super) enum RowLayout {
 pub(crate) struct NodeCold {
     pub trace_name: Option<&'static str>,
     pub trace_namespace: Option<(&'static str, &'static str)>,
-    pub label: Option<String>,
+    pub label: Option<std::borrow::Cow<'static, str>>,
     pub(super) live: Vec<crate::live::Bound>,
     /// The run a cell measures and draws from (see `El::advance_in`).
     pub(super) run_layout: Option<Rc<crate::text::RunLayout>>,
@@ -47,8 +47,8 @@ pub(crate) struct NodeCold {
     pub(super) help: Option<String>,
     /// `El::help_when_truncated`.
     pub(super) help_cut: bool,
-    /// `El::help_above`.
-    pub(super) help_above: bool,
+    /// `El::help_side`.
+    pub(super) help_side: Option<crate::Side>,
     #[cfg(debug_assertions)]
     pub(super) scroll_source: Option<&'static std::panic::Location<'static>>,
 }
@@ -79,7 +79,7 @@ impl crate::cold::Empty for NodeCold {
         material: None,
         help: None,
         help_cut: false,
-        help_above: false,
+        help_side: None,
         #[cfg(debug_assertions)]
         scroll_source: None,
     };
@@ -94,7 +94,7 @@ pub(crate) struct Node {
     pub parent: Option<usize>,
     pub(super) taffy: SlotId,
     pub text: Option<crate::cold::SharedBox<TextSpec>>,
-    pub text_layout: Option<Rc<Layout<Ink>>>,
+    pub text_layout: Option<crate::text::TextLayout>,
     /// Where `text_layout` cut the text for `El::truncate` and its kin.
     pub(crate) elided: Option<Elision>,
     pub(super) input: Option<Box<InputSpec>>,
@@ -129,6 +129,8 @@ pub(crate) struct Node {
     /// The direction it lays out in (`El::dir`, its own or inherited): right to left, its
     /// children's x mirror inside it and its inset's sides swap.
     pub(crate) flow: crate::el::Flow,
+    /// Whether an explicit direction governs this subtree's paragraphs.
+    pub(crate) directed: bool,
     /// Where it sits in its parent (`El::unmirrored`).
     pub(crate) pin: crate::el::Pin,
     /// `P_SCALE` has a track: paint reads the sprung factor.
@@ -140,8 +142,13 @@ pub(crate) struct Node {
     pub(super) selection_group: bool,
     pub(super) window_drag: crate::el::WindowDrag,
     pub(super) ime_cursor: bool,
+    /// `El::ime_option_as_alt`.
+    pub(super) ime_option_as_alt: bool,
     /// Placeholder left in `self.nodes` after `try_reuse_memo` moves a node into the new pass.
     pub(super) moved_stub: bool,
+    /// A new one each time it's built from its element; a node a region keeps keeps it
+    /// (`paint_keep`).
+    pub(super) epoch: u32,
 }
 
 impl std::ops::Deref for Node {
@@ -199,6 +206,7 @@ impl Node {
             whole: false,
             inert: false,
             flow: old.flow,
+            directed: old.directed,
             pin: old.pin,
             scale_track: old.scale_track,
             group_fade: old.group_fade,
@@ -206,7 +214,9 @@ impl Node {
             selection_group: false,
             window_drag: crate::el::WindowDrag::None,
             ime_cursor: false,
+            ime_option_as_alt: false,
             moved_stub: true,
+            epoch: 0,
         }
     }
 
@@ -253,8 +263,9 @@ impl AnimSource {
     pub const TEXT_FLIGHT: u16 = 128;
     pub const LIVE: u16 = 256;
     pub const VIRTUAL_FILL: u16 = 512;
-    pub const NAMES: [&'static str; 10] =
-        ["tracks", "growth", "scroll", "reveal", "loop", "scale-settle", "video", "text-flight", "live", "virtual-fill"];
+    pub const TEXT_FILL: u16 = 1024;
+    pub const NAMES: [&'static str; 11] =
+        ["tracks", "growth", "scroll", "reveal", "loop", "scale-settle", "video", "text-flight", "live", "virtual-fill", "text-fill"];
 
     pub fn names(bits: u16) -> Vec<&'static str> {
         Self::NAMES.iter().enumerate().filter(|(i, _)| bits & (1 << i) != 0).map(|(_, n)| *n).collect()
@@ -291,8 +302,11 @@ pub(super) struct Inh {
     /// The clip, fade and fade origin outside the nearest flight above, for a flight nested in it.
     pub(super) outer: Option<[[f32; 4]; 3]>,
     pub(super) mark: u32,
-    /// The nearest hover group's hover amount (0–1), for `group_*` styles.
+    /// The nearest hover group's hover amount (0-1), for `group_*` styles.
     pub(super) group: f32,
+    /// The nearest `El::press_color` above or here, and how far a press on it is held (0-1).
+    pub(super) pressed: f32,
+    pub(super) press_to: Option<Color>,
     /// `opacity` with each `El::group_opacity` at its hovered level: a press where the pointer
     /// hovers the group finds what the hover shows, before a frame has drawn it.
     pub(super) hit_opacity: f32,
@@ -345,26 +359,11 @@ impl Default for Inh {
     fn default() -> Self {
         Inh { opacity: 1.0, paint_opacity: 1.0, first_fade: 1.0, clip: NO_CLIP, fade: [0.0; 4], fade_origin: NO_CLIP,
             paint_clip: NO_CLIP, paint_fade: [0.0; 4], paint_fade_origin: NO_CLIP, rounded: None,
-            scale: 1.0, anchor: [0.0; 2], anchor_to: [0.0; 2], blur: 0.0, dy: 0.0, dx: 0.0, cover: [0.0; 2], outer: None, mark: 0, group: 0.0,
+            scale: 1.0, anchor: [0.0; 2], anchor_to: [0.0; 2], blur: 0.0, dy: 0.0, dx: 0.0, cover: [0.0; 2], outer: None, mark: 0, group: 0.0, pressed: 0.0, press_to: None,
             hit_opacity: 1.0, group_rect: [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY],
             scale_motion: ScaleMotion::Still, still: (1.0, [0.0; 2], [0.0; 2]), in_cache: false, skip_paint: false, turn: 0,
             snap: Default::default() }
     }
-}
-
-/// What moves a scroll viewport's vertical offset: one mode at a time, so a viewport can't
-/// follow its bottom while it glides, or coast while a glide carries it.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(super) enum ScrollMode {
-    /// At rest where a hand, an app or a glide left it.
-    #[default]
-    Rest,
-    /// A stick-to-bottom viewport following its content's end.
-    Pinned,
-    /// Coasting from a fling, keys or wheel momentum at `v` points a second, decaying.
-    Momentum { v: f32 },
-    /// Gliding on a spring (`ScrollState::glide_spring`) at `v` points a second.
-    Glide { v: f32, to: GlideTo },
 }
 
 /// Where a glide goes.
@@ -389,61 +388,59 @@ impl GlideTo {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct ScrollState {
     pub(super) offset: f64,
+    /// What moves it, with the hand's latches for this frame (`runtime/scroll/mode.rs`).
     pub(super) mode: ScrollMode,
     pub(super) max: f64,
-    /// A hand moved the offset since the last scroll step (an input latch the step clears).
-    pub(super) direct: bool,
-    /// A hand or its momentum moved it in the last scroll step (derived there).
-    pub(super) scrolling: bool,
-    /// A hand (the wheel, keys, a drag, their momentum) or an app's instant jump moved it since
-    /// `El::on_scroll_offset` was last told; not following its bottom, a glide or an anchor.
-    pub(super) by_hand: bool,
-    /// A hand scrolled while the growth stack moved: no shrink glide until it settles.
-    pub(super) shrink_cut: bool,
-    /// The growth stack's layout end while its rows still move (see `ease_to_shrunk_end`).
-    pub(super) laid: Option<f64>,
     /// At-bottom state last sent to `El::on_at_bottom`.
     pub(super) at_bottom: Option<bool>,
     /// State last sent to `El::on_far_from_bottom`.
     pub(super) far_from_bottom: Option<bool>,
     /// Whether the last frame drew the content's bottom on the viewport's (see `stuck_offset`).
     pub(super) held: bool,
-    /// The offset, x and y, the last frame drew the content at, in points (slack and a stuck
-    /// bottom included): how far it carried the content up and left.
-    pub(super) drawn: [f32; 2],
-    /// Which way the last frame's drawn vertical offset stepped: -1, 0 or 1, kept across modes
-    /// so a glide landing on a pinned end carries its direction in. A pinned end that would step
-    /// straight back holds its pixel instead (see the paint pass).
-    pub(super) drawn_step: i8,
+    /// The horizontal offset the last frame drew the content at, in points.
+    pub(super) drawn_x: f32,
+    /// Where it drew the vertical offset, and the pinned end's hold (`scroll_drawn`).
+    pub(super) drawn: PixelHold,
     /// Room freed under a pinned growth stack, held under its last row (see `step_slack`).
     pub(super) slack: scroll_bottom::Slack,
     /// The horizontal axis of `El::scroll_x` and `El::scroll_xy`; all zero on a vertical one.
     pub(super) x: AxisScroll,
-    /// What `El::on_scroll_offset` was last told (`runtime/scroll/watch.rs`).
-    pub(super) told: Option<crate::ScrollPos>,
-    /// The `El::on_scroll_offset` handler that was told, by address: a rebuilt view's new
-    /// handler hears where the viewport stands, though it didn't move.
-    pub(super) told_by: usize,
+    /// What `El::on_scroll_offset` has been told, and which handler heard it
+    /// (`runtime/scroll/watch.rs`).
+    pub(super) watch: super::scroll_watch::Watch,
     /// The spring `Tx::scroll_to_with` gave the running glide, on both axes; `GLIDE` when none.
     pub(super) spring: Option<rune_motion::Spring>,
-    /// Frames left in which an app's instant scroll (`Tx::scroll_to_instant` and the like)
-    /// counts as layout moving, so hover under a still pointer holds while an app steps its
-    /// own glide frame by frame (`runtime/input/hover.rs`).
-    pub(super) nudged: u8,
+    /// An app's instant scroll (`Tx::scroll_to_instant` and the like) landed less than
+    /// `scroll_nudge::NUDGE_HOLD` ago, so content moved under a still pointer and hover waits
+    /// for it to pass while the app steps its own glide frame by frame
+    /// (`runtime/input/hover.rs`).
+    pub(super) nudge: scroll_nudge::Nudge,
 }
 
-/// A scroll viewport's horizontal offset, momentum velocity and limit (points).
+/// What moves a viewport's horizontal offset, one motion at a time.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) enum XMotion {
+    /// Where a hand, an app or a motion left it.
+    #[default]
+    Rest,
+    /// Coasting from a fling or a touch at `v` points a second, decaying.
+    Momentum(f32),
+    /// Gliding on a spring (`ScrollState::glide_spring`) at `v` points a second to `aim`
+    /// (`Tx::scroll_to`).
+    Glide { v: f32, aim: f64 },
+    /// Easing to where a notched mouse wheel sent it (`runtime/scroll/wheel.rs`).
+    Wheel(scroll_wheel::WheelCurve),
+}
+
+/// A scroll viewport's horizontal offset, motion and limit (points).
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct AxisScroll {
     pub(super) offset: f64,
-    pub(super) v: f32,
+    pub(super) motion: XMotion,
     pub(super) max: f64,
-    /// Velocity of a glide to `aim` (`Tx::scroll_to`) while one runs.
-    pub(super) glide: Option<f32>,
-    pub(super) aim: f64,
     /// The viewport's flow (`El::dir`): right to left, its content starts at its right edge and
     /// `offset` counts how far it moved right, uncovering what is to the left.
     pub(super) flow: crate::el::Flow,
@@ -461,14 +458,21 @@ impl AxisScroll {
     pub(super) fn toward(&self, delta: f64) -> f64 {
         match self.flow { crate::el::Flow::Ltr => -delta, crate::el::Flow::Rtl => delta }
     }
-}
 
-#[derive(Clone, Debug, Default)]
-pub(super) struct RevealState {
-    pub(super) len: usize,
-    /// (word start byte, start time) for words still fading.
-    pub(super) words: Vec<(u32, f64)>,
-    pub(super) fade: f32,
+    /// Its momentum (points a second), 0 unless coasting.
+    pub(super) fn coast(&self) -> f32 {
+        match self.motion { XMotion::Momentum(v) => v, _ => 0.0 }
+    }
+
+    /// A glide or a wheel's ease moves it on its own.
+    pub(super) fn carried(&self) -> bool {
+        matches!(self.motion, XMotion::Glide { .. } | XMotion::Wheel(_))
+    }
+
+    /// Coasting at `v` from here; at 0 a coast stops, and a glide or a wheel's ease runs on.
+    pub(super) fn set_coast(&mut self, v: f32) {
+        if v != 0.0 { self.motion = XMotion::Momentum(v); } else if matches!(self.motion, XMotion::Momentum(_)) { self.motion = XMotion::Rest; }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -483,12 +487,14 @@ pub(super) struct Stack {
     pub(super) pad_bottom: f32,
     pub(super) gap: f32,
     pub(super) width: f32,
-    /// Measure at the landing width immediately; defer height targets until it is stable.
-    pub(super) width_hold_until: f64,
-    pub(super) width_shrink_until: f64,
+    /// A width change the rows still wait out (heights it defers go in `pending_heights`).
+    pub(super) width_hold: WidthHold,
     pub(super) pending_heights: HashMap<NodeId, f32>,
     /// The window size at the last commit.
     pub(super) window: (f32, f32),
+    /// The list viewport in the last layout, apart from the window (e.g. above a dock).
+    pub(super) viewport_height: f32,
+    pub(super) handoff: row_reorder::handoff::Handoff,
     /// How far its rows grew (positive steps only) this frame.
     pub(super) grown: f32,
     /// Whether any row in the stack still has height left to grow.
@@ -496,9 +502,42 @@ pub(super) struct Stack {
     /// Whether any row in the stack is still animating.
     pub(crate) moving: bool,
     pub(super) reorder: row_reorder::Reorder,
+    pub(super) seams: Vec<row_reorder::joined::Seam>,
     pub(super) slides: content_slide::ContentSlides,
     /// Fold rows opening or shutting together as one block.
     pub(super) runs: Vec<growth_runs::GrowthRun>,
+}
+
+/// A growth stack whose width changed: its rows measure at the new width at once, but their
+/// new heights wait until the width is stable, and a streaming row shrinks only a while after.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) enum WidthHold {
+    #[default]
+    Off,
+    /// Heights wait until `until`; a streaming row may shrink from `shrink_from`.
+    Rewrap { until: f64, shrink_from: f64 },
+}
+
+impl WidthHold {
+    /// Seconds new heights wait after a width change.
+    const HOLD: f64 = 0.12;
+    /// Seconds a streaming row keeps its height after a width change before it may shrink.
+    const SHRINK: f64 = 0.4;
+
+    /// The width changed at `now`.
+    pub(super) fn rewrap(now: f64) -> WidthHold {
+        WidthHold::Rewrap { until: now + Self::HOLD, shrink_from: now + Self::SHRINK }
+    }
+
+    /// Whether a height set at `at` waits for the width to settle.
+    pub(super) fn defers(self, at: f64) -> bool {
+        matches!(self, WidthHold::Rewrap { until, .. } if at < until)
+    }
+
+    /// Whether a streaming row may shrink at `now`.
+    pub(super) fn may_shrink(self, now: f64) -> bool {
+        !matches!(self, WidthHold::Rewrap { shrink_from, .. } if now < shrink_from)
+    }
 }
 
 /// What a press on a window drag region asks the shell to do, synchronously in that press.
@@ -517,3 +556,7 @@ pub struct FrameStats {
     pub glyphs: usize,
     pub shaped: u32,
 }
+
+#[cfg(test)]
+#[path = "width_hold_tests.rs"]
+mod width_hold_tests;

@@ -76,10 +76,15 @@ impl Trace {
 
     /// Waits up to `wait` for the last frames' present times, then writes every held line.
     pub(crate) fn settle_presents(&mut self, wait: std::time::Duration) {
+        #[cfg(target_arch = "wasm32")]
+        let _ = wait;
         let Some(presents) = self.presents.as_mut() else { return };
-        let until = Instant::now() + wait;
-        while presents.waiting() && Instant::now() < until {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let until = Instant::now() + wait;
+            while presents.waiting() && Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
         }
         presents.flush(&mut self.out);
     }
@@ -356,6 +361,12 @@ pub(crate) fn tree_json<S>(rt: &Runtime<S>, real_t: f64) -> Value {
             if e.drag_out {
                 v["dragOut"] = true.into();
             }
+            if let Some(c) = e.caret {
+                v["caret"] = c.map(r2).to_vec().into();
+            }
+            if let Some(r) = e.edit_range {
+                v["selection"] = r.to_vec().into();
+            }
             if let Some(video) = videos.get(&e.path) {
                 v["video"] = video_json(video);
             }
@@ -376,6 +387,12 @@ pub(crate) fn tree_json<S>(rt: &Runtime<S>, real_t: f64) -> Value {
     });
     if let Some(menu) = rt.popup_json() { tree["popupMenu"] = menu; }
     if let Some(dialog) = rt.file_dialog_json() { tree["fileDialog"] = dialog; }
+    // Where the input method's candidate window opens: the window's IME area, in view points.
+    if let Some(area) = rt.ime_area { tree["imeArea"] = area.map(r2).to_vec().into(); }
+    // The focused field's open composition, not yet part of its text.
+    if let Some((text, cursor)) = rt.focused_preedit() {
+        tree["preedit"] = json!({ "text": text, "cursor": cursor.map(|(a, b)| [a, b]) });
+    }
     if let Some(title) = rt.window_title.current() { tree["title"] = title.into(); }
     if let Some((text, rect)) = rt.help_tooltip() { tree["tooltip"] = json!({ "text": text, "rect": rect.map(r2) }); }
     tree["accessibility"] = crate::a11y::dump::json(&rt.accessibility_tree(), false);

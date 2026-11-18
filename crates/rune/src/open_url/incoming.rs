@@ -18,8 +18,8 @@
 //! Windows hands a link to a new process as a launch argument: the links among the first
 //! process's arguments are kept as the launching link is on macOS, and `single_instance` sends
 //! a later launch's links here from the first process's pipe (`instance`). Links that arrive
-//! before the loop starts are kept too. iOS (winit owns the scene delegate) is a follow-up, and
-//! Linux never calls the hook.
+//! before the loop starts are kept too. Linux does the same through a Unix socket. iOS (winit
+//! owns the scene delegate) is a follow-up.
 // The web build runs no native window, so nothing here is reached there.
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 use std::sync::{Arc, Mutex};
@@ -41,14 +41,23 @@ pub(crate) trait Glue {
     fn remove(&self);
 }
 
-#[derive(Default)]
+/// Where a link goes, from launch until every window has started.
+enum Funnel {
+    /// Nothing installed here (or the handler can't be): a link is kept for the first window
+    /// whose app has the hook, as on Windows before the loop starts.
+    Unprepared { kept: Vec<String> },
+    /// The get-URL handler is Rune's; links wait here for the first window with the hook.
+    Launch { kept: Vec<String> },
+    /// A window listens: a link goes to the first one still running, in start order. Nothing
+    /// waits for a later window, including after every window has started.
+    Listening { listeners: Vec<(u64, Sink)> },
+    /// No handler is installed and no window listens: a link is dropped.
+    Closed,
+}
+
 struct State {
-    /// Running windows whose apps have the hook, in the order they started.
-    listeners: Vec<(u64, Sink)>,
+    funnel: Funnel,
     next: u64,
-    /// Kept from launch until a window listens or `settle`.
-    pending: Option<Vec<String>>,
-    installed: bool,
 }
 
 /// Where links go.
@@ -58,24 +67,25 @@ pub(crate) struct Inbox {
 
 impl Inbox {
     pub(crate) const fn new() -> Self {
-        Inbox { state: Mutex::new(State { listeners: Vec::new(), next: 0, pending: Some(Vec::new()), installed: false }) }
+        Inbox { state: Mutex::new(State { funnel: Funnel::Unprepared { kept: Vec::new() }, next: 0 }) }
     }
 
     /// Before the event loop: install the handler and keep links until a window listens,
     /// unless something else handles them already.
     pub(crate) fn prepare(&self, glue: &dyn Glue) {
         let mut state = self.state.lock().unwrap();
-        if state.installed || glue.handled_elsewhere() || !glue.install() { return; }
-        state.installed = true;
-        state.pending.get_or_insert_with(Vec::new);
+        state.funnel = match std::mem::replace(&mut state.funnel, Funnel::Closed) {
+            Funnel::Unprepared { kept } if !glue.handled_elsewhere() && glue.install() => Funnel::Launch { kept },
+            funnel => funnel,
+        };
     }
 
     /// The links the app was launched with, ahead of any that arrived since.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
     pub(crate) fn launched(&self, urls: Vec<String>) {
         if urls.is_empty() { return; }
         let mut state = self.state.lock().unwrap();
-        if let Some(pending) = &mut state.pending { pending.splice(0..0, urls); }
+        if let Funnel::Unprepared { kept } | Funnel::Launch { kept } = &mut state.funnel { kept.splice(0..0, urls); }
     }
 
     /// Sends links to `app`'s hook while the returned guard lives, after the links kept so far,
@@ -83,16 +93,32 @@ impl Inbox {
     pub(crate) fn listen<S: 'static>(&'static self, app: &App<S>, glue: &dyn Glue) -> Option<Listening> {
         let hook = app.on_open_url?;
         let mut state = self.state.lock().unwrap();
-        if !state.installed {
-            if !glue.install() { return None; }
-            state.installed = true;
-        }
+        let (mut listeners, kept) = match std::mem::replace(&mut state.funnel, Funnel::Closed) {
+            // `Listening` and `Launch` already have the handler; `Unprepared` and `Closed`
+            // install it here.
+            Funnel::Listening { listeners } => (listeners, Vec::new()),
+            Funnel::Launch { kept } => (Vec::new(), kept),
+            Funnel::Unprepared { kept } => {
+                if !glue.install() {
+                    state.funnel = Funnel::Unprepared { kept };
+                    return None;
+                }
+                (Vec::new(), kept)
+            }
+            Funnel::Closed => {
+                if !glue.install() {
+                    state.funnel = Funnel::Closed;
+                    return None;
+                }
+                (Vec::new(), Vec::new())
+            }
+        };
         let handle: AppHandle<S> = app.handle();
         let sink: Sink = Arc::new(move |url: String| handle.update(move |s, tx| hook(s, &url, tx)));
         let id = state.next;
         state.next += 1;
-        state.listeners.push((id, sink.clone()));
-        let kept = state.pending.take().unwrap_or_default();
+        listeners.push((id, sink.clone()));
+        state.funnel = Funnel::Listening { listeners };
         drop(state);
         for url in kept { sink(url); }
         Some(Listening { inbox: self, id })
@@ -101,24 +127,28 @@ impl Inbox {
     /// Every window has started: stop keeping links, and remove the handler if none listens.
     pub(crate) fn settle(&self, glue: &dyn Glue) {
         let mut state = self.state.lock().unwrap();
-        state.pending = None;
-        if state.installed && state.listeners.is_empty() {
-            glue.remove();
-            state.installed = false;
-        }
+        state.funnel = match std::mem::replace(&mut state.funnel, Funnel::Closed) {
+            Funnel::Listening { listeners } if !listeners.is_empty() => Funnel::Listening { listeners },
+            Funnel::Launch { .. } | Funnel::Listening { .. } => { glue.remove(); Funnel::Closed },
+            Funnel::Unprepared { .. } | Funnel::Closed => Funnel::Closed,
+        };
     }
 
     /// A link arrived: to the first listener, kept before one exists, else dropped.
-    #[cfg_attr(not(any(test, target_os = "macos", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(not(any(test, target_os = "macos", target_os = "windows", target_os = "linux")), allow(dead_code))]
     pub(crate) fn receive(&self, url: String) {
         let sink = {
             let mut state = self.state.lock().unwrap();
-            match state.listeners.first() {
-                Some((_, sink)) => sink.clone(),
-                None => {
-                    if let Some(pending) = &mut state.pending { pending.push(url); }
+            match &mut state.funnel {
+                Funnel::Unprepared { kept } | Funnel::Launch { kept } => {
+                    kept.push(url);
                     return;
                 }
+                Funnel::Listening { listeners } => match listeners.first() {
+                    Some((_, sink)) => sink.clone(),
+                    None => return,
+                },
+                Funnel::Closed => return,
             }
         };
         sink(url);
@@ -133,7 +163,10 @@ pub(crate) struct Listening {
 
 impl Drop for Listening {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.inbox.state.lock() { state.listeners.retain(|(id, _)| *id != self.id); }
+        if let Ok(mut state) = self.inbox.state.lock()
+            && let Funnel::Listening { listeners } = &mut state.funnel {
+            listeners.retain(|(id, _)| *id != self.id);
+        }
     }
 }
 
@@ -150,12 +183,13 @@ impl Glue for Native {
 /// Before the event loop starts (see the module docs).
 pub(crate) fn prepare() {
     INBOX.prepare(&Native);
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     INBOX.launched(super::instance::launch_links());
 }
 
-/// A link from a later launch of the app (Windows, `single_instance`).
-#[cfg(target_os = "windows")]
+/// A link from a later launch of the app (Windows, Linux, `single_instance`), or the Dock menu's
+/// jump list entry (macOS, `native_menu`).
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub(crate) fn receive(url: String) { INBOX.receive(url); }
 
 /// For a starting window: its app's links, while the guard lives.
@@ -167,16 +201,16 @@ pub(crate) fn settle() { INBOX.settle(&Native); }
 #[cfg(target_os = "macos")]
 use mac as platform;
 
-/// Windows: links come in launch arguments and down `single_instance`'s pipe, so there is no
-/// handler to install, and nothing else can have taken it.
-#[cfg(target_os = "windows")]
+/// Windows and Linux: links come in launch arguments and down `single_instance`'s pipe or socket,
+/// so there is no handler to install, and nothing else can have taken it.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 mod platform {
     pub(super) fn handled_elsewhere() -> bool { false }
     pub(super) fn install() -> bool { true }
     pub(super) fn remove() {}
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod platform {
     pub(super) fn handled_elsewhere() -> bool { false }
     pub(super) fn install() -> bool { false }

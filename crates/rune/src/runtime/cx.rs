@@ -16,7 +16,7 @@ impl Default for Env {
 }
 
 /// What a view declares for the elements that don't style themselves.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ViewDefaults {
     /// [`Cx::foreground`].
     pub(crate) foreground: Option<Color>,
@@ -26,6 +26,10 @@ pub(crate) struct ViewDefaults {
     pub(crate) help: Option<super::HelpLook>,
     /// [`Cx::web_focus`].
     pub(crate) web_focus: bool,
+    /// [`Cx::force_focus_rings`].
+    pub(crate) force_focus_rings: bool,
+    /// [`Cx::mark_texts`].
+    pub(crate) marks: Rc<[super::TextMark]>,
 }
 
 /// Wakes the shell from another thread (new data arrived); a no-op headless.
@@ -54,10 +58,14 @@ pub struct Cx<S> {
     /// `Cx::set_titlebar` and `Cx::titlebar_height`, read once the view returns.
     pub(super) titlebar: crate::titlebar::TitlebarSet,
     pub(super) system_accent: crate::SystemAccent,
+    pub(super) system_contrast: Option<crate::SystemContrast>,
+    pub(super) system_increased_contrast: bool,
     pub(super) system_scroll_bars: crate::platform::scroll_bars::SystemScrollBars,
     pub(super) system_reduced_motion: bool,
     pub(super) reduced_motion: bool,
     pub(super) time_scale: f32,
+    /// [`Cx::zoom`], read once the view returns.
+    pub(super) zoom: f32,
     pub(super) caret: Option<(String, [f32; 4])>,
     pub(super) caret_read: std::cell::Cell<bool>,
     pub(super) layout: layout_read::LayoutRects,
@@ -73,11 +81,13 @@ impl<S> Cx<S> {
     pub fn retype<T>(&self) -> Cx<T> {
         Cx {
             env: self.env, titlebar_inset: self.titlebar_inset, chrome: self.chrome, caption_color: self.caption_color,
-            defaults: self.defaults,
+            defaults: self.defaults.clone(),
             titlebar: self.titlebar,
             system_accent: self.system_accent,
+            system_contrast: self.system_contrast,
+            system_increased_contrast: self.system_increased_contrast,
             system_scroll_bars: self.system_scroll_bars,
-            system_reduced_motion: self.system_reduced_motion, reduced_motion: self.reduced_motion, time_scale: self.time_scale,
+            system_reduced_motion: self.system_reduced_motion, reduced_motion: self.reduced_motion, time_scale: self.time_scale, zoom: self.zoom,
             caret: self.caret.clone(), caret_read: self.caret_read.clone(),
             layout: self.layout.clone(), layout_reads: self.layout_reads.clone(), _s: PhantomData,
         }
@@ -89,6 +99,7 @@ impl<S> Cx<S> {
     pub fn absorb<T>(&mut self, other: Cx<T>) {
         self.reduced_motion = other.reduced_motion;
         self.time_scale = other.time_scale;
+        self.zoom = other.zoom;
         self.defaults = other.defaults;
         self.caret_read.set(self.caret_read.get() || other.caret_read.get());
         let mut reads = self.layout_reads.borrow_mut();
@@ -111,6 +122,7 @@ impl<S> Cx<S> {
     pub(crate) fn settings_from<T>(&mut self, other: Cx<T>) {
         self.reduced_motion = other.reduced_motion;
         self.time_scale = other.time_scale;
+        self.zoom = other.zoom;
         self.caption_color = other.caption_color;
         self.titlebar = other.titlebar;
         self.caret_read = other.caret_read;
@@ -170,6 +182,14 @@ impl<S> Cx<S> {
     pub fn help_look(&mut self, look: crate::HelpLook) {
         self.defaults.help = Some(look);
     }
+    /// Every control that can take focus draws its keyboard focus ring (and its focus fill) as
+    /// if the keyboard had focused it, whether or not it has focus: a developer tool for checking
+    /// focus styles at a glance, as forcing `:focus` and `:focus-visible` on every focusable
+    /// element of a web page does (Chrome DevTools' `CSS.forcePseudoState`). Focus itself doesn't
+    /// move. Set it on every run of the view while the tool is on.
+    pub fn force_focus_rings(&mut self) {
+        self.defaults.force_focus_rings = true;
+    }
     /// Keyboard focus as a web page has it, for a view that ports one: every pressable control
     /// (an `on_press` element whose role is button, link, tab, checkbox, switch, radio or
     /// combobox) is a Tab stop in document order and takes focus when clicked, as an HTML
@@ -188,8 +208,8 @@ impl<S> Cx<S> {
     /// [`Self::chrome_insets`] reports it from the next frame on, so the buttons line up with
     /// the app's row at every zoom: for a 44 point row, `cx.titlebar_height(44.0 * zoom.max(1.0))`
     /// keeps the row 44 points tall zoomed out, as Electron apps size their `titleBarOverlay`.
-    /// Insets are window points: a view that scales its content by a zoom divides them by it.
-    /// Over [`Self::set_titlebar`], it sets that titlebar's height.
+    /// The height is in window points; [`Self::chrome_insets`] reports it in the view's, over
+    /// [`Self::zoom`]. Over [`Self::set_titlebar`], it sets that titlebar's height.
     pub fn titlebar_height(&mut self, points: f32) {
         self.titlebar.height = Some(points.max(1.0));
     }
@@ -222,6 +242,35 @@ impl<S> Cx<S> {
         #[cfg(not(target_arch = "wasm32"))]
         { [0.0; 4] }
     }
+    /// The primary pointer can't hover: a browser's `(hover: none)`, a phone's or tablet's touch
+    /// screen. What a mouse would reveal on hover (a code block's Copy, a row's actions) should
+    /// show without it. False natively. A change re-runs the view.
+    pub fn hover_none(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        { crate::platform::web::hover_none() }
+        #[cfg(not(target_arch = "wasm32"))]
+        { false }
+    }
+    /// A page's primary pointer is coarse and can't hover. Use this for a phone or tablet's
+    /// controls rather than the viewport width: a narrow window can still have a mouse.
+    pub fn touch_controls(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        { crate::platform::web::touch_controls() }
+        #[cfg(not(target_arch = "wasm32"))]
+        { false }
+    }
+    /// The system's contrast theme when one is on (Windows' Contrast themes, high contrast):
+    /// the colours it asks every app to paint with, which a view uses in place of its own
+    /// (CSS `forced-colors: active`). None otherwise. A change re-runs the view.
+    pub fn system_contrast(&self) -> Option<crate::SystemContrast> {
+        self.system_contrast
+    }
+    /// Whether the system asks for more contrast: macOS's Increase Contrast, or a Windows contrast
+    /// theme (when [`Self::system_contrast`] is also there). A view can draw its stronger edges for
+    /// it while keeping its own colours. A change re-runs the view.
+    pub fn system_increased_contrast(&self) -> bool {
+        self.system_increased_contrast
+    }
     /// The host's OS accessibility preference, independent of this commit's override.
     pub fn system_reduced_motion(&self) -> bool {
         self.system_reduced_motion
@@ -253,6 +302,16 @@ impl<S> Cx<S> {
     /// with this.
     pub fn time_scale(&mut self, scale: f32) {
         self.time_scale = scale.clamp(0.0, 8.0);
+    }
+    /// The UI zoom, as a browser's page zoom (Electron's `setZoomFactor`): `k` times the size,
+    /// 1 unzoomed. The view lays out in a window `1 / k` as many points across, drawn at `k`
+    /// times the window's scale, so borders, icons, text and pixel snapping land on the device
+    /// grid at every zoom as Chromium's do, and motion runs in the space the layout is in. Set it
+    /// on every run of the view; a run that doesn't is unzoomed. A change lands at once, in the
+    /// commit that makes it. [`Self::env`]'s scale, layout reads and pointer positions are in
+    /// the zoomed view's points; [`Self::chrome_insets`] and [`Self::titlebar_inset`] too.
+    pub fn zoom(&mut self, k: f32) {
+        self.zoom = super::zoom::clamp(k);
     }
     /// The focused text field's caret line in window points `[x, y, w, h]`, as last drawn (after
     /// scrolling, at the cursor inside an IME composition), when that field is keyed `key` or sits

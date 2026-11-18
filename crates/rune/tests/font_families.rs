@@ -57,7 +57,7 @@ fn missing_named_family_falls_back_to_sans_pixels() {
         let style = TextStyle::new(13.0, 400.0);
         let mut a = Vec::new(); let mut b = Vec::new();
         sans.glyphs("Hello 0123 ffi", style, scale, [0.0, 0.0], &mut a);
-        missing.glyphs("Hello 0123 ffi", style.family(Family::Named("Rune Missing Family, IBM Plex Mono")),
+        missing.glyphs("Hello 0123 ffi", style.family(Family::Named("Rune Missing Family")),
             scale, [0.0, 0.0], &mut b);
         assert_eq!(a.iter().map(|q| (q.rect, q.uv)).collect::<Vec<_>>(), b.iter().map(|q| (q.rect, q.uv)).collect::<Vec<_>>());
         assert_eq!(sans.atlas.data, missing.atlas.data);
@@ -83,7 +83,12 @@ fn default_faces_keep_batch_c_pixels() {
             }
         }
         system.atlas.data.hash(&mut hash);
-        // Re-baselined for `FontSmoothing::On` (CoreGraphics pipeline) once Calibrated was removed.
+        // At 2× the inline Plex span grows the line, as Chromium's does (#983): each font's box
+        // has its ascent and descent rounded to device px and its half-leading floored, and the
+        // line is the largest reach above the baseline plus the largest below. Plex reaches a
+        // pixel further under the baseline than Inter, so a 13/16 table cell with inline code is
+        // 17 tall at 1× in official OpenCode, not 16. This is the hash from before #448 cut the
+        // span's box to fit (Kit's 70909822 followed that); 1× doesn't change.
         let expected = if scale == 1.0 { 17045220814369067823 } else { 10933675232581112092 };
         assert_eq!(hash.finish(), expected, "sans/mono pixels changed at {scale}×");
     }

@@ -14,7 +14,8 @@ use std::rc::Rc;
 
 use rune::{Color, El, Icon, PointerPress, TextStyle, Tx, col, el, icon, row, text};
 
-use crate::overlay::{Placement, fit_scroll_bar, menu_anchor, scrim};
+use crate::overlay::{Placement, scrim};
+use crate::popover::{anchored, fit_scroll_bar};
 use crate::{Acts, Kit, State, shadows};
 
 /// A menu at a secondary-press position. Store the point from `El::on_secondary_press`
@@ -301,7 +302,7 @@ impl MenuItem {
                 e = e.child(el().key(anchor.clone()).absolute(0.0, y).w_full().h(1.0).inert().a11y_hidden());
                 anchor
             };
-            layer.push(menu_anchor(k, surface, &anchor, Placement::RightStart, x));
+            layer.push(anchored(k, surface, &anchor, Placement::RightStart, x));
             layer.extend(deeper);
         }
         if disabled && !standard && !drawn {
@@ -546,7 +547,7 @@ impl Menu {
         if let Some(modal) = modal {
             surface = modal(surface);
         }
-        layer.push(menu_anchor(k, surface, &key, placement, gutter));
+        layer.push(anchored(k, surface, &key, placement, gutter));
         layer.extend(subs);
         trigger
     }

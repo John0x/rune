@@ -90,6 +90,8 @@ fn view(s: &App, _: &mut Cx<App>) -> El {
 
 fn runtime(slow: bool) -> Runtime<App> {
     force_on();
+    // A fixed threshold: the slow-click tests never read `RUNE_PERF_SLOW_MS` from the environment.
+    super::force_slow_ms(SLOW_MS);
     SENT.take();
     let mut rt = Runtime::new(App { slow, ..App::default() }, view, (400.0, 300.0), Env::new(true, 1.0));
     rt.frame(0.0);
@@ -192,7 +194,7 @@ fn off_nothing_is_timed() {
     click(&mut rt, "save-42");
     assert!(SENT.take().is_empty());
     let tracker = rt.interaction_tracker();
-    assert!(tracker.rollup.is_empty() && tracker.timed.is_none());
+    assert!(tracker.rollup.is_empty() && matches!(tracker.frame, Frame::Idle));
 }
 
 #[test]

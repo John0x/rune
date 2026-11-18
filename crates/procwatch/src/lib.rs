@@ -19,6 +19,8 @@
 //! macOS only for now; elsewhere [`snapshot`] returns `None`, [`usage`] has every field `None`,
 //! and [`watch`] does nothing.
 
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+
 pub mod alloc;
 pub mod gauge;
 
@@ -28,7 +30,9 @@ pub use gauge::gauges;
 
 use std::fmt::Write as _;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Thread {
@@ -120,10 +124,17 @@ fn json_map(s: &mut String, entries: &[(&'static str, i64)]) {
 
 /// This process now.
 pub fn snapshot() -> Option<Snapshot> {
-    let mut s = snapshot_of(std::process::id() as i32)?;
-    s.heap = alloc::heap();
-    s.gauges = gauges();
-    Some(s)
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut s = snapshot_of(std::process::id() as i32)?;
+        s.heap = alloc::heap();
+        s.gauges = gauges();
+        Some(s)
+    }
 }
 
 /// Another process of this user (or this one), read through `proc_pid_rusage` and
@@ -343,39 +354,68 @@ pub fn watch(config: Config) {
 /// [`watch`], and calls `on_warning` on the watcher thread for every warning (not the
 /// periodic report): to drop a cache, write a capture, or post the numbers somewhere.
 pub fn watch_with(config: Config, on_warning: impl Fn(&Event, &Snapshot) + Send + 'static) {
-    if snapshot().is_none() {
-        return;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (config, on_warning);
     }
-    let _ = std::thread::Builder::new().name("procwatch".into()).spawn(move || {
-        let mut watcher = Watcher::new(config);
-        loop {
-            if let Some(s) = snapshot() {
-                for event in watcher.observe(Instant::now(), &s) {
-                    eprintln!("{event}");
-                    if event.is_warning() {
-                        on_warning(&event, &s);
-                    }
-                }
-                *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
-            }
-            std::thread::sleep(watcher.config.every);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if snapshot().is_none() {
+            return;
         }
-    });
+        let _ = std::thread::Builder::new().name("procwatch".into()).spawn(move || {
+            let mut watcher = Watcher::new(config);
+            loop {
+                if let Some(s) = snapshot() {
+                    for event in watcher.observe(Instant::now(), &s) {
+                        eprintln!("{event}");
+                        if event.is_warning() {
+                            on_warning(&event, &s);
+                        }
+                    }
+                    *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+                }
+                std::thread::sleep(watcher.config.every);
+            }
+        });
+    }
 }
 
 /// The judging half of [`watch`], fed samples so tests can drive it.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Watcher {
     pub config: Config,
     history: Vec<(Instant, Snapshot)>,
+    /// The footprint last warned about (0: none yet); the next warning needs twice it.
     warned_footprint: u64,
-    warned_growth: Option<Instant>,
-    warned_cpu: Option<Instant>,
-    reported: Option<Instant>,
+    growth: Gate,
+    cpu: Gate,
+    report: Gate,
 }
 
+/// One message of a kind per window: the first goes out at once, the next a window after it.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Default)]
+struct Gate {
+    last: Option<Instant>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Gate {
+    /// Whether a message may go out at `now`, `window` after the last; if so, it counts as sent.
+    fn pass(&mut self, now: Instant, window: Duration) -> bool {
+        let open = self.last.is_none_or(|at| now.duration_since(at) >= window);
+        if open {
+            self.last = Some(now);
+        }
+        open
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Watcher {
     pub fn new(config: Config) -> Watcher {
-        Watcher { config, history: Vec::new(), warned_footprint: 0, warned_growth: None, warned_cpu: None, reported: None }
+        Watcher { config, history: Vec::new(), warned_footprint: 0, growth: Gate::default(), cpu: Gate::default(), report: Gate::default() }
     }
 
     /// Takes a sample; returns what to log.
@@ -395,7 +435,6 @@ impl Watcher {
             let start = history.iter().rposition(|(at, _)| now.duration_since(*at) >= window).unwrap_or(0);
             &history[start..]
         };
-        let quiet = |warned: Option<Instant>, window: Duration| warned.is_none_or(|at| now.duration_since(at) >= window);
         let event = |kind, line| Event { kind, line };
 
         if s.footprint >= c.warn_footprint && s.footprint >= self.warned_footprint.saturating_mul(2) {
@@ -411,8 +450,7 @@ impl Watcher {
         {
             let rising = window.windows(2).all(|w| w[1].1.footprint >= w[0].1.footprint);
             let grew = s.footprint.saturating_sub(first.footprint);
-            if rising && grew >= c.warn_growth && quiet(self.warned_growth, c.growth_window) {
-                self.warned_growth = Some(now);
+            if rising && grew >= c.warn_growth && self.growth.pass(now, c.growth_window) {
                 out.push(event(
                     Kind::Growth,
                     format!(
@@ -429,15 +467,13 @@ impl Watcher {
         if let Some((then, old)) = since(c.cpu_window).first() {
             let span = now.duration_since(*then).as_secs_f64();
             let cores = (s.cpu_s - old.cpu_s) / span.max(1e-9);
-            if span >= c.cpu_window.as_secs_f64() * 0.9 && cores >= c.warn_cpu_cores && quiet(self.warned_cpu, c.cpu_window) {
-                self.warned_cpu = Some(now);
+            if span >= c.cpu_window.as_secs_f64() * 0.9 && cores >= c.warn_cpu_cores && self.cpu.pass(now, c.cpu_window) {
                 out.push(event(Kind::Cpu, format!("{}: warning: {:.0}% CPU over {:.0}s: {}", c.name, cores * 100.0, span, busiest(old, s, span))));
             }
         }
         if let Some(every) = c.report
-            && self.reported.is_none_or(|at| now.duration_since(at) >= every)
+            && self.report.pass(now, every)
         {
-            self.reported = Some(now);
             out.push(event(
                 Kind::Report,
                 format!(
@@ -721,6 +757,25 @@ mod tests {
         for i in 0..=12u64 {
             assert!(w.observe(t0 + Duration::from_secs(i * 10), &at(50 << 20, 1.0)).is_empty());
         }
+    }
+
+    #[test]
+    fn a_gate_passes_once_per_window() {
+        let (mut g, t0, window) = (Gate::default(), Instant::now(), Duration::from_secs(60));
+        assert!(g.pass(t0, window), "the first goes out at once");
+        assert!(!g.pass(t0 + Duration::from_secs(59), window));
+        assert!(g.pass(t0 + Duration::from_secs(60), window));
+        assert!(!g.pass(t0 + Duration::from_secs(61), window), "a window from the last one that went out");
+    }
+
+    #[test]
+    fn reports_once_per_period() {
+        let mut w = Watcher::new(Config { report: Some(Duration::from_secs(30)), ..Config::release("t") });
+        let t0 = Instant::now();
+        let reported: Vec<u64> = (0..=9u64)
+            .filter(|i| w.observe(t0 + Duration::from_secs(i * 10), &at(50 << 20, 1.0)).iter().any(|e| e.kind == Kind::Report))
+            .collect();
+        assert_eq!(reported, [0, 3, 6, 9]);
     }
 
     #[test]

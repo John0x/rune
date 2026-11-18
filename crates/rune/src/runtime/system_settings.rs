@@ -62,6 +62,22 @@ impl<S: 'static> Runtime<S> {
     pub fn set_tab_visits_controls(&mut self, on: bool) {
         self.tab_visits_controls = on;
     }
+    /// What [`Cx::system_contrast`] reports. Native Windows windows set it from the system's
+    /// contrast theme as they open and when it changes; headless runs keep None.
+    pub fn set_system_contrast(&mut self, contrast: Option<crate::SystemContrast>) {
+        if contrast != self.system_contrast {
+            self.system_contrast = contrast;
+            self.dirty = true;
+        }
+    }
+    /// What [`Cx::system_increased_contrast`] reports. Native windows set it from the system as
+    /// they open, gain focus, and when its display options change; headless runs keep false.
+    pub fn set_system_increased_contrast(&mut self, on: bool) {
+        if on != self.system_increased_contrast {
+            self.system_increased_contrast = on;
+            self.dirty = true;
+        }
+    }
     pub fn set_system_reduced_motion(&mut self, reduced: bool) {
         if self.system_reduced_motion != reduced {
             self.system_reduced_motion = reduced;

@@ -1,6 +1,6 @@
 //! Vector canvas, text measurement, geometry primitives and scene assembly for [`crate::render`].
 
-use rune::{Align, Color, El, LineCap, Shape, TextStyle, Transition, canvas, col, el, text};
+use rune::{Align, Color, El, LineCap, Shape, TextHighlight, TextStyle, Transition, canvas, col, el, text};
 
 use crate::DiagramStyle;
 use crate::hover::{Hover, Spot, Trace};
@@ -8,6 +8,12 @@ use crate::parts::{LabelKey, Mark, Names, Piece, pieces};
 
 /// The card's padding on each side.
 const CARD_PAD: f32 = 16.0;
+
+type Marks<'a> = Option<&'a dyn Fn(&str) -> Vec<TextHighlight>>;
+
+fn marked(el: El, key: &str, marks: Marks<'_>) -> El {
+    if let Some(paint) = marks { el.text_highlights(paint(key)) } else { el }
+}
 
 /// The widest a diagram's drawing can be for its card to fit `paint.max_width`.
 pub(crate) fn room(paint: &DiagramStyle) -> f32 {
@@ -248,17 +254,18 @@ impl Canvas {
         crate::ink::flatten(&mut self.ops, &mut self.traces, paint.surface);
         let b = self.drawn();
         // Store full-size drawing; Scene::el fits each destination before animating it.
-        // Labels scale without changing font metrics. Lines thin no further than 80%.
+        // Labels scale without changing font metrics. Lines scale with everything else, as an
+        // SVG's do: a floor here would be baked into the full-size drawing, so a diagram shrunk
+        // far to fit would draw fat lines once something magnifies it again.
         let pad = 1.0 / scale;
         let map = |p: [f32; 2]| [p[0] - b[0] + pad, p[1] - b[1] + pad];
-        let stroke = |w: f32| w * scale.max(0.8) / scale;
         let paint = |shape: Shape, op: &Op| match op {
             Op::Fill(points, color) => shape.fill(points.iter().map(|&p| map(p)).collect::<Vec<_>>(), *color),
             Op::Stroke { points, closed, width, cap, color } => {
-                shape.stroke_with(points.iter().map(|&p| map(p)).collect::<Vec<_>>(), *closed, stroke(*width), *cap, *color)
+                shape.stroke_with(points.iter().map(|&p| map(p)).collect::<Vec<_>>(), *closed, *width, *cap, *color)
             }
         };
-        let (pieces, label_keys) = pieces(&self, map, stroke);
+        let (pieces, label_keys) = pieces(&self, map);
         let hovers = self.hovers(map, paint);
         let labels = self.labels.into_iter().map(|l| Label { at: map(l.at), ..l }).collect();
         let full = [b[2] - b[0] + 2.0 * pad, b[3] - b[1] + 2.0 * pad];
@@ -314,6 +321,46 @@ impl Scene {
     /// new since the last build comes in on its own ([`crate::parts::Kind::enter`]); otherwise
     /// everything shows the frame it mounts.
     pub(crate) fn el(&self, paint: &DiagramStyle, streaming: bool) -> El {
+        let still = |t: Transition| if streaming { t } else { Transition::none() };
+        let mut card = col()
+            .w_full()
+            .items_center()
+            .padding(CARD_PAD)
+            .radius(6.0)
+            .fill(paint.surface)
+            .border(0.5, paint.surface_border)
+            .clip_rounded(6.0)
+            .animate_layout()
+            .transition(still(Transition::opacity()));
+        if self.size[0] > room(paint) + 0.5 {
+            // Shrunk as far as `min_scale` lets it and still too wide: its sides fade out under
+            // the card's padding rather than stopping at a hard edge.
+            card = card.clip_fade(CARD_PAD, 0.0, CARD_PAD, 0.0);
+        }
+        if let Some(title) = self.title_el(paint, streaming, None) {
+            card = card.gap(TITLE_GAP).child(title);
+        }
+        card.child(self.diagram_el(streaming, None))
+    }
+
+    /// The title and drawing without the card around them, and the size they take.
+    pub(crate) fn drawing(&self, paint: &DiagramStyle, marks: Marks<'_>) -> (El, [f32; 2]) {
+        let mut size = self.size;
+        let mut out = col().items_center();
+        if let Some(title) = self.title_el(paint, false, marks) {
+            let t = measure(self.title.as_deref().unwrap_or_default(), title_font(paint)).size;
+            size = [size[0].max(t[0] + 2.0), size[1] + t[1] + TITLE_GAP];
+            out = out.gap(TITLE_GAP).child(title);
+        }
+        (out.child(self.diagram_el(false, marks)), size)
+    }
+
+    fn title_el(&self, paint: &DiagramStyle, streaming: bool, marks: Marks<'_>) -> Option<El> {
+        let still = if streaming { Transition::opacity() } else { Transition::none() };
+        self.title.as_ref().map(|title| marked(text(title.clone()).key("title").font(title_font(paint)).color(paint.text).transition(still), "title", marks))
+    }
+
+    fn diagram_el(&self, streaming: bool, marks: Marks<'_>) -> El {
         let [w, h] = self.full;
         let still = |t: Transition| if streaming { t } else { Transition::none() };
         // Fit destinations before springing them. Multiplying a springing canvas size by a
@@ -332,7 +379,7 @@ impl Scene {
         // Labels and hover groups are placed by offset, as pieces are ([`Piece::el`]).
         for (l, (key, kind)) in self.labels.iter().zip(&self.label_keys) {
             let (enter, delay) = kind.map_or((Transition::opacity(), 0.0), |k| k.label_enter());
-            let mut t = label(l, l.color).absolute(0.0, 0.0).offset((l.at[0] - 1.0) * scale, l.at[1] * scale).origin(0.0, 0.0).scale(scale).key(key.clone()).transition(still(enter));
+            let mut t = marked(label(l, l.color), key, marks).absolute(0.0, 0.0).offset((l.at[0] - 1.0) * scale, l.at[1] * scale).origin(0.0, 0.0).scale(scale).key(key.clone()).transition(still(enter));
             if streaming && delay > 0.0 {
                 t = t.enter_delay(delay);
             }
@@ -354,33 +401,22 @@ impl Scene {
                 .child(canvas(s.lit.clone()).key("lit").absolute(0.0, 0.0).size(w, h).transition(Transition::none()));
             for &i in &s.labels {
                 if let Some(l) = self.labels.get(i) {
-                    glow = glow.child(label(l, self.lit).absolute(l.at[0] - 1.0, l.at[1]).key(format!("t{i}")).transition(Transition::none()));
+                    let t = marked(label(l, self.lit), &self.label_keys[i].0, marks);
+                    glow = glow.child(t.absolute(l.at[0] - 1.0, l.at[1]).key(format!("t{i}")).transition(Transition::none()));
                 }
             }
             let exit = if streaming { Transition { insertion: rune::Effect::IDENTITY, ..Transition::opacity() } } else { Transition::none() };
             body = body.child(el().key(s.key.clone()).absolute(0.0, 0.0).offset(r[0] * scale, r[1] * scale).size(r[2] * scale, r[3] * scale).hover_group().transition(exit).child(glow).a11y_hidden());
         }
-        let mut card = col()
-            .w_full()
-            .items_center()
-            .padding(CARD_PAD)
-            .radius(6.0)
-            .fill(paint.surface)
-            .border(0.5, paint.surface_border)
-            .clip_rounded(6.0)
-            .animate_layout()
-            .transition(still(Transition::opacity()));
-        if self.size[0] > room(paint) + 0.5 {
-            // Shrunk as far as `min_scale` lets it and still too wide: its sides fade out under
-            // the card's padding rather than stopping at a hard edge.
-            card = card.clip_fade(CARD_PAD, 0.0, CARD_PAD, 0.0);
-        }
-        if let Some(title) = &self.title {
-            let tf = TextStyle { size: paint.font.size + 1.0, line_height: paint.font.line_height + 2.0, weight: 600.0, ..paint.font };
-            card = card.gap(12.0).child(text(title.clone()).key("title").font(tf).color(paint.text).transition(still(Transition::opacity())));
-        }
-        card.child(el().key("diagram").size(self.size[0], self.size[1]).transition(still(Transition::opacity())).child(body))
+        el().key("diagram").size(self.size[0], self.size[1]).transition(still(Transition::opacity())).child(body)
     }
+}
+
+/// Points between a diagram's title and its drawing.
+const TITLE_GAP: f32 = 12.0;
+
+fn title_font(paint: &DiagramStyle) -> TextStyle {
+    TextStyle { size: paint.font.size + 1.0, line_height: paint.font.line_height + 2.0, weight: 600.0, ..paint.font }
 }
 
 pub(crate) fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {

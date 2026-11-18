@@ -17,20 +17,21 @@ impl<S: 'static> Runtime<S> {
         let focused = self.focus.path();
         let editing = || focused.and_then(|p| self.index_of(p)).is_some_and(|i| self.nodes[i].input.is_some());
         let (name, rank, path): (&'static str, u8, Option<&str>) = match action {
-            Action::Press(p, _) => ("on_press", 3, Some(p)),
+            Action::Press(p, ..) => ("on_press", 3, Some(p)),
             Action::DoublePress(p) => ("on_double_press", 3, Some(p)),
             Action::SecondaryPress(p, _) => ("on_secondary_press", 3, Some(p)),
-            Action::Link(p, _) => ("on_link", 3, Some(p)),
+            Action::MiddlePress(p) => ("on_middle_press", 3, Some(p)),
+            Action::Link(p, ..) => ("on_link", 3, Some(p)),
             Action::LinkSecondary(p, ..) => ("on_link_secondary", 3, Some(p)),
             Action::Dismiss(p) => ("dismiss", 3, Some(p)),
             Action::Key { .. } | Action::Physical(..) => (if editing() { "key_edit" } else { "key" }, 3, focused),
-            Action::Ime(_) => ("key_edit", 3, focused),
+            Action::Ime(_) | Action::FinishIme => ("key_edit", 3, focused),
             Action::Paste(..) => ("paste", 3, focused),
             Action::Files(_) => ("on_drop_files", 3, None),
             Action::DragStart(p) => ("on_drag_start", 2, Some(p)),
             Action::Drag(p, ..) | Action::DragRepeat(p, ..) => ("on_drag", 2, Some(p)),
             Action::DragEnd(p, _) => ("on_drag_end", 2, Some(p)),
-            Action::Wheel(_, chain, _) => ("on_wheel", 2, chain.first().map(String::as_str)),
+            Action::Wheel { chain, .. } => ("on_wheel", 2, chain.first().map(String::as_str)),
             Action::Gesture(chain, _) => ("gesture", 2, chain.first().map(String::as_str)),
             Action::Hover(p) => ("on_hover", 1, Some(p)),
             Action::HoverChange(p, _) => ("on_hover_change", 1, Some(p)),
@@ -121,7 +122,7 @@ impl<S: 'static> Runtime<S> {
                 arrived: timed.arrived, frame_start: timed.frame_start, built, submitted, present,
                 handler_ms: timed.handler_ms, phases, why: timed.why, commits: timed.commits, shaped,
                 nodes: self.nodes.len(), reused, rebuilt,
-                cpu_ms: timed.cpu.1, cause: cause.unwrap_or(interaction::Cause::Queued), stacks: timed.stacks,
+                cpu_ms: f.cpu_ms, cause: cause.unwrap_or(interaction::Cause::Queued), stacks: f.stacks,
             });
         }
         self.watch.interaction.reused.clear();

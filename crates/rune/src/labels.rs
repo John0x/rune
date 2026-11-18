@@ -7,6 +7,7 @@
 //! speaks it. The macOS menu bar takes the new names at the next [`AppHandle::set_menu`].
 //!
 //! [`AppHandle::set_menu`]: crate::AppHandle::set_menu
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Something Rune names on screen.
@@ -44,12 +45,15 @@ pub enum Label<'a> {
     HideOthers,
     ShowAll,
     Quit(&'a str),
+    /// A Markdown block's marker before `n` lines nested past the container bound.
+    MoreNestedLines(usize),
 }
 
 type Namer = Arc<dyn Fn(Label<'_>) -> Option<String> + Send + Sync>;
 
 static NAMER: RwLock<Option<Namer>> = RwLock::new(None);
 static LOCALE: RwLock<Option<String>> = RwLock::new(None);
+static RTL: AtomicBool = AtomicBool::new(false);
 
 /// Names Rune's own labels with `names`, for every window. `None` keeps a label's English.
 pub fn set_labels(names: impl Fn(Label<'_>) -> Option<String> + Send + Sync + 'static) {
@@ -67,8 +71,22 @@ pub fn set_locale(tag: &str) {
     }
 }
 
+/// The way the app's language reads, which Rune's native menus take, as a browser's menus take
+/// its interface language's: right to left, a Windows pop-up, window or tray menu lays out right
+/// to left (its checkmarks and submenu arrows on the left, shortcuts at the left edge) and opens
+/// leftward from its point or under its anchor's right edge, and a macOS pop-up menu's items
+/// align right. Left to right (`Ltr` or `Auto`) until the app says.
+pub fn set_direction(direction: crate::Direction) {
+    RTL.store(direction == crate::Direction::Rtl, Ordering::Relaxed);
+}
+
+/// Whether the app's language reads right to left ([`set_direction`]).
+pub(crate) fn rtl() -> bool {
+    RTL.load(Ordering::Relaxed)
+}
+
 /// What `label` reads now: the app's name for it, else Rune's English.
-pub(crate) fn label(label: Label<'_>) -> String {
+pub fn label(label: Label<'_>) -> String {
     named(label).unwrap_or_else(|| english(label))
 }
 
@@ -106,5 +124,7 @@ fn english(label: Label<'_>) -> String {
         Label::HideOthers => "Hide Others".into(),
         Label::ShowAll => "Show All".into(),
         Label::Quit(app) => format!("Quit {app}"),
+        Label::MoreNestedLines(1) => "1 more nested line".into(),
+        Label::MoreNestedLines(n) => format!("{n} more nested lines"),
     }
 }

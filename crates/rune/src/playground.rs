@@ -44,10 +44,11 @@ mod view;
 mod widths;
 
 pub(crate) use live::Live;
+use live::Showing;
 use folds::Folds;
 use widths::Widths;
 pub use open::slug;
-pub(crate) use region::Region;
+pub(crate) use region::{Keyboard, Moved, Region};
 pub(crate) use stage::call;
 pub use stage::{Play, Stage, Step};
 use stage::{SCROLL_MARGIN, Staged, Trigger, View, trigger, trigger_tx};
@@ -398,6 +399,9 @@ impl Default for Controls {
         Self { filter: Default::default(), sidebar_w: SIDEBAR, side_w: SIDE, save_widths: None }
     }
 }
+
+/// `attach`'s signature, for `App::attach_playground`.
+pub(crate) type Attach<S> = fn(&mut crate::Runtime<S>, Option<Playground<S>>, &crate::AppSpec<S>, Option<Option<String>>, Option<String>, bool);
 
 /// Shows `playground` in `rt`'s window when this run offers it: an enabled playground, in a
 /// window unless `RUNE_PLAYGROUND=0`, or wherever `--playground` asks for it, headless included,

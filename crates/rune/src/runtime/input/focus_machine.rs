@@ -25,7 +25,9 @@ pub(crate) enum Focus {
     /// taking focus, as a browser's sequential focus navigation starting point). `blurred` is
     /// the focus the gesture or commit underway took away: a scrim that blurs on pointer-down
     /// and closes its overlay on pointer-up still returns focus through `El::focus_return`.
-    None { from: Option<String>, blurred: Option<String> },
+    /// `handoff` is whether that focus may go to a neighbour once its element leaves the tree
+    /// (the user's Escape or a press): `Tx::blur` says nothing has focus, so it hands nothing on.
+    None { from: Option<String>, blurred: Option<String>, handoff: bool },
     /// `path` has focus. `hovered`: the pointer lit it as a `focus_highlight` row, so its
     /// highlight shows without a key. `from`: a press on content that takes no focus queued a
     /// blur, and Tab starts there once it lands.
@@ -33,7 +35,7 @@ pub(crate) enum Focus {
 }
 
 impl Default for Focus {
-    fn default() -> Self { Self::None { from: None, blurred: None } }
+    fn default() -> Self { Self::None { from: None, blurred: None, handoff: false } }
 }
 
 pub(crate) enum FocusEvent {
@@ -47,6 +49,9 @@ pub(crate) enum FocusEvent {
     Pointed,
     /// A press on content that takes no focus: Tab goes on from there.
     StartAt(String),
+    /// `Tx::blur`: the app dropped focus itself, so nothing hands the keyboard on when the
+    /// element it left goes too, unlike Escape or a press that blurred it.
+    Dropped,
     /// A commit settled with no press held, or `Tx::blur`: a blur it carried is final.
     Settled,
 }
@@ -63,7 +68,13 @@ pub(crate) enum FocusEffect {
 pub(crate) struct FocusState {
     pub(crate) focus: Focus,
     pub(crate) modality: Modality,
+    /// Per landmark (by path), the element focused last inside it, most recent first: where F6
+    /// lands when it comes back to that pane.
+    scopes: Vec<(String, String)>,
 }
+
+/// How many panes F6 remembers a focus for.
+const SCOPES: usize = 16;
 
 impl FocusState {
     pub(crate) fn path(&self) -> Option<&str> {
@@ -85,6 +96,19 @@ impl FocusState {
     /// Focus shows, by the keyboard or the pointer's light on a row.
     pub(crate) fn shown(&self) -> bool { self.keyboard() || self.hovered() }
 
+    /// Notes that `path` has focus inside landmark `scope`.
+    pub(crate) fn remember_scope(&mut self, scope: String, path: String) {
+        if self.scopes.first().is_some_and(|(s, p)| *s == scope && *p == path) { return; }
+        self.scopes.retain(|(s, _)| *s != scope);
+        self.scopes.insert(0, (scope, path));
+        self.scopes.truncate(SCOPES);
+    }
+
+    /// The element focused last inside landmark `scope`.
+    pub(crate) fn scope_memory(&self, scope: &str) -> Option<&str> {
+        self.scopes.iter().find(|(s, _)| s == scope).map(|(_, p)| p.as_str())
+    }
+
     /// Where Tab starts while nothing is focused.
     pub(crate) fn tab_start(&self) -> Option<&str> {
         match &self.focus {
@@ -101,6 +125,11 @@ impl FocusState {
         }
     }
 
+    /// Whether focus the element lost may move to a neighbour once it leaves the tree.
+    pub(crate) fn handoff(&self) -> bool {
+        matches!(self.focus, Focus::None { handoff: true, .. })
+    }
+
     pub(crate) fn step(&mut self, event: FocusEvent) -> Effects<FocusEffect> {
         match event {
             FocusEvent::Set { path, keyboard } => {
@@ -109,7 +138,7 @@ impl FocusState {
                 self.focus = match (std::mem::take(&mut self.focus), path) {
                     (Focus::On { path: old, hovered, .. }, Some(path)) if old == path => Focus::On { path, hovered, from: None },
                     (_, Some(path)) => Focus::On { path, hovered: false, from: None },
-                    (Focus::On { path: old, from, .. }, None) => Focus::None { from: from.or_else(|| Some(old.clone())), blurred: Some(old) },
+                    (Focus::On { path: old, from, .. }, None) => Focus::None { from: from.or_else(|| Some(old.clone())), blurred: Some(old), handoff: true },
                     (none @ Focus::None { .. }, None) => none,
                 };
                 if moved { Effects::one(FocusEffect::Moved) } else { Effects::none() }
@@ -132,6 +161,10 @@ impl FocusState {
                 }
                 Effects::none()
             }
+            FocusEvent::Dropped => {
+                if let Focus::None { handoff, .. } = &mut self.focus { *handoff = false; }
+                Effects::none()
+            }
             FocusEvent::Settled => {
                 if let Focus::None { blurred, .. } = &mut self.focus { *blurred = None; }
                 Effects::none()
@@ -143,7 +176,7 @@ impl FocusState {
     /// moves, and [`Self::put_back`] restores it if nothing took focus meanwhile.
     pub(crate) fn set_aside(&mut self) -> Option<Focus> {
         let Focus::On { path, from, .. } = &self.focus else { return None };
-        let rest = Focus::None { from: from.clone(), blurred: Some(path.clone()) };
+        let rest = Focus::None { from: from.clone(), blurred: Some(path.clone()), handoff: false };
         Some(std::mem::replace(&mut self.focus, rest))
     }
 

@@ -14,7 +14,7 @@ impl<S: 'static> Runtime<S> {
     /// drag a Move from where the pointer now is over the content. Whether it scrolled.
     pub(super) fn step_drag_autoscroll(&mut self, dt: f32) -> bool {
         let (Some(path), Some((x, y))) = (self.press.path().map(str::to_owned), self.pointer) else { return false };
-        if dt <= 0.0 || self.input_click.captured {
+        if dt <= 0.0 || self.input_click.captured() {
             return false;
         }
         let Some(i) = self.nodes.iter().position(|n| &n.path == path.as_str() && n.handlers.get().is_some_and(|h| h.drag_autoscroll && h.on_drag.is_some())) else {
@@ -41,7 +41,7 @@ impl<S: 'static> Runtime<S> {
         let Some(st) = self.scrolls.get_mut(&self.nodes[v].id) else { return false };
         let before = st.offset;
         st.offset = (st.offset + f64::from(speed * dt)).clamp(0.0, st.max);
-        st.mode = ScrollMode::Rest;
+        st.mode = st.mode.to_rest();
         if st.offset == before {
             return false;
         }

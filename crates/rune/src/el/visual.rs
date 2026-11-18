@@ -52,6 +52,8 @@ pub struct VisualCold {
     pub outline: Option<Outline>,
     /// Vector strokes and fills in the element's own points, over the fill.
     pub shape: Option<Rc<Shape>>,
+    /// A terminal's cell grid (`grid`), painted over the fill.
+    pub(crate) grid: Option<Rc<crate::el::grid::Grid>>,
     /// An RGBA image scaled into the element's rect, over the fill and shape.
     pub pixels: Option<crate::pixels::Pixels>,
     /// How `pixels` keeps its aspect ratio; `None` stretches it to the rect.
@@ -73,8 +75,6 @@ pub struct VisualCold {
     pub hover_alone: bool,
     /// `El::hover_group_shared`: the key of the elements whose hover this group shares.
     pub(crate) hover_share: Option<Rc<str>>,
-    /// `El::hover_group_focus`: keyboard focus on it or inside it hovers it too.
-    pub(crate) hover_focus: bool,
     /// `El::icon_rotation`: the icon's turn in radians, clockwise.
     pub(crate) icon_turn: f32,
     /// Optional app-supplied key mixed into the cached subtree's signature (`El::cache_key`).
@@ -102,6 +102,13 @@ pub struct VisualCold {
     pub(crate) flight_crop: bool,
     /// `El::hold_landing_width`: an animated width change lands its contents and slides them.
     pub(crate) hold_landing: bool,
+    pub(crate) row_face: Option<&'static str>,
+    /// `El::press_color`: its text and icons' colour while a press on it is held.
+    pub(crate) press_color: Option<Color>,
+    /// `El::paint_contained`: the origin (window points) its children snap against.
+    pub(crate) paint_contain: Option<[f32; 2]>,
+    /// `El::motion_snaps`: while it moves, it and its subtree snap every frame.
+    pub(crate) motion_snaps: bool,
     /// `El::offset`: a visual shift in points.
     pub(crate) offset: [f32; 2],
     /// Static alpha of this element's own paint; never inherited or isolated.
@@ -141,6 +148,7 @@ impl Empty for VisualCold {
         radial: None,
         outline: None,
         shape: None,
+        grid: None,
         pixels: None,
         pixels_fit: None,
         effect: None,
@@ -150,7 +158,6 @@ impl Empty for VisualCold {
         group_opacity: None,
         group_color: None,
         hover_alone: false,
-        hover_focus: false,
         hover_share: None,
         icon_turn: 0.0,
         cache_key: None,
@@ -165,6 +172,10 @@ impl Empty for VisualCold {
         clip_to_content: false,
         flight_crop: false,
         hold_landing: false,
+        row_face: None,
+        press_color: None,
+        paint_contain: None,
+        motion_snaps: false,
         offset: [0.0; 2],
         paint_alpha: 1.0,
         layer_opacity: 1.0,
@@ -353,4 +364,11 @@ impl VisualFlags {
     pub(crate) fn no_pixel_snap(self) -> bool { self.0 & Self::NO_PIXEL_SNAP != 0 }
     #[inline(always)]
     pub(crate) fn ride_trailing(self) -> bool { self.0 & Self::RIDE_TRAILING != 0 }
+}
+
+impl Visual {
+    /// Whether a press on it shows (an `El::press` overlay or an `El::press_color`).
+    pub(crate) fn tracks_press(&self) -> bool {
+        self.press().a > 0.0 || self.cold.get().is_some_and(|c| c.press_color.is_some())
+    }
 }

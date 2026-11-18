@@ -145,6 +145,7 @@ fn name_field(e: El, label: Option<&str>, placeholder: &str, description: Option
 pub struct TextInput {
     edit: TextEdit,
     label: Option<String>,
+    description: Option<String>,
     placeholder: String,
     large: bool,
     style: Option<TextStyle>,
@@ -182,6 +183,13 @@ impl TextInput {
         self.edits.handlers.push(Box::new(El::animate_edit_layout));
         self
     }
+    /// The value's direction (`El::dir`): `Direction::Auto` takes it from the text's first strong
+    /// character, as `dir="auto"` on an `input` does, so a name in Arabic starts at the right in
+    /// a left-to-right window. Defaults to the window's.
+    pub fn dir(mut self, dir: rune::Direction) -> Self {
+        self.edits.visual(move |e| e.dir(dir));
+        self
+    }
     pub fn on_change<S: 'static>(mut self, f: impl Fn(&mut S, &mut Tx) + 'static) -> Self {
         self.edits.change(f);
         self
@@ -194,6 +202,7 @@ impl TextInput {
         TextInput {
             edit: edit.clone(),
             label: None,
+            description: None,
             placeholder: String::new(),
             large: false,
             style: None,
@@ -225,6 +234,11 @@ impl TextInput {
     /// `appearance="large"`: 32 points tall.
     pub fn large(mut self) -> Self {
         self.large = true;
+        self
+    }
+    /// Help or a validation error for the inner editor, separate from its name.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
         self
     }
     /// The text's type, in place of `ui_compact` (13 / 16): typed text, placeholder, caret and
@@ -335,7 +349,7 @@ impl TextInput {
             .rich_style(kit_rich_style(k))
             .placeholder(self.placeholder.clone(), hint)
             .caret(ink, k.selection());
-        let mut field = name_field(field, self.label.as_deref(), &self.placeholder, None, disabled).invalid(self.invalid);
+        let mut field = name_field(field, self.label.as_deref(), &self.placeholder, self.description.as_deref(), disabled).invalid(self.invalid);
         if let Some(key) = self.active.clone() {
             field = field.active_descendant(key);
         }

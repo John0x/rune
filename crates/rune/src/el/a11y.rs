@@ -2,6 +2,7 @@
 //! state, live updates and its place in a set. Screen readers, Voice Control and automation
 //! tools read it through the OS accessibility tree (`crate::a11y`).
 
+use std::borrow::Cow;
 use crate::El;
 
 /// How assistive technology announces changes to an element's text ([`El::live_region`]), as ARIA's
@@ -37,7 +38,7 @@ pub(crate) struct Range {
 /// The rarer accessibility properties, boxed so an element without them stays small.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct A11yMore {
-    pub description: Option<String>,
+    pub description: Option<Cow<'static, str>>,
     pub value: Option<String>,
     pub range: Option<Range>,
     /// 1-based position and the set's size.
@@ -51,6 +52,12 @@ pub(crate) struct A11yMore {
     pub sorted: Option<bool>,
     /// `El::href`: the URL this element links to.
     pub href: Option<String>,
+    /// `El::labelled_by`'s key.
+    pub labelled_by: Option<Cow<'static, str>>,
+    /// `El::described_by`'s key.
+    pub described_by: Option<Cow<'static, str>>,
+    /// `El::busy`.
+    pub busy: bool,
 }
 
 /// Accessibility state beyond role and label (`El::level`, `El::expanded`, `El::secure`, and
@@ -63,13 +70,16 @@ pub(crate) struct A11y {
     pub checked: Option<Checked>,
     pub disabled: bool,
     pub hidden: bool,
+    /// `El::unselectable`: a web page's mirror leaves this subtree's text out of the selection.
+    pub unselectable: bool,
     pub live: Option<LiveRegion>,
     pub more: Option<Box<A11yMore>>,
 }
 
 impl A11y {
     pub(crate) const EMPTY: A11y = A11y {
-        level: None, expanded: None, secure: false, checked: None, disabled: false, hidden: false, live: None, more: None,
+        level: None, expanded: None, secure: false, checked: None, disabled: false, hidden: false, unselectable: false,
+        live: None, more: None,
     };
 
     fn more(&mut self) -> &mut A11yMore {
@@ -103,14 +113,47 @@ impl El {
     /// setting does, or the shortcut a button has. The label stays short. Without one, an
     /// [`El::help`] tooltip describes the element; `description("")` turns that off.
     pub fn description(mut self, text: impl Into<String>) -> Self {
-        self.cold_mut().a11y.more().description = Some(text.into());
+        self.cold_mut().a11y.more().description = Some(Cow::Owned(text.into()));
+        self
+    }
+    /// [`El::description`] from a string that lives for the program (a translated message, a
+    /// literal): kept as it is, with nothing copied, so a view that runs every frame pays
+    /// nothing for it.
+    pub fn description_static(mut self, text: &'static str) -> Self {
+        self.cold_mut().a11y.more().description = Some(Cow::Borrowed(text));
         self
     }
     /// The element whose content is active while this one keeps keyboard focus (ARIA
     /// `aria-activedescendant`): the highlighted row of a tree, table or suggestion list whose
-    /// container or search field holds focus. `key` names it as `Cx::layout` does.
+    /// container or search field holds focus. `key` names it as `Cx::layout` does; an empty
+    /// one names none, and costs nothing.
     pub fn active_descendant(mut self, key: impl Into<String>) -> Self {
-        self.cold_mut().a11y.more().active = Some(key.into());
+        let key = key.into();
+        if key.is_empty() {
+            return self;
+        }
+        self.cold_mut().a11y.more().active = Some(key);
+        self
+    }
+    /// The element whose text names this one (ARIA `aria-labelledby`): a setting's title for
+    /// its switch, a dialog's heading for the dialog. `key` names it as `Cx::layout` does, and the
+    /// nearest element with that key counts: the first inside this one's parent, else inside its
+    /// grandparent, and so on, so a component's controls can all name their own `"title"`. A label
+    /// set with [`El::label`] wins.
+    pub fn labelled_by(mut self, key: impl Into<String>) -> Self {
+        self.cold_mut().a11y.more().labelled_by = Some(Cow::Owned(key.into()));
+        self
+    }
+    /// The element whose text describes this one (ARIA `aria-describedby`): a setting's
+    /// explanation for its switch, a dialog's message for the dialog.
+    pub fn described_by(mut self, key: impl Into<String>) -> Self {
+        self.cold_mut().a11y.more().described_by = Some(Cow::Owned(key.into()));
+        self
+    }
+    /// The element is still changing and a reader should wait for it to settle (ARIA
+    /// `aria-busy`): a turn while the reply streams, a tool call while it runs.
+    pub fn busy(mut self, busy: bool) -> Self {
+        if busy || self.cold.a11y.more.is_some() { self.cold_mut().a11y.more().busy = busy; }
         self
     }
     /// Whether the value entered here fails validation (ARIA `aria-invalid`).
@@ -179,6 +222,16 @@ impl El {
         self.cold_mut().a11y.hidden = true;
         self
     }
+    /// Keep the text in this element and everything inside it out of a web page's selection
+    /// (CSS `user-select: none`). A page ([`App::web_document`](crate::App::web_document)) lets
+    /// people select and copy its text as any web page does, except text inside something that
+    /// takes the pointer: a press, drag or gesture handler, a button, link or field. Use this
+    /// for other text that shouldn't select, such as a wordmark drawn as text.
+    /// [`El::selectable`] text inside still selects. Outside a web page it changes nothing.
+    pub fn unselectable(mut self) -> Self {
+        self.cold_mut().a11y.unselectable = true;
+        self
+    }
     /// How changes to this element's text are announced (ARIA `aria-live`), for status text
     /// that updates while the user does something else.
     pub fn live_region(mut self, live: LiveRegion) -> Self {
@@ -196,6 +249,57 @@ impl El {
     /// (`"Ctrl+S"`, `"⌘S"`), for assistive technology to read.
     pub fn shortcut_hint(mut self, keys: impl Into<String>) -> Self {
         self.cold_mut().a11y.more().shortcut = Some(keys.into());
+        self
+    }
+}
+
+impl El {
+    /// The element's accessible role. `"textbox"` on a container also makes a press anywhere
+    /// on it (padding, a leading icon, a trailing label) focus its one reachable text editor and
+    /// place the caret at the nearer end, without blurring a focused field or dragging the
+    /// window; buttons and other controls inside keep their own presses. With zero or more
+    /// than one reachable editor inside, the container does nothing special.
+    #[inline]
+    pub fn role(mut self, role: &'static str) -> Self {
+        self.set_role(role);
+        self
+    }
+    /// [`El::role`] in place.
+    #[inline]
+    pub fn set_role(&mut self, role: &'static str) -> &mut Self {
+        self.set_role_name(role);
+        self
+    }
+    #[inline]
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.set_label(label);
+        self
+    }
+    /// [`El::label`] from a string that lives for the program (a translated message, a
+    /// literal): kept as it is, with nothing copied, so a view that runs every frame pays
+    /// nothing for its names.
+    #[inline]
+    pub fn label_static(mut self, label: &'static str) -> Self {
+        self.cold_mut().label = Some(Cow::Borrowed(label));
+        self
+    }
+    /// [`El::label`] in place.
+    #[inline]
+    pub fn set_label(&mut self, label: impl Into<String>) -> &mut Self {
+        self.cold_mut().label = Some(Cow::Owned(label.into()));
+        self
+    }
+    /// An outline row's depth for accessibility, 1 at the top (ARIA `aria-level`), as a
+    /// `treeitem` carries it. The element tree reports it as `level`.
+    pub fn level(mut self, level: u32) -> Self {
+        self.cold_mut().a11y.level = Some(level);
+        self
+    }
+    /// Whether a disclosure (a tree row with children, a collapsible header) is open, for
+    /// accessibility (ARIA `aria-expanded`). Leave it unset on an element that can't open.
+    /// The element tree reports it as `expanded`.
+    pub fn expanded(mut self, open: bool) -> Self {
+        self.cold_mut().a11y.expanded = Some(open);
         self
     }
 }

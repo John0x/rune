@@ -125,6 +125,11 @@ export function nextTask() {
     return globalThis.scheduler?.yield ? globalThis.scheduler.yield() : new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+// Resolves in the page's next idle time, or after `timeout` ms at the latest.
+export function nextIdle(timeout) {
+    return new Promise((resolve) => globalThis.requestIdleCallback ? requestIdleCallback(() => resolve(), { timeout }) : setTimeout(resolve, timeout));
+}
+
 export async function fetchBytes(url) {
     const response = await fetch(new URL(url, document.baseURI));
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -158,6 +163,25 @@ export function viewport(canvas, callback, embedded) {
     };
     const motion = matchMedia('(prefers-reduced-motion: reduce)');
     const reduced = () => callback(JSON.stringify({ kind: 'motion', reduced: motion.matches }));
+    // A primary pointer that can't hover (a touch screen): `Cx::hover_none`.
+    const hoverNone = matchMedia('(hover: none)');
+    const coarse = matchMedia('(pointer: coarse)');
+    const pointer = () => callback(JSON.stringify({ kind: 'primary_pointer', hover: !hoverNone.matches, coarse: coarse.matches }));
+    // A contrast theme (Windows' Contrast themes): `forced-colors`, and its system colours read
+    // off a probe, as sRGB bytes, for `Cx::system_contrast`.
+    const forced = matchMedia('(forced-colors: active)');
+    const contrast = () => {
+        if (!forced.matches) { callback(JSON.stringify({ kind: 'contrast', colors: null })); return; }
+        const swatch = document.createElement('span');
+        swatch.style.cssText = 'position:fixed;visibility:hidden;forced-color-adjust:none';
+        document.body.append(swatch);
+        const colors = ['Canvas', 'CanvasText', 'Highlight', 'HighlightText', 'GrayText', 'ButtonFace', 'ButtonText', 'LinkText'].map((name) => {
+            swatch.style.color = name;
+            return (getComputedStyle(swatch).color.match(/\d+(\.\d+)?/g) ?? ['0', '0', '0']).slice(0, 3).map(Number);
+        });
+        swatch.remove();
+        callback(JSON.stringify({ kind: 'contrast', colors }));
+    };
     const focus = () => callback(JSON.stringify({ kind: 'focus', focused: document.hasFocus() }));
     const visibility = () => callback(JSON.stringify({ kind: 'visibility', visible: !document.hidden }));
     let dprMedia = null;
@@ -174,22 +198,41 @@ export function viewport(canvas, callback, embedded) {
     window.visualViewport?.addEventListener('resize', update);
     window.visualViewport?.addEventListener('scroll', update);
     window.addEventListener('resize', update);
+    // The safe area can change with no resize (Safari settles nv() after a rotation's resize;
+    // a Home Screen app's status bar): the probe's padding is the insets, so its border box follows
+    // them (its content box is always empty, which is what an observer watches by default).
+    const insets = new ResizeObserver(update);
+    insets.observe(probe, { box: 'border-box' });
     motion.addEventListener('change', reduced);
+    hoverNone.addEventListener('change', pointer);
+    coarse.addEventListener('change', pointer);
+    forced.addEventListener('change', contrast);
     window.addEventListener('focus', focus);
     window.addEventListener('blur', focus);
     document.addEventListener('visibilitychange', visibility);
     // Mount is called while Rust is installing the shell; enter it only after installation.
-    queueMicrotask(() => { update(); reduced(); focus(); visibility(); });
+    queueMicrotask(() => { update(); reduced(); pointer(); contrast(); focus(); visibility(); });
     return () => {
         dprMedia?.removeEventListener('change', onDpr);
         window.visualViewport?.removeEventListener('resize', update);
         window.visualViewport?.removeEventListener('scroll', update);
         window.removeEventListener('resize', update);
+        insets.disconnect();
         motion.removeEventListener('change', reduced);
+        hoverNone.removeEventListener('change', pointer);
+        coarse.removeEventListener('change', pointer);
+        forced.removeEventListener('change', contrast);
         window.removeEventListener('focus', focus);
         window.removeEventListener('blur', focus);
         document.removeEventListener('visibilitychange', visibility);
         probe.remove();
         largest.remove();
     };
+}
+
+// One face of an app font as the page's own, so the semantic mirror's text sets in it.
+export function addFontFace(family, bytes, weight, style) {
+    const face = new FontFace(family, bytes.slice(), { weight, style });
+    document.fonts.add(face);
+    face.load().catch(() => {});
 }

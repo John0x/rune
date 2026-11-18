@@ -6,8 +6,11 @@ impl<S: 'static> Runtime<S> {
     /// input's handler, focus traversal and the focused editor, in that order.
     pub(super) fn route_key(&mut self, ev: &KeyEvent, repeat: bool, one: &mut Tx) -> bool {
         let physical_key = one.physical_key;
+        one.by_keys = true;
         one.focused = self.focused_key();
         if matches!(ev.key, crate::Key::Modifier { .. }) { return !repeat && self.route_modifier(ev, one); }
+        // Any other key while Ctrl and Shift are down makes them a shortcut, not a direction.
+        self.disarm_direction_chord();
         one.key_repeat = repeat;
         let shown = self.focus.keyboard() || self.focus.hovered();
         if focus::navigates(ev) { self.focus.step(focus_machine::FocusEvent::Navigated); }
@@ -44,7 +47,7 @@ impl<S: 'static> Runtime<S> {
             })
         {
             let layout = self.focused_layout();
-            if self.with_focused(|e| e.key(ev, layout.as_deref()), one) {
+            if self.with_focused(|e| e.key_in(ev, layout.as_ref().map(TextLayout::view)), one) {
                 return true;
             }
         }
@@ -71,7 +74,7 @@ impl<S: 'static> Runtime<S> {
                 if copies && e.is_rich() && !e.is_secure() {
                     html = Some(e.selected_html()).filter(|h| !h.is_empty());
                 }
-                e.key(ev, layout.as_deref())
+                e.key_in(ev, layout.as_ref().map(TextLayout::view))
             }, one);
             if let Some(html) = html
                 && let Some(text) = one.copy.as_ref().filter(|w| !w.is_secret()).map(|w| w.content().text().to_owned())
@@ -112,12 +115,14 @@ impl<S: 'static> Runtime<S> {
     /// another view paged there routes the key itself with `Tx::scroll_page`.
     pub(super) fn page_scroll(&mut self, ev: &KeyEvent) -> bool {
         use crate::Key::*;
-        if !matches!(ev.key, PageUp | PageDown | Home | End) || ev.mods.cmd || ev.mods.alt || ev.mods.ctrl { return false; }
+        if ev.mods.cmd || ev.mods.alt || ev.mods.ctrl { return false; }
         // A focused field in a virtual row that scrolled out has no node: page its list.
         let focused = self.focus.path().and_then(|path| {
             std::iter::successors(Some(path), |p| p.rsplit_once('/').map(|(head, _)| head))
                 .find_map(|p| self.nodes.iter().position(|n| n.path == p))
         });
+        if let Some(f) = focused && self.focus.is(&self.nodes[f].path) && self.pageable(f) && self.scroller_key(f, ev) { return true; }
+        if !matches!(ev.key, PageUp | PageDown | Home | End) { return false; }
         // A step's key (`Play::press`) pages only the stage, never the playground around it.
         let staged = self.playground.as_ref().is_some_and(|p| p.pressing);
         let pageable = |i: usize| self.pageable(i) && (!staged || self.under(i, crate::playground::is_stage));
@@ -129,6 +134,30 @@ impl<S: 'static> Runtime<S> {
         if !self.page_to(i, |offset, max, page| match ev.key { PageUp => offset - page, PageDown => offset + page, Home => 0.0, _ => max }) { return false; }
         log_event!(self, "page {:?}", ev.key);
         true
+    }
+
+    /// Up and Down by a line of 40 points, and Space (Shift+Space back) by a page, on a scroll
+    /// view that has focus itself, as a browser scrolls a focused scroller (`tabindex` on an
+    /// `overflow: auto` region) when nothing in it took the key.
+    fn scroller_key(&mut self, i: usize, ev: &KeyEvent) -> bool {
+        use crate::Key::*;
+        const LINE: f64 = 40.0;
+        let space = ev.key == Text(" ".into());
+        if ev.mods.shift && !space { return false; }
+        let moved = match ev.key {
+            Up => self.page_to(i, |offset, _, _| offset - LINE),
+            Down => self.page_to(i, |offset, _, _| offset + LINE),
+            _ if space && ev.mods.shift => self.page_to(i, |offset, _, page| offset - page),
+            _ if space => self.page_to(i, |offset, _, page| offset + page),
+            _ => return false,
+        };
+        if moved { log_event!(self, "scroll {:?}", ev.key); }
+        moved
+    }
+
+    /// A focused scroll view that presses nothing passes Space on to scroll itself.
+    pub(super) fn scrolls_on_space(&self, i: usize) -> bool {
+        self.nodes[i].handlers.on_press.is_none() && self.pageable(i)
     }
 
     /// Whether node `i` is a live scroll view whose content overflows it.
@@ -146,18 +175,23 @@ impl<S: 'static> Runtime<S> {
         let (id, page, stick) = (self.nodes[i].id, f64::from(self.nodes[i].local.h * 0.9), self.nodes[i].scroll.is_some_and(|s| s.stick_bottom));
         let Some(st) = self.scrolls.get_mut(&id) else { return false };
         st.offset = to(st.offset, st.max, page).clamp(0.0, st.max);
-        st.direct = true;
+        st.moved();
         st.land(stick);
         true
     }
 
-    pub(super) fn focused_layout(&mut self) -> Option<Rc<Layout<Ink>>> {
+    pub(super) fn focused_layout(&mut self) -> Option<TextLayout> {
         let path = self.focus.owned()?;
         let s = self.env.scale;
         let n = self.node(&path)?;
+        // The field shows its edit's display text: the layout it drew is that text's. A secret
+        // draws its mask, so the keys move through a layout of what it holds.
+        if let Some(l) = n.text_layout.clone().filter(|_| n.text.as_ref().is_some_and(|t| !t.redacted)) {
+            return Some(l);
+        }
         let (mut spec, w) = (n.text.clone()?, n.target[2] - n.target[0] - n.inset[0] - n.inset[2]);
         spec.replace_content(n.input.as_ref()?.edit.display().0);
-        Some(self.text.layout_for_spec(&spec, s, spec.wrap.then_some(w * s), line_alignment(&spec)))
+        Some(TextLayout::Single(self.text.layout_for_spec(&spec, s, spec.wrap.then_some(w * s), line_alignment(&spec))))
     }
 
     pub(super) fn with_focused(&mut self, f: impl FnOnce(&mut crate::edit::TextEdit) -> EditOutcome, tx: &mut Tx) -> bool {
@@ -185,7 +219,7 @@ impl<S: 'static> Runtime<S> {
         // Submit and Escape's blur act once per press; held keys still type, move and delete.
         if tx.key_repeat { out.submit = false; out.blur = false; }
         // Typing is the user's own hand: no animation.
-        tx.instant = !animate_layout;
+        tx.commit = tx.commit.snap(!animate_layout);
         self.caret_follow = true;
         if let Some(change) = change
             && before.as_ref().map(|s| s.as_str()) != Some(access(states!(self)).text.as_str())
@@ -203,7 +237,7 @@ impl<S: 'static> Runtime<S> {
             && let Some(sub) = submit
         {
             log_event!(self, "submit {path}");
-            tx.instant = false;
+            tx.commit = tx.commit.animated();
             sub(states!(self), tx);
         } else if out.submit {
             // A field with nothing to submit passes Return to the default button, as in a sheet.
@@ -264,6 +298,8 @@ impl<S: 'static> Runtime<S> {
     /// [`Runtime::key`]; `stage` routes it to the open playground's stage, for `Play::press`.
     pub(super) fn queue_key(&mut self, ev: KeyEvent, stage: bool) {
         self.dismiss_help();
+        // A key ends a middle-click autoscroll, and does nothing else.
+        if self.autoscroll_key() { return; }
         // Escape during a drag cancels it and goes no further.
         if ev.key == crate::Key::Escape && self.cancel_drag() { return; }
         self.queue.push(Action::Key { ev, repeat: false, stage });
@@ -279,9 +315,12 @@ impl<S: 'static> Runtime<S> {
         self.queue.push(Action::Ime(ev));
     }
 
-    /// End native composition on window deactivation without discarding text or field focus.
-    pub fn cancel_composition(&mut self) {
-        self.ime(Ime::Preedit(String::new(), None));
+    /// The window went inactive mid-composition: what the composition shows becomes text, in
+    /// event order, as a browser keeps it, and the field keeps focus. The platform's input
+    /// method is told to drop its own copy (`ime_reset`), so it doesn't come back in the next
+    /// field.
+    pub fn finish_composition(&mut self) {
+        self.queue.push(Action::FinishIme);
         self.ime_reset = true;
     }
 
@@ -324,6 +363,16 @@ impl<S: 'static> Runtime<S> {
     }
     pub(crate) fn read_result(&mut self, id: u64, content: crate::ClipboardContent) {
         self.queue.push(Action::ClipboardRead(id, content));
+    }
+
+    /// The focused field's text around its selection, for the platform's input method.
+    pub(crate) fn ime_text(&self) -> Option<crate::edit::ImeText> {
+        self.focused_input().and_then(|i| i.edit.ime_text())
+    }
+
+    /// The focused field's open composition and its cursor range, for a script's tree.
+    pub(crate) fn focused_preedit(&self) -> Option<(&str, Option<(usize, usize)>)> {
+        self.focused_input().filter(|i| !i.edit.is_secure()).and_then(|i| i.edit.preedit())
     }
 
     /// Whether the focused editor requires secure native keyboard input.

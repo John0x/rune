@@ -1,7 +1,7 @@
 use super::*;
 
 fn meta() -> Meta {
-    Meta { duration: 1.0, size: Some((64, 36)), frame: 0.25 }
+    Meta { duration: 1.0, size: Some((64, 36)), frame: 0.25, sound: false }
 }
 
 #[test]
@@ -52,6 +52,8 @@ fn extensions_come_from_the_last_path_segment() {
     assert_eq!(ext("sounds/clip."), None);
 }
 
+/// Windows reads WebM and Ogg when the system has their extensions, so it finds out on open.
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn webm_video_fails_at_once() {
     let a = Player::url("https://example.com/clips/tap.webm?v=2");
@@ -64,9 +66,29 @@ fn webm_video_fails_at_once() {
     assert!(!a.is_playing(), "a failed clip doesn't play");
 }
 
+/// An audio clip no backend has seen, so nothing has changed before the test starts.
+fn bare_audio() -> Arc<Shared> {
+    Arc::new(Shared {
+        source: MediaSource::from("missing.m4a"),
+        headers: Vec::new(),
+        kind: Kind::Audio,
+        ctl: Mutex::new(Control { muted: false, kind: Kind::Audio, ..Control::default() }),
+        wakes: Mutex::new(Vec::new()),
+        waker: WakerSlot::default(),
+        notified: AtomicU64::new(0),
+        native: Mutex::new(backend::Native::default()),
+        backend: &BACKEND,
+    })
+}
+
+fn quiet_audio() -> Player {
+    let shared = bare_audio();
+    Player { surface: NativeSurface::with_video(shared.clone()), shared }
+}
+
 #[test]
 fn the_waker_hears_each_state_change_once() {
-    let a = Player::audio("missing.m4a");
+    let a = quiet_audio();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = calls.clone();
     a.set_waker(Arc::new(move || {
@@ -74,7 +96,7 @@ fn the_waker_hears_each_state_change_once() {
     }));
     a.shared.settle(false);
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0, "nothing changed yet");
-    a.shared.ctl.lock().unwrap().open(Ok(Meta { duration: 2.0, size: None, frame: 1.0 / 30.0 }));
+    a.shared.ctl.lock().unwrap().open(Ok(Meta { duration: 2.0, size: None, frame: 1.0 / 30.0, sound: false }));
     a.shared.settle(false);
     a.shared.settle(false);
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -85,6 +107,7 @@ fn the_waker_hears_each_state_change_once() {
 
 /// An unsupported format fails inside the constructor, before any waker can be set: setting
 /// one afterwards still delivers that failure, once.
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn a_waker_set_after_a_failure_hears_it_once() {
     let a = Player::url("tap.ogv");
@@ -109,11 +132,16 @@ fn a_seek_before_the_clip_opens_is_clamped_when_it_does() {
     assert_eq!((c.seek, c.time), (Some(1.0), 1.0));
 }
 
+/// The parked list is process-wide: these tests take turns so each sees only its own clips.
+#[cfg(target_os = "macos")]
+static PARKED_TESTS: Mutex<()> = Mutex::new(());
+
 /// `play()` on a parked clip only unparks it on its next pull or edit on the main thread;
 /// until then, parking others must not release it.
 #[cfg(target_os = "macos")]
 #[test]
 fn parking_never_releases_a_playing_clip() {
+    let _only = PARKED_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let clips: Vec<Video> = (0..6).map(|_| Video::file(fixture())).collect();
     let mut released = Vec::new();
     released.extend(backend::parked_with(&clips[0].shared));
@@ -124,6 +152,84 @@ fn parking_never_releases_a_playing_clip() {
     assert!(!released.iter().any(|r| Arc::ptr_eq(r, &clips[0].shared)), "the playing clip stays");
     assert_eq!(released.len(), 1, "four of the five paused clips stay parked");
     assert!(Arc::ptr_eq(&released[0], &clips[1].shared), "the oldest paused clip goes");
+}
+
+/// Records, on drop, whether the parking pass's lock was free: a destructor that takes it would
+/// deadlock in the app.
+#[cfg(target_os = "macos")]
+struct DroppedDuringParking;
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// None until a clip's destructor runs: Some(free) for whether PARKED was free then.
+    static DROPPED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DroppedDuringParking {
+    fn drop(&mut self) {
+        DROPPED.with(|flag| flag.set(Some(macos::parked_free())));
+    }
+}
+
+/// A clip's last owner can go away while a parking pass holds PARKED. Its destructor runs app
+/// code (the waker captures), which may play another parked clip and re-enter `unpark`, so it
+/// must run after the lock is released. // differs from dev: dev dropped the upgrade in the pass.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_clip_dropped_during_a_parking_pass_is_destroyed_outside_the_lock() {
+    let _only = PARKED_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let target = bare_audio();
+    let probe = DroppedDuringParking;
+    target.waker.set(Arc::new(move || {
+        let _ = &probe;
+    }));
+    let other = bare_audio();
+    // Nothing to release: the list holds one paused clip.
+    assert!(backend::parked_with(&target).is_empty());
+    // The pass over `other` drops the target's last owner while it holds the target's upgrade.
+    macos::on_kept(move || drop(target));
+    assert!(backend::parked_with(&other).is_empty());
+    assert_eq!(
+        DROPPED.with(|flag| flag.take()),
+        Some(true),
+        "the clip's destructor ran while PARKED was held (it would deadlock here)"
+    );
+}
+
+/// A redraw of a parked clip re-parks it every frame, where dev allocated nothing: the pass's
+/// upgraded owners keep their capacity across passes. // differs from dev: dev's temporary
+/// upgrades needed no buffer at all.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_warm_parking_pass_keeps_its_buffers_capacity() {
+    let _only = PARKED_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let clips: Vec<Video> = (0..4).map(|_| Video::file(fixture())).collect();
+    // Park all four, then pass over them until the buffer fits them.
+    for _ in 0..5 {
+        for clip in &clips {
+            assert!(backend::parked_with(&clip.shared).is_empty(), "four parked clips fit");
+        }
+    }
+    let warm = macos::held_capacity();
+    assert!(warm >= clips.len(), "the pass keeps every upgraded clip: {warm}");
+    for _ in 0..100 {
+        for clip in &clips {
+            assert!(backend::parked_with(&clip.shared).is_empty(), "nothing is evicted");
+        }
+    }
+    assert_eq!(macos::held_capacity(), warm, "a warm redraw of parked clips allocates nothing");
+}
+
+/// Only formats that no build reads fail at once; with `ogg-audio`, Ogg audio opens later.
+#[cfg(target_os = "macos")]
+#[test]
+fn only_formats_no_build_reads_fail_at_once() {
+    let ogv = Player::audio("https://example.com/clip.ogv");
+    assert!(matches!(ogv.shared.snapshot().state, PlayerState::Failed(e) if e.contains(".ogv")));
+    let ogg = Player::audio("https://example.com/clip.ogg");
+    let failed = matches!(ogg.shared.snapshot().state, PlayerState::Failed(_));
+    assert_eq!(failed, !cfg!(feature = "ogg-audio"), "{:?}", ogg.shared.snapshot().state);
 }
 
 #[test]
@@ -155,14 +261,14 @@ fn state_follows_open_play_end_and_failure() {
     c.open(Ok(meta()));
     assert_eq!(c.state(), PlayerState::Ready);
     assert_eq!((c.duration, c.size), (Some(1.0), Some((64, 36))));
-    c.playing = true;
+    step(&mut c, Event::Play);
     assert_eq!(c.state(), PlayerState::Playing);
     c.advance_virtual(10.0);
     c.advance_virtual(10.5);
     assert_eq!(c.time, 0.5);
     let generation = c.generation;
     c.advance_virtual(11.25);
-    assert_eq!((c.time, c.playing, c.ended), (1.0, false, true));
+    assert_eq!((c.time, &c.run), (1.0, &Run::Ended));
     assert_eq!(c.state(), PlayerState::Ended);
     assert!(c.generation > generation, "ending re-runs views");
     c.fail("boom".into());
@@ -174,21 +280,20 @@ fn state_follows_open_play_end_and_failure() {
 fn virtual_time_loops_rates_and_seeks() {
     let mut c = Control::default();
     c.open(Ok(meta()));
-    c.playing = true;
+    step(&mut c, Event::Play);
     c.looping = true;
     c.rate = 2.0;
     c.advance_virtual(0.0);
     c.advance_virtual(0.6);
     assert!((c.time - 0.2).abs() < 1e-9, "1.2 s wraps to 0.2: {}", c.time);
-    assert!(c.playing);
-    c.seek = Some(0.75);
-    c.anchor = None;
+    assert!(c.playing());
+    step(&mut c, Event::Seek(0.75));
     c.advance_virtual(5.0);
     assert_eq!(c.time, 0.75);
     c.advance_virtual(5.1);
     assert!((c.time - 0.95).abs() < 1e-9);
     // Paused time stays put whatever the clock does.
-    c.playing = false;
+    step(&mut c, Event::Pause);
     c.advance_virtual(9.0);
     assert!((c.time - 0.95).abs() < 1e-9);
 }
@@ -200,28 +305,28 @@ fn playing_after_the_end_restarts_from_zero() {
         let mut c = v.shared.ctl.lock().unwrap();
         c.open(Ok(meta()));
         c.time = 1.0;
-        c.ended = true;
+        c.run = Run::Ended;
     }
     assert_eq!(v.state(), PlayerState::Ended);
     v.play();
     let c = v.shared.ctl.lock().unwrap();
     assert_eq!(c.seek, Some(0.0));
-    assert!(c.playing && !c.ended);
+    assert!(c.playing());
 }
 
 #[test]
 fn display_positions_loop_or_end() {
     let mut c = Control::default();
     c.open(Ok(meta()));
-    c.playing = true;
+    step(&mut c, Event::Play);
     assert!(!c.observe(0.4, false));
     assert_eq!(c.time, 0.4);
     c.looping = true;
     assert!(c.observe(1.0, true), "looping restarts the player");
-    assert_eq!((c.time, c.playing), (0.0, true));
+    assert_eq!((c.time, c.playing()), (0.0, true));
     c.looping = false;
     assert!(!c.observe(1.2, true));
-    assert_eq!((c.time, c.playing, c.state()), (1.0, false, PlayerState::Ended));
+    assert_eq!((c.time, c.playing(), c.state()), (1.0, false, PlayerState::Ended));
 }
 
 #[test]
@@ -269,9 +374,9 @@ fn failures_draw_a_placeholder_and_stop_drawing() {
     let mut rt = crate::Runtime::new(v.clone(), view, (32.0, 18.0), crate::Env::new(true, 2.0));
     rt.frame(0.0);
     let PlayerState::Failed(message) = v.state() else { panic!("{:?}", v.state()) };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     assert!(message.contains("no such file"), "{message}");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     assert_eq!(message, "video playback isn't supported on this platform yet");
     let frame = v.surface().latest().expect("placeholder frame");
     assert_eq!((frame.size, frame.format), ([32, 18], Format::Bgra));
@@ -569,7 +674,7 @@ fn headless_audio_time_follows_the_virtual_clock() {
     let heard = ends.clone();
     let clip = a.clone();
     a.set_waker(Arc::new(move || {
-        if clip.shared.ctl.lock().unwrap().ended {
+        if clip.shared.ctl.lock().unwrap().run == Run::Ended {
             heard.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }));
@@ -602,6 +707,26 @@ fn headless_audio_time_follows_the_virtual_clock() {
     rt.frame(0.6);
     near(a.time(), 0.1, "loops");
     assert!(a.is_playing());
+}
+
+/// A replaced waker's captures drop after the slot's lock: one may read the clip's state and
+/// would deadlock there. // differs from dev: dev dropped the old waker under the lock.
+#[test]
+fn a_replaced_waker_is_dropped_outside_the_slots_lock() {
+    static FREED: Mutex<Option<bool>> = Mutex::new(None);
+    struct Probe(Arc<WakerSlot>);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            *FREED.lock().unwrap() = Some(self.0.free());
+        }
+    }
+    let slot = Arc::new(WakerSlot::default());
+    let first = Probe(slot.clone());
+    slot.set(Arc::new(move || {
+        let _ = &first;
+    }));
+    slot.set(Arc::new(|| {}));
+    assert_eq!(*FREED.lock().unwrap(), Some(true), "the replaced waker dropped while the slot's lock was held");
 }
 
 /// A new runtime's clock starts at 0, never where an earlier runtime on this thread left off.

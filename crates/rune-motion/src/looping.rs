@@ -4,7 +4,7 @@ use crate::{Animated, Beat, Cycle, Easing, Sequence, PropClass, Spring};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LoopKind {
     Opacity { low: f32, high: f32 },
-    /// Piecewise-linear, wall-clock opacity with a bounded frame rate.
+    /// Piecewise-linear, wall-clock opacity sampled at display rate or a fixed cadence.
     OpacityCycle(Cycle),
     /// Finite opacity/scale choreography; holds its last pose at rest.
     Sequence(Sequence),
@@ -53,75 +53,104 @@ impl LoopSpec {
 #[derive(Clone, Copy, Debug)]
 pub struct LoopTrack {
     spec: LoopSpec,
-    epoch: f64,
+    phase: Phase,
     phase0: f64,
     amplitude: Animated<f32>,
-    finished: bool,
+}
+
+/// Where a track is in its play. A periodic loop only ever plays (its cooling lives on
+/// `amplitude`); a finite sequence can also be done.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    /// Playing, with phase 0 landing on `since`. A delayed start is a `since` still ahead.
+    Playing { since: f64 },
+    /// A finite sequence that played out: it holds its last pose, and enabling it again leaves
+    /// it there. It does not replay.
+    Done,
 }
 
 impl LoopTrack {
     pub fn new(spec: LoopSpec, now: f64) -> Self {
         assert!(spec.period.is_finite() && spec.period > 0.0);
         assert!(spec.delay.is_finite() && spec.delay >= 0.0);
-        Self { spec, epoch: now + spec.delay, phase0: 0.0,
-            amplitude: Animated::new(1.0).with_class(PropClass::Opacity), finished: false }
+        Self { spec, phase: Phase::Playing { since: now + spec.delay }, phase0: 0.0,
+            amplitude: Animated::new(1.0).with_class(PropClass::Opacity) }
+    }
+    /// Whether this track has an end: a finite sequence plays once and then rests.
+    fn finite(&self) -> bool {
+        matches!(self.spec.kind, LoopKind::Sequence(_))
     }
     pub fn phase(&self, now: f64) -> f64 {
-        if matches!(self.spec.kind, LoopKind::Sequence(_)) {
-            return if self.finished { 1.0 } else { ((now - self.epoch) / self.spec.period).clamp(0.0, 1.0) };
+        let since = match self.phase {
+            Phase::Playing { since } => since,
+            // A played-out sequence rests at its last pose.
+            Phase::Done => return 1.0,
+        };
+        if self.finite() {
+            return ((now - since) / self.spec.period).clamp(0.0, 1.0);
         }
-        (self.phase0 + (now - self.epoch).max(0.0) / self.spec.period).rem_euclid(1.0)
+        (self.phase0 + (now - since).max(0.0) / self.spec.period).rem_euclid(1.0)
     }
     /// Preserve the presented phase when changing speed. An unchanged spec is a no-op.
     pub fn retime(&mut self, spec: LoopSpec, now: f64) {
         assert!(spec.period.is_finite() && spec.period > 0.0);
         if self.spec == spec { return; }
-        if matches!(self.spec.kind, LoopKind::Sequence(_)) || matches!(spec.kind, LoopKind::Sequence(_)) {
+        if self.finite() || matches!(spec.kind, LoopKind::Sequence(_)) {
             *self = Self::new(spec, now);
             return;
         }
         self.phase0 = self.phase(now);
-        self.epoch = now.max(self.epoch);
+        match &mut self.phase {
+            Phase::Playing { since } => *since = now.max(*since),
+            // Only a finite sequence is `Done`, and those restarted above.
+            Phase::Done => {}
+        }
         self.spec = spec;
     }
     /// Cool to rest without stopping or resetting phase. Reversal inherits envelope velocity.
+    /// A finite sequence that cooled mid-play carries on from where its phase had reached; one
+    /// that played out stays `Done` and does not replay.
     pub fn enabled(&mut self, enabled: bool, now: f64) {
-        if matches!(self.spec.kind, LoopKind::Sequence(_)) {
-            if enabled && self.amplitude.target() == 0.0 {
-                self.epoch = now + self.spec.delay;
-                self.finished = false;
-            } else if !enabled { self.finished = true; }
-        }
         self.amplitude.animate_to(if enabled { 1.0 } else { 0.0 }, Spring::new(0.18, 0.0), now);
     }
     /// Moves the track onto a clock reading `delta` more, at the same place.
     pub fn shift(&mut self, delta: f64) {
-        self.epoch += delta;
+        if let Phase::Playing { since } = &mut self.phase { *since += delta; }
         self.amplitude.shift(delta);
     }
     /// Moves a periodic loop `dt` further along its rhythm, for time its clock didn't see; a
     /// loop still waiting starts `dt` sooner. Finite sequences keep their place.
     pub fn advance(&mut self, dt: f64) {
-        if !matches!(self.spec.kind, LoopKind::Sequence(_)) { self.epoch -= dt; }
+        if !self.finite() && let Phase::Playing { since } = &mut self.phase { *since -= dt; }
     }
     /// Explicit settle/reduced motion lands finite sequences; periodic loops keep their phase.
     pub fn finish(&mut self) {
-        if matches!(self.spec.kind, LoopKind::Sequence(_)) { self.finished = true; }
+        if self.finite() { self.phase = Phase::Done; }
     }
     pub fn active(&self, now: f64) -> bool {
-        if matches!(self.spec.kind, LoopKind::Sequence(_)) {
-            return !self.finished && now >= self.epoch && now < self.epoch + self.spec.period;
+        match self.phase {
+            Phase::Done => false,
+            // A cooled sequence keeps its phase clock but draws nothing, so it asks for no
+            // frames.
+            Phase::Playing { since } if self.finite() => {
+                self.amplitude.target() > 0.0 && now >= since && now < since + self.spec.period
+            }
+            Phase::Playing { since } => {
+                (self.amplitude.target() > 0.0 && now >= since) || !self.amplitude.is_settled(now)
+            }
         }
-        (self.amplitude.target() > 0.0 && now >= self.epoch) || !self.amplitude.is_settled(now)
     }
     /// The animation-clock instant to wake at; no frames are needed before it.
     pub fn pending_start(&self, now: f64) -> Option<f64> {
-        (!self.finished && self.amplitude.target() > 0.0 && now < self.epoch).then_some(self.epoch)
+        match self.phase {
+            Phase::Playing { since } if self.amplitude.target() > 0.0 && now < since => Some(since),
+            _ => None,
+        }
     }
-    /// Wall-clock cycles retain their cadence even when animation time is paused.
+    /// A stepped cycle's timer interval. Continuous tracks use the host's frame request.
     pub fn frame_interval(&self) -> Option<f64> {
         match self.spec.kind {
-            LoopKind::OpacityCycle(c) => Some(f64::from(1.0 / c.fps.max(1.0))),
+            LoopKind::OpacityCycle(c) => c.frame_interval(),
             _ => None,
         }
     }
@@ -155,7 +184,8 @@ impl LoopTrack {
     }
     pub fn pose(&self, now: f64, reduced: bool) -> Option<Beat> {
         let LoopKind::Sequence(frames) = self.spec.kind else { return None };
-        Some(frames.sample(if reduced || self.finished { frames.duration() } else { self.phase(now) * frames.duration() }))
+        let at = if reduced || self.phase == Phase::Done { frames.duration() } else { self.phase(now) * frames.duration() };
+        Some(frames.sample(at))
     }
 }
 
@@ -186,6 +216,101 @@ mod tests {
         assert!(!track.active(4.35));
         assert_eq!(track.pending_start(4.0), None);
         assert_eq!(track.pose(4.35, false).unwrap().scale, 1.0);
+    }
+    #[test]
+    fn a_finished_sequence_stays_done_when_enabled_again() {
+        const BEATS: &[Beat] = &[Beat::new(0.0).opacity(0.0), Beat::new(0.5).opacity(1.0)];
+        let spec = LoopSpec::sequence(Sequence::new(BEATS).delay(0.2));
+        let mut t = LoopTrack::new(spec, 0.0);
+        t.finish();
+        assert!(!t.active(0.3), "a finished sequence asks for no frames");
+        assert_eq!(t.pending_start(0.3), None);
+        assert_eq!(t.pose(0.3, false).unwrap().opacity, 1.0, "and holds its last pose");
+        t.advance(1.0);
+        assert_eq!(t.pose(0.3, false).unwrap().opacity, 1.0, "a sequence keeps its place");
+        t.enabled(false, 1.0);
+        assert!(!t.active(10.0), "cooled to rest");
+        t.enabled(true, 2.0);
+        assert_eq!(t.pending_start(2.0), None, "enabling again doesn't wait on a delay");
+        assert!(!t.active(2.1), "and asks for no frames");
+        assert_eq!(t.pose(2.1, false).unwrap().opacity, 1.0, "holding its last pose");
+        assert_eq!(t.pose(0.3, false).unwrap().opacity, 1.0, "it never replays");
+    }
+    #[test]
+    fn a_sequence_that_ran_out_while_cooled_rests_instead_of_replaying() {
+        const BEATS: &[Beat] = &[Beat::new(0.0).opacity(0.0), Beat::new(0.5).opacity(1.0)];
+        let spec = LoopSpec::sequence(Sequence::new(BEATS).delay(0.2));
+        let mut t = LoopTrack::new(spec, 0.0);
+        assert!(t.active(0.5), "playing until 0.7");
+        t.enabled(false, 0.5);
+        assert!(!t.active(0.5), "cooled to rest");
+        t.enabled(true, 2.0);
+        assert_eq!(t.pending_start(2.0), None, "the delay is not paid again");
+        assert!(!t.active(2.1));
+        assert_eq!(t.pose(2.1, false).unwrap().opacity, 1.0, "it rests where it ran out");
+    }
+    #[test]
+    fn enabling_a_cooled_sequence_carries_on_from_its_presented_phase() {
+        const BEATS: &[Beat] = &[
+            Beat::new(0.0).opacity(0.0).easing(Easing::LINEAR),
+            Beat::new(1.0).opacity(1.0).easing(Easing::LINEAR),
+        ];
+        let spec = LoopSpec::sequence(Sequence::new(BEATS).delay(0.2));
+        let mut t = LoopTrack::new(spec, 0.0);
+        let cooled = t.phase(0.7);
+        assert!((cooled - 0.5).abs() < 1e-9, "mid-run, half way");
+        t.enabled(false, 0.7);
+        assert!(!t.active(0.7), "cooled to rest");
+        t.enabled(true, 0.9);
+        assert!(t.active(0.9), "it warms back up and asks for frames");
+        assert_eq!(t.pending_start(0.9), None, "it does not wait out the delay again");
+        assert!((t.phase(0.9) - 0.7).abs() < 1e-9, "it carries on from where it had reached");
+        assert!(
+            (t.pose(0.9, false).unwrap().opacity - 0.7).abs() < 1e-5,
+            "presenting the pose its phase reached, not its first pose"
+        );
+        assert!(!t.active(1.3), "and still ends where its own clock does");
+        assert_eq!(t.pose(1.3, false).unwrap().opacity, 1.0);
+    }
+    #[test]
+    fn enabling_leaves_a_looping_tracks_phase_alone() {
+        let specs = [
+            LoopSpec::opacity(1.0, 0.0, 0.2, 0.8),
+            LoopSpec::rotation(0.9),
+            LoopSpec::slide(2.0, [-1.0, 0.0], [3.0, 0.0]),
+        ];
+        for spec in specs {
+            let mut cooled = LoopTrack::new(spec, 0.0);
+            let plain = LoopTrack::new(spec, 0.0);
+            cooled.enabled(false, 0.4);
+            assert!(cooled.active(0.41), "cooling keeps its settle frames");
+            cooled.enabled(true, 1.1);
+            for i in 0..50 {
+                let now = 1.1 + i as f64 * 0.037;
+                assert_eq!(cooled.phase(now), plain.phase(now), "{spec:?} keeps its phase");
+                assert_eq!(cooled.active(now), plain.active(now));
+                assert_eq!(cooled.pending_start(now), plain.pending_start(now));
+            }
+            assert!((cooled.sample(5.0, false) - plain.sample(5.0, false)).abs() < 1e-6);
+            match (cooled.offset(5.0, false), plain.offset(5.0, false)) {
+                (Some(warmed), Some(never)) => {
+                    assert!((warmed[0] - never[0]).abs() < 1e-6, "its amplitude warms back to full");
+                }
+                (None, None) => {}
+                _ => panic!("the same spec asks for the same offsets"),
+            }
+        }
+    }
+    #[test]
+    fn a_delayed_loop_shifts_and_advances_its_start() {
+        let mut t = LoopTrack::new(LoopSpec::opacity(1.0, 2.0, 0.0, 1.0), 3.0);
+        assert_eq!(t.pending_start(3.0), Some(5.0));
+        t.shift(0.5);
+        assert_eq!(t.pending_start(3.0), Some(5.5), "a clock shift moves the start with it");
+        t.advance(0.25);
+        assert_eq!(t.pending_start(3.0), Some(5.25), "time the clock didn't see starts it sooner");
+        assert!(!t.active(5.0));
+        assert!(t.active(5.25));
     }
     #[test]
     fn cycle_preserves_wall_phase_stops_still_and_cadence() {

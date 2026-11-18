@@ -113,6 +113,9 @@ pub enum ScriptEvent {
     /// `{"type": "key-up"}`: a logical key's release.
     KeyUp(KeyEvent),
     Paste(String),
+    /// `{"type": "ime", "preedit": ., "cursor": [a, b]}` or `{"type": "ime", "commit": .}`: what an input
+    /// method composes or commits, as the platform's IME hands it over.
+    Ime(crate::Ime),
     /// A paste with HTML or RTF beside the text (`{"paste": {"text": …, "html": …}}`).
     PasteContent(crate::ClipboardContent),
     /// A registered global shortcut chord. Only its handler runs; it never reaches `on_key`.
@@ -124,6 +127,8 @@ pub enum ScriptEvent {
     Focus(bool),
     /// `{"reopen": true}`: the app reopened, as a click on its macOS Dock icon does.
     Reopen,
+    /// `{"open_url": …}`: a link the system opened with the app (`App::on_open_url`).
+    OpenUrl(String),
     /// `{"type": "resize", "dw": …, "dh": …, "dur": …}`: a person resizing the window, one step
     /// a frame, (dw, dh) points from its size when the resize began.
     Resize { dw: f32, dh: f32 },

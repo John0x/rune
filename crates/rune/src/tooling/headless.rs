@@ -53,6 +53,7 @@ pub(crate) fn try_headless<S: 'static>(mut app: crate::app::App<S>, args: Args) 
 
 pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args: Args, transparent: bool) {
     // RUNE_HEADLESS_WAIT=SECS holds the run before it starts, so a sampling profiler can attach.
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(secs) = std::env::var("RUNE_HEADLESS_WAIT").ok().and_then(|s| s.parse::<f64>().ok()) {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs));
     }
@@ -73,7 +74,9 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
     let (srgb_blend, font_smoothing) = (app.srgb_blend, app.font_smoothing);
     let (on_focus, on_ime, on_mods) = (app.on_focus, app.on_ime, app.on_mods);
     let feedback = (app.on_pressable_hover, app.on_any_press);
-    let on_reopen = app.on_reopen;
+    let (on_reopen, on_open_url) = (app.on_reopen, app.on_open_url);
+    // A `--realtime` run stands in for a window, so it starts the app's live work as one does.
+    let mut on_ready = app.on_ready.take().filter(|_| args.realtime);
     let mut reports = crate::frame::encoded::FrameReports::<S>::new(app.on_frame_encoded.take(), Some("main"));
     let source = read_script(&args);
     let script = source.as_ref().map(load_script).unwrap_or_default();
@@ -181,6 +184,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
         shortcuts.drain();
         let requests = shared.take();
         menus.drain();
+        let _receiving = shortcuts.receiving();
         for f in requests.updates {
             rt.update_if(f);
             menus.drain();
@@ -191,8 +195,10 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
     let mut frames_written = 0usize;
     let has_video = writer.has_video();
     let snap_crop = std::cell::Cell::new(None::<[u32; 4]>);
+    let cpu_boot = std::cell::RefCell::new(args.cpu_boot.clone().map(|dir| crate::render::cpu_boot::tool::Tool::new(dir, args.cpu_boot_threads, gpu.adapter.get_info().vendor)));
     // Finished readbacks, in frame order.
     let mut deliver = |shot: Shot, mut px: Vec<u8>| {
+        if shot.snap && let Some(tool) = cpu_boot.borrow_mut().as_mut() { tool.gpu(&px, (wp, hp)); }
         if args.chrome_overlay
             && let Some(lights) = chrome.traffic_light_rects()
         {
@@ -219,7 +225,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
     let mut early_place = None;
     // `Tx::resize_window` moves the viewport on the virtual clock; the canvas keeps its size.
     let mut frame_anim = None;
-    let mut resize_from = rt.viewport;
+    let mut resize_from = rt.window_viewport();
     // As on macOS, a frame change asked for while nothing moves waits a frame to start.
     let mut idle = true;
     if script.iter().find(|e| !matches!(e.kind, Kind::Mark(_))).is_some_and(|e| e.t <= 1e-9) {
@@ -230,6 +236,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
 
     #[cfg(feature = "frame-profile")]
     let mut profile = crate::frame::profile::Log::new(last_frame + 1);
+    let mut loop_check = super::loop_check::Tally::default();
     for k in 0..=last_frame {
         #[cfg(feature = "frame-profile")]
         let (alloc0, commits0, cpu0) = {
@@ -237,11 +244,13 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
             (procwatch::alloc::thread_allocations(), rt.stats.commits, crate::frame::profile::cpu_ms())
         };
         let real_t = k as f64 * dt;
+        #[cfg(not(target_arch = "wasm32"))]
         if args.realtime {
             let ahead = real_t - wall.elapsed().as_secs_f64();
             if ahead > 0.0 { std::thread::sleep(std::time::Duration::from_secs_f64(ahead)); }
         }
         let frame_start = Instant::now();
+        let script_before = next_ev;
         #[cfg(feature = "frame-profile")]
         let events0 = next_ev;
         while next_ev < script.len() && script[next_ev].t <= real_t + 1e-9 {
@@ -249,7 +258,8 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
             next_ev += 1;
             if let Some(g) = gate.as_mut() && !matches!(e.kind, Kind::Mark(_)) { g.input("script"); }
             let (x, y) = match &e.pos {
-                Pos::Xy(x, y) => (*x, *y),
+                // A script's points are the window's; the view's are over its zoom.
+                Pos::Xy(x, y) => (*x / rt.zoom(), *y / rt.zoom()),
                 Pos::Key(key) => rt.find(key).unwrap_or_else(|| die(&format!("script: no element with key {key:?}"))),
                 Pos::Rel(_, _) if e.kind.at_pointer() => rt.pointer().unwrap_or((0.0, 0.0)),
                 Pos::Rel(dx, dy) => (last_down.0 + dx, last_down.1 + dy),
@@ -264,6 +274,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
                 Kind::Focus(focused) => rt.window_focus(*focused),
                 // The one window always shows here.
                 Kind::Reopen => if let Some(f) = on_reopen { rt.update(|s, tx| { f(s, true, tx); }); },
+                Kind::OpenUrl(url) => if let Some(f) = on_open_url { rt.update(|s, tx| f(s, url, tx)); },
                 Kind::Shortcut(shortcut) => shared.shortcuts.fire(shortcut).unwrap_or_else(|e| die(&format!("script shortcut: {e}"))),
                 Kind::Menu(item) => crate::native_menu::fire(&shared, item).unwrap_or_else(|e| die(&format!("script menu: {e}"))),
                 Kind::PopupMenu(picked) => rt.resolve_popup(picked.as_deref()).unwrap_or_else(|e| die(&format!("script pop-up menu: {e}"))),
@@ -280,8 +291,10 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
                 Kind::Key(k, true) => rt.repeat_key(k.clone()),
                 Kind::Physical(event) => rt.physical_input(*event),
                 Kind::Paste(content) => rt.paste_content(content.clone()),
-                Kind::Wheel(dx, dy) => wheel(&mut rt, (x, y), *dx, *dy),
-                Kind::Fling(vx, vy) => fling(&mut rt, (x, y), *vx, *vy),
+                Kind::Ime(ime) => rt.ime(ime.clone()),
+                // A wheel turns as far on screen at any zoom, as Chromium's does.
+                Kind::Wheel(dx, dy) => { let z = rt.zoom(); wheel(&mut rt, (x, y), *dx / z, *dy / z) }
+                Kind::Fling(vx, vy) => { let z = rt.zoom(); fling(&mut rt, (x, y), *vx / z, *vy / z) }
                 Kind::Files(step) => file_input(&mut rt, step, (x, y)),
                 &Kind::Resize(dw, dh) => eased_input::step_resize(&mut rt, &mut resize_from, (dw, dh), scale),
                 kind => {
@@ -301,18 +314,26 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
                 }
             }
         }
+        // Frame 0 has drawn: a window runs `on_ready` after its first frame.
+        if k == 1 && let Some(mut ready) = on_ready.take() { ready(&crate::WindowHandle::new("main")); }
         let requested_place = take_requests(&mut rt);
         take_window_frame(&mut rt, &mut frame_anim, real_t, limits);
         if !idle { step_window_frame(&mut rt, &mut frame_anim, real_t, scale); }
         rt.window_resting = frame_anim.is_none() && rt.window_frame.is_none();
         let step = if k == 0 { 0.0 } else { dt };
         if let Some(g) = gate.as_mut() { g.before(&mut rt); }
+        // `RUNE_LOOP_CHECK=1`: every frame asks for a loop-only step first, and the step is
+        // compared with the ordinary frame that runs instead, or says why it wouldn't run. A
+        // window never asks after a script's kind of event (`LoopFrame::touched`); here the
+        // step's own refusal shows for those too, counted apart.
+        let asked = (rt.loop_check_on() && k > 0 && frame_anim.is_none()).then(|| rt.loop_step(step));
         let mut animating = rt.frame(step);
+        if let Some(asked) = asked { loop_check.add(real_t, next_ev != script_before, asked, rt.loop_checked()); }
         rt.open_popup_headless();
         // As on macOS, a frame change this commit asked for starts with the springs it
         // started, which have shown a step unless they held for the window.
         if rt.window_frame.is_some() {
-            let shown = if rt.fit_held { 0.0 } else { step };
+            let shown = if rt.fit.take_held() { 0.0 } else { step };
             take_window_frame(&mut rt, &mut frame_anim, real_t - shown, limits);
         }
         idle = !animating && frame_anim.is_none();
@@ -336,6 +357,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
                 ui.set_format(&gpu.device, target_format);
             }
         }
+        if let Some(tool) = cpu_boot.borrow_mut().as_mut() { tool.frame(&mut rt, (wp, hp), k, (update_ms * 1e6) as u64, k == snap_frame); }
         renderer.upload_images(&gpu.device, &gpu.queue, &mut rt.images);
         renderer.prepare_surfaces(&gpu.device, &gpu.queue, &rt.surfaces, (wp, hp));
         let mut enc = gpu.device.create_command_encoder(&Default::default());
@@ -356,13 +378,13 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
             c.render(&mut f);
             animating |= c.animating();
         } else {
-            renderer.prepare(&gpu.device, &gpu.queue, &mut rt.text.atlas, &rt.instances, (wp, hp));
+            renderer.prepare_ui(&gpu.device, &gpu.queue, &mut rt.text.atlas, &rt.instances, (wp, hp));
             renderer.draw(&mut enc, view, rt.clear_color());
         }
         if let Some((ov, ui)) = overlay.as_mut() {
             let ort = ov.frame(real_t, step, rt.backdrop_dark().unwrap_or(dark));
             if !ort.instances.is_empty() {
-                ui.prepare(&gpu.device, &gpu.queue, &mut ort.text.atlas, &ort.instances, (wp, hp));
+                ui.prepare_ui(&gpu.device, &gpu.queue, &mut ort.text.atlas, &ort.instances, (wp, hp));
                 ui.draw_over(&mut enc, view);
             }
         }
@@ -455,6 +477,7 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
         let wall = wall.elapsed().as_secs_f64();
         eprintln!("rune: {} frames in {wall:.2} s wall ({:.1} frames/s)", last_frame + 1, (last_frame + 1) as f64 / wall);
     }
+    let loop_checked = loop_check.report();
     let q = |v: &mut Vec<f64>, p: f64| {
         v.sort_by(f64::total_cmp);
         if v.is_empty() { 0.0 } else { v[((v.len() - 1) as f64 * p).round() as usize] }
@@ -485,6 +508,11 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
     if let Some(s) = comp.as_mut().and_then(|c| c.summary(&gpu.device)) {
         eprintln!("{s}");
     }
+    // A headless run opens no links (`Tx::open_url`): say which its handlers asked for.
+    for url in rt.take_url_requests() {
+        eprintln!("rune: open_url {url} (headless: not opened)");
+    }
+    if !loop_checked { std::process::exit(3); }
 }
 
 /// Takes the size handlers asked for a headless window, inside the limits the app set; its
@@ -492,11 +520,11 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
 fn take_window_frame<S>(rt: &mut Runtime<S>, anim: &mut Option<crate::window::frame::FrameAnim>, start: f64,
     (min, max): ((f32, f32), Option<(f32, f32)>)) {
     use crate::window::frame::{FrameAnim, clamp_size};
-    rt.fit_held = false;
+    rt.fit.take_held();
     let Some(request) = rt.window_frame.take() else { return };
     let Some(size) = request.size else { return };
     let (w, h) = clamp_size(size, min, max);
-    let from = [0.0, 0.0, rt.viewport.0, rt.viewport.1];
+    let from = [0.0, 0.0, rt.window_viewport().0, rt.window_viewport().1];
     *anim = Some(FrameAnim::retarget(anim.as_ref(), request.spring, start, from, [0.0, 0.0, w, h]));
 }
 

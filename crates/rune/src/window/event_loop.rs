@@ -52,6 +52,8 @@ fn run_configured(_: Factory, _: Args, _: bool) -> Result<(), String> {
 #[cfg(not(target_arch = "wasm32"))]
 fn run_configured(factory: Factory, args: Args, accessory: bool) -> Result<(), String> {
     let _ = accessory;
+    // A relaunch goes on once the app it restarts has exited.
+    crate::relaunch::wait_for_previous();
     crate::tooling::perf_warn::launch::run_starts();
     crate::platform::ready_signal::run_starts();
     #[cfg(target_os = "macos")]
@@ -64,14 +66,29 @@ fn run_configured(factory: Factory, args: Args, accessory: bool) -> Result<(), S
     #[allow(unused_mut)]
     let mut builder = EventLoop::<WakeEvent>::with_user_event();
     #[cfg(target_os = "macos")]
-    if accessory {
+    // `RUNE_OPEN_INACTIVE` (a tool's launch): the app doesn't take activation at launch either.
+    if accessory || std::env::var_os("RUNE_OPEN_INACTIVE").is_some() {
         use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
-        builder
-            .with_activation_policy(ActivationPolicy::Accessory)
-            .with_default_menu(false)
-            .with_activate_ignoring_other_apps(false);
+        if accessory {
+            builder.with_activation_policy(ActivationPolicy::Accessory).with_default_menu(false);
+        }
+        builder.with_activate_ignoring_other_apps(false);
     }
     let event_loop = builder.build().inspect_err(|_| crate::render::discard_prewarm()).map_err(event_loop_error)?;
+    crate::marks::mark("loop.built");
+    // While the app sets up, after winit's first window: the first CPU frame's rounding needs it.
+    // Beside `EventLoop::new` it waited on the window manager's lock that window takes, and made
+    // it 1,134 µs slower.
+    #[cfg(target_os = "windows")]
+    crate::gpu::pick::find_display_vendor_soon();
+    // winit's table for the keyboard layout, which the first key or mouse message would build on
+    // this thread (8-10 ms, every virtual key through `ToUnicodeEx`): built beside the launch.
+    #[cfg(target_os = "windows")]
+    {
+        // SAFETY: no arguments; this thread runs the loop.
+        let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        let _ = std::thread::Builder::new().name("rune-keyboard-layout".into()).spawn(move || winit::platform::windows::warm_keyboard_layout(thread));
+    }
     event_loop.set_control_flow(ControlFlow::Wait);
     #[cfg(target_os = "macos")]
     crate::platform::app_icon::launched();
@@ -80,12 +97,18 @@ fn run_configured(factory: Factory, args: Args, accessory: bool) -> Result<(), S
     crate::popup_menu::start(std::sync::Arc::new(move || { let _ = turn.send_event(WakeEvent::Turn); }));
     let mut windows = Windows { factory: Some(factory), args, proxy, hosts: Vec::new(), gpu: Rc::default() };
     crate::open_url::incoming::prepare();
+    crate::marks::mark("loop.run");
     let result = event_loop.run_app(&mut windows);
+    crate::marks::mark("loop.exited");
     // The windows' interaction timing queued its last rollups as they closed.
     crate::tooling::interaction::flush();
     crate::render::discard_prewarm();
     crate::clipboard::shutdown(); // Also cover an event-loop error before `exiting`.
     crate::platform::ready_signal::clear();
+    // An orderly exit: the windows and their renderers go here. `RUNE_LOOP_CHECK=2` found a
+    // differing picture: the process ends with 3, as a fast exit does (`quit::end_process`).
+    drop(windows);
+    if crate::render::loop_pixel_check_failed() { std::process::exit(3); }
     result.map_err(|error| format!("run: {error}"))
 }
 

@@ -57,6 +57,9 @@ pub struct ElementInfo {
     pub live_intent: u32,
     /// On the focused text field: its caret line in window points (see [`Cx::caret`]).
     pub caret: Option<[f32; 4]>,
+    /// On the focused text field, unless secure: its selection's anchor and focus, UTF-8 bytes
+    /// of its text (equal for a caret).
+    pub edit_range: Option<[usize; 2]>,
     /// Dragging it starts an OS drag ([`El::drag_out`]).
     pub drag_out: bool,
     /// Its tooltip and accessibility help ([`El::help`]).
@@ -168,7 +171,7 @@ impl<S: 'static> Runtime<S> {
             !parents[i] && n.text.is_none() && n.input.is_none() && !n.focus.enabled && n.material.is_none()
                 && v.fill.a == 0.0 && (v.border_width() == 0.0 || v.border().a == 0.0 && v.border_bottom.is_none_or(|c| c.a == 0.0))
                 && v.shadows.is_empty() && v.surface.is_none() && v.icon.is_none() && v.gradient.is_none() && v.radial.is_none()
-                && v.outline.is_none() && v.shape.is_none() && v.pixels.is_none() && v.effect.is_none()
+                && v.outline.is_none() && v.shape.is_none() && v.grid.is_none() && v.pixels.is_none() && v.effect.is_none()
                 && v.hover().a == 0.0 && v.press().a == 0.0
         }).map(|(_, n)| n.path.as_str()).collect()
     }
@@ -237,7 +240,7 @@ impl<S: 'static> Runtime<S> {
                 let (x0, y0) = (rect[0].max(clip[0] / s), rect[1].max(clip[1] / s));
                 let (x1, y1) = ((rect[0] + rect[2]).min(clip[2] / s), (rect[1] + rect[3]).min(clip[3] / s));
                 let visible = [x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)];
-                let revealing = flight.is_some() || self.reveals.get(&n.id).is_some_and(|r| !r.words.is_empty());
+                let revealing = flight.is_some() || self.reveals.get(&n.id).is_some_and(|r| r.fading());
                 let mut in_growing_row = false;
                 let mut scrolling = false;
                 let mut scrolled = [0.0; 2];
@@ -268,7 +271,7 @@ impl<S: 'static> Runtime<S> {
                         None => at.map_or(v, |at| self.content_to_window(at, v)),
                     };
                     if j != i && let Some(st) = self.scrolls.get(&self.nodes[j].id) {
-                        let [x, y] = to_window(Some(j), st.drawn);
+                        let [x, y] = to_window(Some(j), [st.drawn_x, st.drawn.y()]);
                         scrolled = [scrolled[0] + x, scrolled[1] + y];
                     }
                     // A launch, and what it carries, leaves under the offsets it launched against
@@ -309,11 +312,11 @@ impl<S: 'static> Runtime<S> {
                     path: n.path.clone(),
                     key: n.key.clone(),
                     role: n.role,
-                    label: n.label.clone(),
+                    label: n.label.as_deref().map(str::to_owned),
                     text: match &n.text {
                         Some(t) => (!secure).then(|| t.source_text().to_owned()),
                         // A text built from several (a rolling label's glyphs) reads as its label.
-                        None => (!secure).then(|| n.label.clone()).flatten().filter(|_| n.role == "text"),
+                        None => (!secure).then(|| n.label.as_deref().map(str::to_owned)).flatten().filter(|_| n.role == "text"),
                     },
                     rect,
                     target: [n.target[0], n.target[1], n.target[2] - n.target[0], n.target[3] - n.target[1]],
@@ -322,7 +325,8 @@ impl<S: 'static> Runtime<S> {
                     blur: if flight.is_some() { 0.0 } else { self.inh_scratch.get(i).map_or(p.blur, |h| h.blur) },
                     radius: p.radius.0[0],
                     fill: self.color(n.id, P_FILL, n.vis.fill),
-                    text_color: n.text.as_ref().map(|t| t.color).or(n.vis.icon.map(|(_, c)| c)).map(|c| self.color(n.id, P_TEXT, c)),
+                    text_color: paint_tracks::text_color(n)
+                        .map(|c| paint_tracks::group_tint(n, self.color(n.id, P_TEXT, c), self.inh_scratch.get(i).map_or(0.0, |h| h.group))),
                     hover: if (n.focus.highlight.is_some() && self.highlight_visible(i)) || (n.focus.fill.is_some() && self.focus_ring_visible(i)) { 1.0 }
                         else { self.scene.get(n.id, P_HOVER).unwrap_or(0.0) },
                     press: self.scene.get(n.id, P_PRESS).unwrap_or(0.0),
@@ -335,6 +339,7 @@ impl<S: 'static> Runtime<S> {
                     scrolled,
                     live_intent,
                     caret: self.caret_rect(&self.nodes, i),
+                    edit_range: n.input.as_ref().filter(|inp| inp.edit.focused && !inp.edit.is_secure()).map(|inp| [inp.edit.anchor, inp.edit.focus]),
                     drag_out: n.handlers.drag_out.is_some(),
                     help: n.help.as_deref().filter(|_| !n.help_cut || n.text_cut(s)).map(|h| crate::el::help_words(h).into_owned()),
                     selected: n.text.as_ref().filter(|t| t.selectable && !secure).and_then(|t| {
@@ -366,7 +371,7 @@ impl<S: 'static> Runtime<S> {
                 hover: 0.0, press: 0.0, moving: true, parent: None,
                 visible: [r.x.max(c[0]), r.y.max(c[1]), (r.edges()[2].min(c[2]) - r.x.max(c[0])).max(0.0),
                     (r.edges()[3].min(c[3]) - r.y.max(c[1])).max(0.0)],
-                revealing: true, in_growing_row: false, scrolling: false, scrolled: [0.0; 2], virtual_extent: false, live_intent: 0, caret: None, drag_out: false,
+                revealing: true, in_growing_row: false, scrolling: false, scrolled: [0.0; 2], virtual_extent: false, live_intent: 0, caret: None, edit_range: None, drag_out: false,
                 help: None, selected: None, level: None, expanded: None, item_selected: false, stuck: 0.0,
             });
         }
