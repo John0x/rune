@@ -74,7 +74,7 @@ fn anchor_with(motion: Spring, content: El, anchor: &str, placement: Placement, 
 
 /// A transparent full-window press target under an open overlay: pressing outside closes it.
 pub fn scrim<S: 'static>(key: impl Into<String>, close: impl Fn(&mut S) + 'static) -> El {
-    el().key(key).role("none").absolute(0.0, 0.0).w_full().h_full().on_press(close)
+    el().key(key).role("none").hit().absolute(0.0, 0.0).w_full().h_full().on_press(close)
 }
 
 /// `Popover::new("share").trigger(button).title("Share").open(s.open).build(&kit, &mut layer)`.
@@ -168,7 +168,7 @@ impl Popover {
         if !self.open {
             return trigger;
         }
-        let mut content = col().key(format!("{}-content", self.key)).role("dialog")
+        let mut content = col().key(format!("{}-content", self.key)).role("dialog").hit()
             .description(self.description.clone().unwrap_or_default())
             .focus_return(&anchor_key).min_w(200.0).max_w(320.0);
         if let Some(l) = &self.label {
@@ -528,6 +528,7 @@ impl HoverCard {
         }
         let content = col()
             .key(format!("{}-card", self.key))
+            .hit()
             .min_w(200.0)
             .max_w(320.0)
             .child(col().padding(4.0).children(self.body));

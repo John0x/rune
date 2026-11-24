@@ -129,3 +129,74 @@ fn a_released_hold_holds_nothing_until_layout_settles() {
     h.release(false);
     assert!(!h.held() && !h.released(), "with layout still, a move just ends the hold");
 }
+
+#[test]
+fn a_hit_overlay_swallows_hover_moves_and_clicks_from_elements_under_it() {
+    #[derive(Default)]
+    struct S {
+        under_hovered: bool,
+        under_moves: usize,
+        under_clicks: usize,
+        overlay_hovered: bool,
+        overlay_clicks: usize,
+    }
+    fn view(_: &S, _: &mut Cx<S>) -> El {
+        let under = el()
+            .key("under")
+            .pin(Some(0.0), Some(0.0), None, None)
+            .size(200.0, 100.0)
+            .hover(Color::WHITE)
+            .on_hover_change(|s: &mut S, inside, _| s.under_hovered = inside)
+            .on_pointer_move(|s: &mut S, _| s.under_moves += 1)
+            .on_press(|s: &mut S| s.under_clicks += 1);
+        let overlay = col()
+            .key("overlay")
+            .role("menu")
+            .hit()
+            .pin(Some(60.0), Some(10.0), None, None)
+            .size(120.0, 80.0)
+            .on_hover_change(|s: &mut S, inside, _| s.overlay_hovered = inside)
+            .child(
+                el()
+                    .key("overlay-btn")
+                    .size(60.0, 30.0)
+                    .hover(Color::WHITE)
+                    .on_press(|s: &mut S| s.overlay_clicks += 1),
+            );
+        el().w_full().h_full().child(under).child(overlay)
+    }
+    let mut rt = Runtime::new(S::default(), view, (240.0, 120.0), Env::new(true, 1.0));
+    rt.frame(0.0);
+    let id = |rt: &Runtime<S>, key: &str| {
+        rt.nodes.iter().find(|n| n.path.rsplit('/').next() == Some(key)).map(|n| n.id).unwrap()
+    };
+    let lit = |rt: &Runtime<S>, key: &str| rt.scene.store().target(id(rt, key), P_HOVER).unwrap_or(0.0);
+
+    // Uncovered area on `under`: hover, hover_change, and pointer_move fire normally.
+    rt.pointer_move(20.0, 50.0);
+    rt.frame(1.0 / 120.0);
+    assert_eq!(lit(&rt, "under"), 1.0);
+    assert!(rt.state.under_hovered && !rt.state.overlay_hovered);
+    assert_eq!(rt.state.under_moves, 1);
+
+    // Move onto empty area inside `overlay`: `under` turns off and receives no moves or clicks.
+    rt.pointer_move(140.0, 70.0);
+    rt.frame(1.0 / 120.0);
+    assert_eq!(lit(&rt, "under"), 0.0, "overlay occludes underlying hover track");
+    assert!(!rt.state.under_hovered && rt.state.overlay_hovered, "overlay occludes underlying hover_change");
+    assert_eq!(rt.state.under_moves, 1, "overlay occludes underlying pointer_move");
+    rt.pointer_down(140.0, 70.0);
+    rt.pointer_up(140.0, 70.0);
+    rt.frame(1.0 / 120.0);
+    assert_eq!(rt.state.under_clicks, 0, "empty area of overlay swallows clicks");
+
+    // Move onto interactive child inside `overlay`: child and overlay both react, `under` stays off.
+    rt.pointer_move(80.0, 25.0);
+    rt.frame(1.0 / 120.0);
+    assert_eq!((lit(&rt, "under"), lit(&rt, "overlay-btn")), (0.0, 1.0));
+    assert!(!rt.state.under_hovered && rt.state.overlay_hovered);
+    rt.pointer_down(80.0, 25.0);
+    rt.pointer_up(80.0, 25.0);
+    rt.frame(1.0 / 120.0);
+    assert_eq!((rt.state.under_clicks, rt.state.overlay_clicks), (0, 1));
+}

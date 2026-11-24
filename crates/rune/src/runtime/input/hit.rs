@@ -142,6 +142,43 @@ impl<S: 'static> Runtime<S> {
         inputs.next().is_none().then_some(first)
     }
 
+    /// Node `i`'s position in the current frame's paint order.
+    pub(super) fn paint_order_of(&self, i: usize) -> usize {
+        if self.layer_paint_order.is_empty() {
+            i
+        } else {
+            self.layer_paint_order.iter().position(|&n| n == i).unwrap_or(i)
+        }
+    }
+
+    /// The topmost overlay/hit barrier at (x, y) that occludes non-ancestor elements painted
+    /// beneath it (an overlay marked `.hit()`, an anchored non-tooltip surface, or a modal).
+    pub(super) fn top_cover(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+        self.hits.iter().rev().find_map(|&(id, r)| {
+            if !self.hit_contains(id, r, x, y) { return None; }
+            let i = *self.node_index.get(&id)?;
+            let n = &self.nodes[i];
+            let blocks = !self.subtree_exiting(i)
+                && self.allowed(i)
+                && (n.vis_flags.hit()
+                    || n.handlers.modal.is_some()
+                    || (n.above.is_some() && n.role != "tooltip"));
+            blocks.then(|| (i, self.paint_order_of(i)))
+        })
+    }
+
+    /// Whether node `i` is occluded by `cover` (`top_cover(x, y)`): painted before `cover` and
+    /// not an ancestor of `cover`.
+    pub(super) fn covered_by(&self, i: usize, cover: Option<(usize, usize)>) -> bool {
+        let Some((top, top_order)) = cover else { return false };
+        if top == i || top_order <= self.paint_order_of(i) {
+            return false;
+        }
+        let outer = self.nodes[i].path.as_str();
+        let inner = self.nodes[top].path.as_str();
+        !(inner == outer || (inner.len() > outer.len() && inner.starts_with(outer) && inner.as_bytes()[outer.len()] == b'/'))
+    }
+
     /// The topmost element under (x, y) that takes primary input, selectable text included.
     pub(super) fn top_target(&self, x: f32, y: f32) -> Option<usize> {
         self.hits.iter().rev().find_map(|&(id, r)| {
@@ -150,7 +187,7 @@ impl<S: 'static> Runtime<S> {
             let n = &self.nodes[i];
             // A secondary-only child must not obscure primary input or background blur.
             (!self.subtree_exiting(i) && self.allowed(i) && (n.has_primary_handler() || n.input.is_some() || n.role == "textbox"
-                || (n.role == "button" && n.vis_flags.hit()) || n.window_drag != crate::el::WindowDrag::None || n.focus.enabled || n.handlers.modal.is_some()
+                || n.vis_flags.hit() || n.window_drag != crate::el::WindowDrag::None || n.focus.enabled || n.handlers.modal.is_some()
                 || self.is_selectable(i))).then_some(i)
         })
     }

@@ -143,9 +143,13 @@ impl<S: 'static> Runtime<S> {
         let mut inside: Vec<String> = Vec::new();
         let mut entering: Vec<usize> = Vec::new();
         if let Some((x, y)) = self.pointer {
+            let cover = self.top_cover(x, y);
             for &(id, r) in &self.hits {
                 if let Some((i, n)) = self.node_index.get(&id).map(|&i| (i, &self.nodes[i]))
-                    && n.handlers.get().is_some_and(|h| h.on_hover_change.is_some()) && self.hit_contains(id, r, x, y) && !inside.contains(&n.path)
+                    && n.handlers.get().is_some_and(|h| h.on_hover_change.is_some())
+                    && self.hit_contains(id, r, x, y)
+                    && !self.covered_by(i, cover)
+                    && !inside.contains(&n.path)
                 {
                     if !self.hover_within.contains(&n.path) { entering.push(i); }
                     inside.push(n.path.clone());
@@ -201,8 +205,9 @@ impl<S: 'static> Runtime<S> {
         match flips {
             Some(flips) => flips.iter().any(held),
             None => {
-                let (captured, alone, shared) = (self.captured(), self.hovered_alone(), self.shared_hovered());
-                (0..self.nodes.len()).filter_map(|i| self.hover_flip(i, captured, alone, &shared)).any(|f| held(&f))
+                let cover = self.pointer.and_then(|(x, y)| self.top_cover(x, y));
+                let (captured, alone, shared) = (self.captured(), self.hovered_alone(cover), self.shared_hovered(cover));
+                (0..self.nodes.len()).filter_map(|i| self.hover_flip(i, captured, alone, &shared, cover)).any(|f| held(&f))
             }
         }
     }
@@ -288,10 +293,10 @@ impl<S: 'static> Runtime<S> {
 
     /// The innermost `hover_alone` element under the pointer: the elements around it show no
     /// hover.
-    fn hovered_alone(&self) -> Option<usize> {
+    fn hovered_alone(&self, cover: Option<(usize, usize)>) -> Option<usize> {
         let (x, y) = self.pointer?;
         (0..self.nodes.len())
-            .filter(|&i| self.nodes[i].vis.hover_alone && !self.is_exiting(self.nodes[i].id) && self.allowed(i) && self.node_contains(i, x, y))
+            .filter(|&i| self.nodes[i].vis.hover_alone && !self.is_exiting(self.nodes[i].id) && self.allowed(i) && self.node_contains(i, x, y) && !self.covered_by(i, cover))
             .max_by_key(|&i| self.nodes[i].path.len())
     }
 
@@ -303,12 +308,13 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// The `hover_group_shared` keys of the elements under the pointer or holding keyboard focus.
-    fn shared_hovered(&self) -> Vec<Rc<str>> {
+    fn shared_hovered(&self, cover: Option<(usize, usize)>) -> Vec<Rc<str>> {
         let (x, y) = self.pointer.unwrap_or((f32::NAN, f32::NAN));
         (0..self.nodes.len())
             .filter_map(|i| {
                 let key = self.nodes[i].vis.hover_share.as_ref()?;
-                (!self.is_exiting(self.nodes[i].id) && self.allowed(i) && (self.node_contains(i, x, y) || self.keyboard_within(i))).then(|| key.clone())
+                let pointer_in = self.node_contains(i, x, y) && !self.covered_by(i, cover);
+                (!self.is_exiting(self.nodes[i].id) && self.allowed(i) && (pointer_in || self.keyboard_within(i))).then(|| key.clone())
             })
             .collect()
     }
@@ -316,10 +322,10 @@ impl<S: 'static> Runtime<S> {
     /// Node `i`'s hover track, if it has one and isn't leaving. `alone`: the `hover_alone`
     /// element under the pointer, which turns off the tracks of the elements around it.
     /// `shared`: the `hover_group_shared` keys the pointer is over.
-    fn hover_flip(&self, i: usize, captured: Option<&str>, alone: Option<usize>, shared: &[Rc<str>]) -> Option<Flip> {
+    fn hover_flip(&self, i: usize, captured: Option<&str>, alone: Option<usize>, shared: &[Rc<str>], cover: Option<(usize, usize)>) -> Option<Flip> {
         let n = &self.nodes[i];
         if !(n.vis.hover().a > 0.0 || n.vis_flags.hover_group()) || self.is_exiting(n.id) { return None; }
-        let inside = self.pointer.is_some_and(|(x, y)| self.node_contains(i, x, y))
+        let inside = self.pointer.is_some_and(|(x, y)| self.node_contains(i, x, y) && !self.covered_by(i, cover))
             || n.vis.hover_share.as_ref().is_some_and(|k| shared.contains(k))
             || (n.vis_flags.hover_group() && self.keyboard_within(i));
         let capture_inside = if self.secondary.is_held() { inside } else { self.press.inside() };
@@ -351,15 +357,16 @@ impl<S: 'static> Runtime<S> {
         }
         let mut changed = false;
         let mut flips = std::mem::take(&mut self.hover_hold.flips);
+        let cover = self.pointer.and_then(|(x, y)| self.top_cover(x, y));
         let captured = self.press.path().or(self.secondary.path());
-        let alone = self.hovered_alone();
-        let shared = self.shared_hovered();
+        let alone = self.hovered_alone(cover);
+        let shared = self.shared_hovered(cover);
         for i in 0..self.nodes.len() {
             let n = &self.nodes[i];
             let press_scale = n.handlers.get().and_then(|h| h.press_scale);
             if n.vis.hover().a <= 0.0 && !n.vis_flags.hover_group() && !n.vis.tracks_press() && press_scale.is_none() { continue; }
             if self.is_exiting(n.id) { continue; }
-            match self.hover_flip(i, captured, alone, &shared) {
+            match self.hover_flip(i, captured, alone, &shared, cover) {
                 Some(f) if f.changed => flips.push(f),
                 // Default hover animations inherit velocity and have no completion token.
                 // An unchanged target preserves its trajectory in the store already; avoid

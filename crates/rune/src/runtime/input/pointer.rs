@@ -16,10 +16,12 @@ impl<S: 'static> Runtime<S> {
         self.pointer = Some((x, y));
         self.autoscroll_moved(x, y);
         if self.in_viewport(x, y) { self.set_left(false); }
+        let cover = self.top_cover(x, y);
         for &(id, rect) in &self.hits {
             if self.hit_contains(id, rect, x, y)
                 && let Some(&i) = self.node_index.get(&id)
                 && self.nodes[i].handlers.get().is_some_and(|h| h.on_pointer_move.is_some())
+                && !self.covered_by(i, cover)
             {
                 let point = self.pointer_event(i, x, y);
                 self.queue.push(Action::PointerMove(self.nodes[i].path.clone(), point));
@@ -306,6 +308,17 @@ impl<S: 'static> Runtime<S> {
             // Tab goes on from here, as from a browser's click on plain content.
             if self.defaults.web_focus { self.focus.step(focus_machine::FocusEvent::StartAt(n.path.clone())); }
             if self.focus.path().is_some() { self.queue.push(Action::Blur); }
+        }
+        // A handlerless `.hit()` surface (an overlay background or native hit region) swallows
+        // clicks without starting a runtime pointer capture.
+        if n.vis_flags.hit()
+            && !n.has_primary_handler()
+            && !on_link
+            && !n.vis.tracks_press()
+            && n.handlers.press_scale.is_none()
+            && !self.is_selectable(ti)
+        {
+            return;
         }
         let r = n.target;
         let [lx, ly] = self.to_local(ti, x, y);
