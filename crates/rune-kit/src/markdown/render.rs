@@ -382,6 +382,18 @@ impl Renderer {
         out
     }
 
+    pub(super) fn spans_padded(&self, padded: &links::PaddedInline<'_>, font: TextStyle) -> Vec<Span> {
+        let mut out = self.spans(&padded.inline, font);
+        for (range, width) in &padded.link_pads {
+            let mut sp = Span::new(range.start, range.end);
+            sp.size = Some(pad_size(font, *width));
+            sp.weight = Some(font.weight);
+            sp.underline = Some(Color::TRANSPARENT);
+            out.push(sp);
+        }
+        out
+    }
+
     /// Resolves `hl` against [`MarkdownStyle`] into a [`TextHighlight`] for `range`.
     fn make_text_highlight(&self, idx: usize, range: Range<usize>, hl: &Highlight) -> TextHighlight {
         let s = &self.s;
@@ -400,10 +412,20 @@ impl Renderer {
     }
 
     fn text_highlights_for(&self, text: &str, map: Option<&SpanMap>) -> Vec<TextHighlight> {
+        self.text_highlights_padded(text, map, None)
+    }
+
+    fn text_highlights_padded(
+        &self,
+        text: &str,
+        map: Option<&SpanMap>,
+        padded: Option<&links::PaddedInline<'_>>,
+    ) -> Vec<TextHighlight> {
         let Some(map) = map.filter(|_| !self.highlights.is_empty()) else { return Vec::new() };
         let mut out = Vec::new();
         for (idx, (src_ranges, hl)) in self.highlights.iter().enumerate() {
             for r in map.map_ranges(src_ranges, text) {
+                let r = padded.map_or(r.clone(), |p| p.map_range(r));
                 out.push(self.make_text_highlight(idx, r, hl));
             }
         }
@@ -415,18 +437,26 @@ impl Renderer {
         if self.selectable { e.selectable(true).selection_color(self.s.selection) } else { e }
     }
 
-    /// `e`, the text of `inl`, with its strikethroughs, highlights, links and selectable, copying
-    /// without inline code's padding.
-    pub(super) fn select_inline(&self, mut e: El, inl: &Inline, map: Option<&SpanMap>) -> El {
+    /// `e`, the text of `padded`, with its strikethroughs, highlights, links and selectable,
+    /// copying without inline code's or styled links' padding.
+    pub(super) fn select_inline_padded(
+        &self,
+        mut e: El,
+        padded: &links::PaddedInline<'_>,
+        orig: &Inline,
+        map: Option<&SpanMap>,
+    ) -> El {
+        let inl = &*padded.inline;
         for &(a, b, st) in &inl.spans {
             if matches!(st, Style::Strike) {
                 e = e.strike(a, b, None);
             }
         }
-        e = e.text_highlights(self.text_highlights_for(&inl.text, map));
+        e = e.text_highlights(self.text_highlights_padded(&orig.text, map, Some(padded)));
         let e = self.select(self.wire_link(self.link_icons(e, inl), inl));
         if !self.selectable { return e; }
-        inl.spans.iter().filter(|s| matches!(s.2, Style::CodePad)).fold(e, |e, s| e.uncopied(s.0..s.1))
+        let e = inl.spans.iter().filter(|s| matches!(s.2, Style::CodePad)).fold(e, |e, s| e.uncopied(s.0..s.1));
+        padded.link_pads.iter().fold(e, |e, (r, _)| e.uncopied(r.clone()))
     }
 
     pub(super) fn with_reveal(&self, e: El) -> El {
@@ -440,17 +470,26 @@ impl Renderer {
     }
 
     pub(super) fn para(&self, inl: &Inline, map: Option<&SpanMap>, style: TextStyle, color: Color) -> El {
+        let padded = self.pad_styled_links(inl, style);
         // Lines keep their own 22.4 points, as a page's do, so a long list doesn't drift a
         // point per item.
-        let e = self.with_reveal(rich(inl.text.clone(), self.spans(inl, style)).font(style).color(color).exact_lines().wrap_anywhere()).w_full();
-        let e = bidi::directed(bidi::isolated(e, inl), bidi::inline_dir(inl));
+        let e = self
+            .with_reveal(
+                rich(padded.inline.text.clone(), self.spans_padded(&padded, style))
+                    .font(style)
+                    .color(color)
+                    .exact_lines()
+                    .wrap_anywhere(),
+            )
+            .w_full();
+        let e = bidi::directed(bidi::isolated(e, &padded.inline), bidi::inline_dir(&padded.inline));
         // A copy puts a blank line around a paragraph, one newline around a list item's first
         // with its marker before it.
         let e = match self.flow.get().lead {
             Some((cols, lead, before)) => e.copy_prefix(format!("{}{}", " ".repeat(cols), lead.marker())).copy_breaks(before, 1),
             None => e.copy_breaks(2, 2),
         };
-        self.select_inline(e, inl, map)
+        self.select_inline_padded(e, &padded, inl, map)
     }
 
     /// `blocks` in a column, spaced by their collapsed margins. A heading's bottom margin alone

@@ -438,15 +438,16 @@ impl Renderer {
                 Align::End if dir.is_some() && dir != table_dir => Align::Start,
                 a => a,
             };
+            let padded = self.pad_styled_links(inl, font);
             let content = self
                 .with_reveal(
-                    rich(inl.text.clone(), self.spans(inl, font))
+                    rich(padded.inline.text.clone(), self.spans_padded(&padded, font))
                         .font(font)
                         .color(color)
                         .align(align),
                 )
                 .w_full();
-            let content = super::bidi::directed(super::bidi::isolated(content, inl), dir);
+            let content = super::bidi::directed(super::bidi::isolated(content, &padded.inline), dir);
             // Full width: each column's share of the row is its share of the natural width, so
             // a wider row widens columns in proportion and a narrower one shrinks them as
             // without it. A table that scrolls never shrinks a column below its content.
@@ -460,7 +461,11 @@ impl Renderer {
             r = r.child(
                 // Clipped: a word wider than a shrunk column (or a row still streaming in) must
                 // not run into the next column.
-                cell.pl(self.pad_left(j, pad_x)).pr(pad_x).py(pad_y).clip_soft(0.0).child(self.select_inline(content, inl, maps.get(j))),
+                cell.pl(self.pad_left(j, pad_x))
+                    .pr(pad_x)
+                    .py(pad_y)
+                    .clip_soft(0.0)
+                    .child(self.select_inline_padded(content, &padded, inl, maps.get(j))),
             );
         }
         r
@@ -515,23 +520,37 @@ impl Renderer {
                 if inl.text.is_empty() {
                     continue;
                 }
-                let spans = self.spans(inl, font);
+                let padded = self.pad_styled_links(inl, font);
+                let p_inl = &*padded.inline;
+                let spans = self.spans_padded(&padded, font);
                 // Unrounded, as a browser's table layout sums them; a hair over, so a cell at
                 // its column's natural width never wraps its last word.
-                let (min, max) = rune::text::content_widths(&inl.text, &spans, font);
-                // Inline code's padding is white space set around it, which a line leaves
-                // out of its width where it ends the line; a page counts an inline box's
-                // padding in the cell's widths.
-                let ends_code = |end: usize| inl.text[end..].chars().next().is_none_or(char::is_whitespace);
+                let (min, max) = rune::text::content_widths(&p_inl.text, &spans, font);
+                // Inline code's and styled links' padding is white space set around them, which a
+                // line leaves out of its width where it ends the line; a page counts an inline
+                // box's padding in the cell's widths.
+                let ends_pad = |end: usize| p_inl.text[end..].chars().next().is_none_or(char::is_whitespace);
                 let pad = |hit: bool| if hit { self.s.inline_code_pad } else { 0.0 };
-                let pads = inl.spans.iter().filter(|s| s.2 == Style::CodePad && inl.spans.iter().any(|c| c.2 == Style::Code && c.1 == s.0));
-                let (last, word) = pads.fold((false, false), |(last, word), s| (last || s.1 == inl.text.len(), word || ends_code(s.1)));
+                let pads = p_inl.spans.iter().filter(|s| s.2 == Style::CodePad && p_inl.spans.iter().any(|c| c.2 == Style::Code && c.1 == s.0));
+                let (last, word) = pads.fold((false, false), |(last, word), s| (last || s.1 == p_inl.text.len(), word || ends_pad(s.1)));
                 // Code that ends the cell lost its end padding with the line's trailing space
                 // (`parser::trimmed_len`), but a page still counts it: the cell is as wide as the chip.
-                let ends = inl.spans.iter().any(|c| c.2 == Style::Code && c.1 >= inl.text.len());
+                let ends = p_inl.spans.iter().any(|c| c.2 == Style::Code && c.1 >= p_inl.text.len());
                 let (last, word) = (last || ends, word || ends);
-                natural[j] = max + pad(last) + 0.01;
-                fit[j] = min + pad(word) + 0.01;
+                let link_last = padded
+                    .link_pads
+                    .iter()
+                    .filter(|(r, _)| r.end == p_inl.text.len())
+                    .map(|(_, w)| *w)
+                    .fold(0.0f32, f32::max);
+                let link_word = padded
+                    .link_pads
+                    .iter()
+                    .filter(|(r, _)| ends_pad(r.end))
+                    .map(|(_, w)| *w)
+                    .fold(0.0f32, f32::max);
+                natural[j] = max + pad(last) + link_last + 0.01;
+                fit[j] = min + pad(word) + link_word + 0.01;
             }
             let rw = Rc::new(RowWidths { natural: natural.into_boxed_slice(), fit: fit.into_boxed_slice() });
             ROW_WIDTHS.with_borrow_mut(|c| c.insert(rkey, rw.clone(), 8 * n + 48));

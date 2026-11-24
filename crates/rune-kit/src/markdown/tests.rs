@@ -285,6 +285,77 @@ fn link_spans_come_before_inner_inline_styles_so_bold_em_and_code_keep_theirs() 
 }
 
 #[test]
+fn styled_bg_links_reserve_uncopied_horizontal_room_and_keep_highlight_ranges() {
+    let style = MarkdownStyle::neutral(true);
+    let bg = Color { r: 0.2, g: 0.2, b: 0.2, a: 1.0 };
+    let look: LinkLook = Rc::new(move |url| {
+        url.starts_with("orch://").then(|| (Span::new(0, 0).color(Color::WHITE).mono().bg(bg, 4.0), LinkPaint::new()))
+    });
+    let (blocks, sources, tasks, _, _) = doc_cached("In [a.rs](orch://file/a.rs) and [b.rs](orch://file/b.rs): [c.rs](orch://file/c.rs)[d.rs](orch://file/d.rs) ([web](https://example.com))");
+    let Block::Para(inl) = &blocks[0] else { panic!() };
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_help: None, link_ring: None, code_link: None, on_task: None,
+        tasks_read_only: false, selectable: false, scroll_wide: false, tentative: None, highlighter: Highlighter::builtin(), sources,
+        next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
+        #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None, flow: Cell::default() };
+
+    let padded = r.pad_styled_links(inl, style.body);
+    assert_eq!(padded.link_pads.len(), 8, "four styled bg links get leading and trailing pads; web link does not");
+    let link_texts: Vec<&str> = padded.inline.links.iter().map(|(a, b, _)| &padded.inline.text[*a..*b]).collect();
+    assert_eq!(link_texts, vec!["a.rs", "b.rs", "c.rs", "d.rs", "web"]);
+
+    // Original highlight ranges map cleanly onto the link label and surrounding text.
+    let a_orig = inl.text.find("a.rs").unwrap();
+    let colon_orig = inl.text.find(':').unwrap();
+    let a_mapped = padded.map_range(a_orig..a_orig + 4);
+    let colon_mapped = padded.map_range(colon_orig..colon_orig + 1);
+    assert_eq!(&padded.inline.text[a_mapped], "a.rs");
+    assert_eq!(&padded.inline.text[colon_mapped.clone()], ":");
+
+    // Adjacent links stay separated by both trailing and leading pads.
+    let c_end = padded.inline.links[2].1;
+    let d_start = padded.inline.links[3].0;
+    assert_eq!(d_start - c_end, 2 * PAD.len());
+
+    // In rendered text layout, each padded link's bg rect (`x0 - 4 .. x1 + 4`) stays strictly
+    // clear of surrounding glyphs like `In`, `:`, and adjacent pills.
+    let spans = r.spans_padded(&padded, style.body);
+    let mut ts = rune::text::TextSystem::default();
+    let layout = ts.layout_rich(&padded.inline.text, &spans, style.body, 2.0, None);
+    let mut decos = Vec::new();
+    ts.decorations(&layout, &spans, 2.0, [0.0, 0.0], &mut decos);
+    let pills: Vec<[f32; 4]> = decos.iter().filter(|d| d.radius > 0.0).map(|d| d.rect).collect();
+    assert_eq!(pills.len(), 4);
+    let in_w = rune::text::measure("In ", &[], style.body, None).0 * 2.0;
+    assert!(
+        pills[0][0] > in_w + 1.0,
+        "link pill left edge ({}) should stay clear of preceding space ({in_w})",
+        pills[0][0],
+    );
+    let prefix_spans: Vec<Span> = spans
+        .iter()
+        .filter(|s| (s.start as usize) < colon_mapped.start)
+        .cloned()
+        .map(|mut s| {
+            s.end = s.end.min(colon_mapped.start as u32);
+            s
+        })
+        .collect();
+    let colon_x = rune::text::measure(&padded.inline.text[..colon_mapped.start], &prefix_spans, style.body, None).0 * 2.0;
+    assert!(
+        pills[1][0] + pills[1][2] < colon_x - 1.0,
+        "link pill right edge ({}) should stay clear of trailing colon ({colon_x})",
+        pills[1][0] + pills[1][2],
+    );
+    // Adjacent pills do not overlap each other either.
+    assert!(
+        pills[2][0] + pills[2][2] < pills[3][0] - 1.0,
+        "adjacent link pills should not overlap: {:?} vs {:?}",
+        pills[2],
+        pills[3],
+    );
+}
+
+#[test]
 fn pure_markdown_caches_its_built_subtree_keeps_paths_and_invalidates_on_change() {
     use rune::{Cx, Env, Runtime};
 

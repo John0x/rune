@@ -1,6 +1,36 @@
 //! Links in Markdown: their handlers, looks and rings, and wiring them onto the text.
+use std::borrow::Cow;
+
 use super::*;
 use rune::PointerPress;
+
+/// Uncopied horizontal padding around links whose [`Markdown::link_style`] sets a padded
+/// background (`Span::bg` with `bg_pad > 0`), so the painted chip and any [`Markdown::link_ring`]
+/// border do not collide with surrounding text or punctuation.
+pub(super) struct PaddedInline<'a> {
+    pub(super) inline: Cow<'a, Inline>,
+    /// `(byte_range_in_padded_text, width_pt)` for each inserted uncopied padding span.
+    pub(super) link_pads: Vec<(Range<usize>, f32)>,
+    /// Sorted original byte offsets where [`PAD`] was inserted (`pos <= a` shifts starts,
+    /// `pos < b` shifts ends).
+    insert_positions: Vec<usize>,
+}
+
+impl PaddedInline<'_> {
+    /// Maps a byte range in the original `Inline::text` into `self.inline.text`.
+    pub(super) fn map_range(&self, r: Range<usize>) -> Range<usize> {
+        if self.insert_positions.is_empty() {
+            return r;
+        }
+        let start = r.start + self.insert_positions.partition_point(|&p| p <= r.start) * PAD.len();
+        let end = if r.start < r.end {
+            r.end + self.insert_positions.partition_point(|&p| p < r.end) * PAD.len()
+        } else {
+            start
+        };
+        start..end
+    }
+}
 
 pub(super) type LinkWire = (Rc<dyn Fn(El) -> El>, Option<std::any::TypeId>);
 pub(super) type LinkLook = Rc<dyn Fn(&str) -> Option<(Span, LinkPaint)>>;
@@ -127,6 +157,76 @@ impl Renderer {
             Span { start: a as u32, end: b as u32, ..own }
         } else {
             Span { color: Some(s.accent), underline: Some(s.link_underline), ..Span::new(a, b) }
+        }
+    }
+
+    /// Reserves uncopied horizontal space around any link whose [`Markdown::link_style`] paints a
+    /// padded background (`Span::bg` with `bg_pad > 0`), keeping the chip's border clear of
+    /// adjacent characters and punctuation without altering clipboard copy or find-in-page offsets.
+    pub(super) fn pad_styled_links<'a>(&self, inl: &'a Inline, font: TextStyle) -> PaddedInline<'a> {
+        let Some(look) = self.link_look.as_ref().filter(|_| !inl.links.is_empty()) else {
+            return PaddedInline {
+                inline: Cow::Borrowed(inl),
+                link_pads: Vec::new(),
+                insert_positions: Vec::new(),
+            };
+        };
+        let outer = (font.size * 0.12).max(1.5);
+        let mut inserts: Vec<(usize, bool, f32)> = Vec::new();
+        for &(a, b, ref url) in &inl.links {
+            if a >= b || b > inl.text.len() || !inl.text.is_char_boundary(a) || !inl.text.is_char_boundary(b) {
+                continue;
+            }
+            if let Some((span, _)) = look(url)
+                && span.bg.is_some()
+                && span.bg_pad.is_finite()
+                && span.bg_pad > 0.0
+            {
+                let width = span.bg_pad + outer;
+                inserts.push((a, false, width));
+                inserts.push((b, true, width));
+            }
+        }
+        if inserts.is_empty() {
+            return PaddedInline {
+                inline: Cow::Borrowed(inl),
+                link_pads: Vec::new(),
+                insert_positions: Vec::new(),
+            };
+        }
+        // At the same byte (adjacent links), the earlier link's trailing pad (`is_after = true`)
+        // comes before the next link's leading pad (`is_after = false`).
+        inserts.sort_by_key(|&(pos, is_after, _)| (pos, !is_after));
+
+        let mut text = String::with_capacity(inl.text.len() + inserts.len() * PAD.len());
+        let mut link_pads = Vec::with_capacity(inserts.len());
+        let mut insert_positions = Vec::with_capacity(inserts.len());
+        let mut cursor = 0;
+        for &(pos, _, width) in &inserts {
+            if pos > cursor {
+                text.push_str(&inl.text[cursor..pos]);
+                cursor = pos;
+            }
+            let start = text.len();
+            text.push_str(PAD);
+            link_pads.push((start..text.len(), width));
+            insert_positions.push(pos);
+        }
+        if cursor < inl.text.len() {
+            text.push_str(&inl.text[cursor..]);
+        }
+
+        let map = |a: usize, b: usize| -> (usize, usize) {
+            let na = a + insert_positions.partition_point(|&p| p <= a) * PAD.len();
+            let nb = if a < b { b + insert_positions.partition_point(|&p| p < b) * PAD.len() } else { na };
+            (na, nb)
+        };
+        let spans = inl.spans.iter().map(|&(a, b, st)| { let (na, nb) = map(a, b); (na, nb, st) }).collect();
+        let links = inl.links.iter().map(|(a, b, url)| { let (na, nb) = map(*a, *b); (na, nb, url.clone()) }).collect();
+        PaddedInline {
+            inline: Cow::Owned(Inline { text, spans, links }),
+            link_pads,
+            insert_positions,
         }
     }
 
