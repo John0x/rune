@@ -116,6 +116,7 @@ pub(crate) struct PillChip {
     pub start: u32,
     pub end: u32,
     pub icon: Option<&'static Icon>,
+    pub icon_color: Option<Color>,
     pub bg: Option<Color>,
     pub fg: Option<Color>,
     pub bare: Option<Box<BareIcon>>,

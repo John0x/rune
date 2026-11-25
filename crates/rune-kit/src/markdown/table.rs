@@ -540,17 +540,32 @@ impl Renderer {
                 let link_last = padded
                     .link_pads
                     .iter()
-                    .filter(|(r, _)| r.end == p_inl.text.len())
-                    .map(|(_, w)| *w)
+                    .filter(|(r, _, _)| r.end == p_inl.text.len())
+                    .map(|(_, _, w)| *w)
                     .fold(0.0f32, f32::max);
                 let link_word = padded
                     .link_pads
                     .iter()
-                    .filter(|(r, _)| ends_pad(r.end))
-                    .map(|(_, w)| *w)
+                    .filter(|(r, _, _)| ends_pad(r.end))
+                    .map(|(_, _, w)| *w)
                     .fold(0.0f32, f32::max);
-                natural[j] = max + pad(last) + link_last + 0.01;
-                fit[j] = min + pad(word) + link_word + 0.01;
+                // Inline pill links reserve horizontal room through `InlineBox`es (margin + pad +
+                // optional icon + trail), which `content_widths` does not see.
+                let pill_extra: f32 = self.link_pill.as_ref().map_or(0.0, |pill| {
+                    let margin = (font.size * 0.12).max(1.5);
+                    let p_pad = (font.size * 0.36).max(3.0);
+                    let icon_w = (font.size * 0.95).round() + (font.size * 0.22).max(2.0);
+                    p_inl
+                        .links
+                        .iter()
+                        .filter_map(|(_, _, url)| pill(url))
+                        .map(|ps| {
+                            2.0 * (margin + p_pad) + if ps.has_icon() { icon_w } else { 0.0 }
+                        })
+                        .sum()
+                });
+                natural[j] = max + pad(last) + link_last + pill_extra + 0.01;
+                fit[j] = min + pad(word) + link_word + pill_extra + 0.01;
             }
             let rw = Rc::new(RowWidths { natural: natural.into_boxed_slice(), fit: fit.into_boxed_slice() });
             ROW_WIDTHS.with_borrow_mut(|c| c.insert(rkey, rw.clone(), 8 * n + 48));

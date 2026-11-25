@@ -4,36 +4,58 @@ use std::borrow::Cow;
 use super::*;
 use rune::PointerPress;
 
+/// One byte edit applied to `Inline::text` when rewriting styled or pill links.
+struct TextEditOp {
+    orig_start: usize,
+    orig_end: usize,
+    new_len: usize,
+}
+
 /// Uncopied horizontal padding around links whose [`Markdown::link_style`] sets a padded
-/// background (`Span::bg` with `bg_pad > 0`), so the painted chip and any [`Markdown::link_ring`]
-/// border do not collide with surrounding text or punctuation.
+/// background (`Span::bg` with `bg_pad > 0`), plus stripped inner `CodePad` runs inside
+/// pill/bg-styled links so backticks inside a link label never inflate its chip.
 pub(super) struct PaddedInline<'a> {
     pub(super) inline: Cow<'a, Inline>,
-    /// `(byte_range_in_padded_text, width_pt)` for each inserted uncopied padding span.
-    pub(super) link_pads: Vec<(Range<usize>, f32)>,
-    /// Sorted original byte offsets where [`PAD`] was inserted (`pos <= a` shifts starts,
-    /// `pos < b` shifts ends).
-    insert_positions: Vec<usize>,
+    /// `(byte_range_in_padded_text, font_size_pt, width_pt)` for each inserted uncopied padding span.
+    pub(super) link_pads: Vec<(Range<usize>, f32, f32)>,
+    /// Sorted non-overlapping edits applied to original `Inline::text` bytes.
+    edits: Vec<TextEditOp>,
 }
 
 impl PaddedInline<'_> {
+    fn map_point(&self, pos: usize, is_end: bool) -> usize {
+        let mut delta: isize = 0;
+        for e in &self.edits {
+            if e.orig_start == e.orig_end {
+                if (!is_end && e.orig_start <= pos) || (is_end && e.orig_start < pos) {
+                    delta += e.new_len as isize;
+                }
+            } else if e.orig_end <= pos {
+                delta += e.new_len as isize - (e.orig_end - e.orig_start) as isize;
+            } else if e.orig_start < pos {
+                // `pos` lies inside a removed range: clamp to the start of the removal.
+                return (e.orig_start as isize + delta).max(0) as usize;
+            } else {
+                break;
+            }
+        }
+        (pos as isize + delta).max(0) as usize
+    }
+
     /// Maps a byte range in the original `Inline::text` into `self.inline.text`.
     pub(super) fn map_range(&self, r: Range<usize>) -> Range<usize> {
-        if self.insert_positions.is_empty() {
+        if self.edits.is_empty() {
             return r;
         }
-        let start = r.start + self.insert_positions.partition_point(|&p| p <= r.start) * PAD.len();
-        let end = if r.start < r.end {
-            r.end + self.insert_positions.partition_point(|&p| p < r.end) * PAD.len()
-        } else {
-            start
-        };
+        let start = self.map_point(r.start, false);
+        let end = if r.start < r.end { self.map_point(r.end, true).max(start) } else { start };
         start..end
     }
 }
 
 pub(super) type LinkWire = (Rc<dyn Fn(El) -> El>, Option<std::any::TypeId>);
 pub(super) type LinkLook = Rc<dyn Fn(&str) -> Option<(Span, LinkPaint)>>;
+pub(super) type LinkPill = Rc<dyn Fn(&str) -> Option<PillStyle>>;
 pub(super) type LinkRing = Rc<dyn Fn(&str) -> Option<(Color, f32)>>;
 pub(super) type LinkHelp = Rc<dyn Fn(&str) -> Option<String>>;
 pub(super) type CodeLink = (Rc<dyn Fn(&str) -> Option<String>>, Color);
@@ -89,6 +111,14 @@ impl Markdown {
     /// hovered. Applies with or without a handler.
     pub fn link_style(mut self, f: impl Fn(&str) -> Option<(Span, LinkPaint)> + 'static) -> Self {
         self.link_look = Some(Rc::new(f));
+        self
+    }
+    /// Draws chosen links as inline [`El::pills`](rune::El::pills) chips (rounded fill, optional
+    /// leading icon, atomic line wrapping and zero-height inline-box horizontal room). Combine
+    /// with [`Self::link_style`] for typography and hover paints, and [`Self::link_ring`] for an
+    /// inset hairline border.
+    pub fn link_pill(mut self, f: impl Fn(&str) -> Option<PillStyle> + 'static) -> Self {
+        self.link_pill = Some(Rc::new(f));
         self
     }
     /// An inset border ring `(color, width_pt)` inside the rounded [`Span::bg`] of chosen links
@@ -160,73 +190,134 @@ impl Renderer {
         }
     }
 
-    /// Reserves uncopied horizontal space around any link whose [`Markdown::link_style`] paints a
-    /// padded background (`Span::bg` with `bg_pad > 0`), keeping the chip's border clear of
-    /// adjacent characters and punctuation without altering clipboard copy or find-in-page offsets.
+    pub(super) fn is_pill_link(&self, url: &str) -> bool {
+        self.link_pill.as_ref().is_some_and(|f| f(url).is_some())
+    }
+
+    /// Rewrites `inl` for styled/pill links: strips inner `Style::CodePad` spaces inside chip or
+    /// pill links (so backticks inside a link label never pad the interior of its chip), and
+    /// reserves uncopied horizontal space around non-pill bg-styled links using spaces sized at
+    /// `<= font.size` so line height never grows.
     pub(super) fn pad_styled_links<'a>(&self, inl: &'a Inline, font: TextStyle) -> PaddedInline<'a> {
-        let Some(look) = self.link_look.as_ref().filter(|_| !inl.links.is_empty()) else {
+        if inl.links.is_empty() || (self.link_look.is_none() && self.link_pill.is_none()) {
             return PaddedInline {
                 inline: Cow::Borrowed(inl),
                 link_pads: Vec::new(),
-                insert_positions: Vec::new(),
+                edits: Vec::new(),
             };
-        };
+        }
+        enum Action {
+            /// Insert `count` narrow no-break spaces at `pos`, drawn at `size_pt` (`<= font.size`) for `width_pt`.
+            Insert { pos: usize, is_after: bool, count: usize, size_pt: f32, width_pt: f32 },
+            /// Remove an inner `Style::CodePad` byte range inside a pill/bg-styled link.
+            Remove { start: usize, end: usize },
+        }
         let outer = (font.size * 0.12).max(1.5);
-        let mut inserts: Vec<(usize, bool, f32)> = Vec::new();
+        let mut actions: Vec<Action> = Vec::new();
+        let mut chip_ranges: Vec<(usize, usize)> = Vec::new();
         for &(a, b, ref url) in &inl.links {
             if a >= b || b > inl.text.len() || !inl.text.is_char_boundary(a) || !inl.text.is_char_boundary(b) {
                 continue;
             }
-            if let Some((span, _)) = look(url)
+            if self.is_pill_link(url) {
+                chip_ranges.push((a, b));
+                continue;
+            }
+            if let Some((span, _)) = self.link_look.as_ref().and_then(|look| look(url))
                 && span.bg.is_some()
                 && span.bg_pad.is_finite()
                 && span.bg_pad > 0.0
             {
-                let width = span.bg_pad + outer;
-                inserts.push((a, false, width));
-                inserts.push((b, true, width));
+                chip_ranges.push((a, b));
+                let width_pt = span.bg_pad + outer;
+                let (count, size_pt) = render::pad_run(font, width_pt);
+                actions.push(Action::Insert { pos: a, is_after: false, count, size_pt, width_pt });
+                actions.push(Action::Insert { pos: b, is_after: true, count, size_pt, width_pt });
             }
         }
-        if inserts.is_empty() {
+        if !chip_ranges.is_empty() {
+            for &(sa, sb, st) in &inl.spans {
+                if matches!(st, Style::CodePad)
+                    && sa < sb
+                    && sb <= inl.text.len()
+                    && chip_ranges.iter().any(|&(la, lb)| la <= sa && sb <= lb)
+                {
+                    actions.push(Action::Remove { start: sa, end: sb });
+                }
+            }
+        }
+        if actions.is_empty() {
             return PaddedInline {
                 inline: Cow::Borrowed(inl),
                 link_pads: Vec::new(),
-                insert_positions: Vec::new(),
+                edits: Vec::new(),
             };
         }
-        // At the same byte (adjacent links), the earlier link's trailing pad (`is_after = true`)
-        // comes before the next link's leading pad (`is_after = false`).
-        inserts.sort_by_key(|&(pos, is_after, _)| (pos, !is_after));
+        // Order by original start offset: at the same byte, trailing insert (`is_after = true`)
+        // comes first, then removals starting there, then leading insert (`is_after = false`).
+        actions.sort_by_key(|a| match *a {
+            Action::Insert { pos, is_after: true, .. } => (pos, 0u8),
+            Action::Remove { start, .. } => (start, 1u8),
+            Action::Insert { pos, is_after: false, .. } => (pos, 2u8),
+        });
 
-        let mut text = String::with_capacity(inl.text.len() + inserts.len() * PAD.len());
-        let mut link_pads = Vec::with_capacity(inserts.len());
-        let mut insert_positions = Vec::with_capacity(inserts.len());
-        let mut cursor = 0;
-        for &(pos, _, width) in &inserts {
-            if pos > cursor {
-                text.push_str(&inl.text[cursor..pos]);
-                cursor = pos;
+        let mut text = String::with_capacity(inl.text.len() + 32);
+        let mut link_pads = Vec::new();
+        let mut edits = Vec::new();
+        let mut cursor = 0usize;
+        for action in actions {
+            match action {
+                Action::Insert { pos, count, size_pt, width_pt, .. } => {
+                    if pos > cursor {
+                        text.push_str(&inl.text[cursor..pos]);
+                        cursor = pos;
+                    }
+                    let start = text.len();
+                    for _ in 0..count {
+                        text.push('\u{202f}');
+                    }
+                    let new_len = text.len() - start;
+                    link_pads.push((start..text.len(), size_pt, width_pt));
+                    edits.push(TextEditOp { orig_start: pos, orig_end: pos, new_len });
+                }
+                Action::Remove { start, end } => {
+                    if end <= cursor {
+                        continue;
+                    }
+                    let from = start.max(cursor);
+                    if from > cursor {
+                        text.push_str(&inl.text[cursor..from]);
+                    }
+                    cursor = end;
+                    edits.push(TextEditOp { orig_start: from, orig_end: end, new_len: 0 });
+                }
             }
-            let start = text.len();
-            text.push_str(PAD);
-            link_pads.push((start..text.len(), width));
-            insert_positions.push(pos);
         }
         if cursor < inl.text.len() {
             text.push_str(&inl.text[cursor..]);
         }
 
-        let map = |a: usize, b: usize| -> (usize, usize) {
-            let na = a + insert_positions.partition_point(|&p| p <= a) * PAD.len();
-            let nb = if a < b { b + insert_positions.partition_point(|&p| p < b) * PAD.len() } else { na };
-            (na, nb)
-        };
-        let spans = inl.spans.iter().map(|&(a, b, st)| { let (na, nb) = map(a, b); (na, nb, st) }).collect();
-        let links = inl.links.iter().map(|(a, b, url)| { let (na, nb) = map(*a, *b); (na, nb, url.clone()) }).collect();
+        let probe = PaddedInline { inline: Cow::Borrowed(inl), link_pads: Vec::new(), edits };
+        let spans = inl
+            .spans
+            .iter()
+            .filter_map(|&(a, b, st)| {
+                let r = probe.map_range(a..b);
+                (r.start < r.end).then_some((r.start, r.end, st))
+            })
+            .collect();
+        let links = inl
+            .links
+            .iter()
+            .filter_map(|(a, b, url)| {
+                let r = probe.map_range(*a..*b);
+                (r.start < r.end).then_some((r.start, r.end, url.clone()))
+            })
+            .collect();
         PaddedInline {
             inline: Cow::Owned(Inline { text, spans, links }),
             link_pads,
-            insert_positions,
+            edits: probe.edits,
         }
     }
 
@@ -234,6 +325,16 @@ impl Renderer {
     /// span of `e` (the text element holding it) reporting its destination.
     pub(super) fn wire_link(&self, mut e: El, inl: &Inline) -> El {
         let inl = &*self.with_code_links(inl);
+        if let Some(pill) = self.link_pill.as_ref().filter(|_| !inl.links.is_empty()) {
+            let pills: Vec<(Range<usize>, PillStyle)> = inl
+                .links
+                .iter()
+                .filter_map(|(a, b, url)| Some((*a..*b, pill(url)?)))
+                .collect();
+            if !pills.is_empty() {
+                e = e.pills(pills);
+            }
+        }
         if let Some(ring) = self.link_ring.as_ref().filter(|_| !inl.links.is_empty()) {
             for (a, b, url) in &inl.links {
                 if let Some((color, width)) = ring(url) {

@@ -298,7 +298,7 @@ pub(super) fn with_renderer<R>(r: &Renderer, f: impl FnOnce() -> R) -> R {
 fn compute_base(r: &Renderer) -> (u64, u64) {
     let Renderer {
         s, highlights, reveal, streaming, tasks_read_only, selectable, scroll_wide, on_link, on_link_secondary,
-        link_look: _, link_help: _, link_ring: _, link_favicon: _, code_link: _,
+        link_look: _, link_pill: _, link_help: _, link_ring: _, link_favicon: _, code_link: _,
         highlighter: _, sources: _, next_source: _, tasks: _, next_task: _, on_task: _,
         #[cfg(feature = "mermaid")]
         diagram_frame: _,
@@ -414,6 +414,12 @@ impl Renderer {
                     hash_span(&sp, h);
                     let _ = std::fmt::write(&mut HashFmt(h), format_args!("{lp:?}"));
                 }
+            }
+        }
+        if let Some(pill) = &self.link_pill {
+            match pill(url) {
+                None => 0u8.hash(h),
+                Some(p) => { 1u8.hash(h); let _ = std::fmt::write(&mut HashFmt(h), format_args!("{p:?}")); }
             }
         }
         if let Some(ring) = &self.link_ring { ring(url).map(|(c, w)| (c, w.to_bits())).hash(h); }
@@ -606,6 +612,11 @@ impl Renderer {
                         look(url).map(|(sp, _)| (sp.weight.map(f32::to_bits), sp.size.map(f32::to_bits), sp.mono, sp.italic)).hash(&mut h);
                     }
                 }
+                if let Some(pill) = &self.link_pill {
+                    for url in &p.links {
+                        pill(url).map(|ps| format!("{ps:?}")).hash(&mut h);
+                    }
+                }
             }
             None => {
                 for inl in cells.iter().take(n) {
@@ -614,6 +625,11 @@ impl Renderer {
                     if let Some(look) = &self.link_look {
                         for (_, _, url) in &resolved.links {
                             look(url).map(|(sp, _)| (sp.weight.map(f32::to_bits), sp.size.map(f32::to_bits), sp.mono, sp.italic)).hash(&mut h);
+                        }
+                    }
+                    if let Some(pill) = &self.link_pill {
+                        for (_, _, url) in &resolved.links {
+                            pill(url).map(|ps| format!("{ps:?}")).hash(&mut h);
                         }
                     }
                 }

@@ -61,7 +61,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use rune::{Align, Color, Cursor, El, Family, Link, LinkPaint, Span, TextHighlight, TextStyle, Tx, col, el, icon, rich, row, text};
+use rune::{Align, Color, Cursor, El, Family, Link, LinkPaint, PillStyle, Span, TextHighlight, TextStyle, Tx, col, el, icon, rich, row, text};
 
 use crate::Kit;
 
@@ -90,7 +90,7 @@ pub use style::MarkdownStyle;
 use crate::budget::Budget;
 use crate::syntax::{Highlighter, SyntaxTheme};
 pub use crate::syntax::Syntax;
-use links::{CodeLink, LinkHelp, LinkLook, LinkRing, LinkWire};
+use links::{CodeLink, LinkHelp, LinkLook, LinkPill, LinkRing, LinkWire};
 pub use cache::parse_cached;
 #[doc(hidden)]
 pub use memo::{block_builds, reset_block_builds};
@@ -214,6 +214,7 @@ pub struct Markdown {
     on_link: Option<LinkWire>,
     on_link_secondary: Option<LinkWire>,
     link_look: Option<LinkLook>,
+    link_pill: Option<LinkPill>,
     link_help: Option<LinkHelp>,
     on_task: Option<TaskWire>,
     tasks_read_only: bool,
@@ -240,7 +241,7 @@ thread_local! {
 
 impl Markdown {
     pub fn new(src: impl Into<String>) -> Markdown {
-        Markdown { src: src.into(), style: None, block_keys: Vec::new(), highlights: Vec::new(), autolink: true, reveal: -1.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_help: None, link_ring: None, code_link: None,
+        Markdown { src: src.into(), style: None, block_keys: Vec::new(), highlights: Vec::new(), autolink: true, reveal: -1.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_pill: None, link_help: None, link_ring: None, code_link: None,
             on_task: None, tasks_read_only: false, selectable: false, copy_source: false, scroll_wide: false, tentative: None, highlighter: Highlighter::builtin(),
             #[cfg(feature = "mermaid")]
             diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None }
@@ -449,6 +450,7 @@ impl Markdown {
             && self.on_link.is_none()
             && self.on_link_secondary.is_none()
             && self.link_look.is_none()
+            && self.link_pill.is_none()
             && self.link_help.is_none()
             && self.link_ring.is_none()
             && self.code_link.is_none()
@@ -497,7 +499,7 @@ impl Markdown {
         };
         let dirs = bidi::Dirs::new(&blocks);
         let root_dir = dirs.of_slice(&blocks).or(self.tentative);
-        let r = Renderer { s: style.clone(), highlights: self.highlights, reveal: self.reveal, streaming: self.streaming, on_link: self.on_link, on_link_secondary: self.on_link_secondary, link_look: self.link_look, link_help: self.link_help, link_ring: self.link_ring, code_link: self.code_link,
+        let r = Renderer { s: style.clone(), highlights: self.highlights, reveal: self.reveal, streaming: self.streaming, on_link: self.on_link, on_link_secondary: self.on_link_secondary, link_look: self.link_look, link_pill: self.link_pill, link_help: self.link_help, link_ring: self.link_ring, code_link: self.code_link,
             on_task: self.on_task, tasks_read_only: self.tasks_read_only, selectable: self.selectable, scroll_wide: self.scroll_wide, tentative: self.tentative,
             highlighter: self.highlighter, sources, next_source: Cell::new(0), tasks, next_task: Cell::new(0),
             current_block_key: RefCell::new("b0".into()),

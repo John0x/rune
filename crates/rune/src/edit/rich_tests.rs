@@ -993,7 +993,7 @@ fn pill_edge_cases_words_lines_bidi_and_direct_text_mutation() {
     let chips: Vec<crate::text::PillChip> = w
         .display_pills()
         .into_iter()
-        .map(|(start, end, _)| crate::text::PillChip { start, end, icon: None, bg: None, fg: None, bare: None })
+        .map(|(start, end, _)| crate::text::PillChip { start, end, icon: None, icon_color: None, bg: None, fg: None, bare: None })
         .collect();
     let layout = ts.layout_blocks(&w.text, &[], w.blocks(), &chips, style, 2.0, Some(220.0), parley::Alignment::Start);
     assert!(layout.len() >= 3, "wrapped into {} lines", layout.len());
@@ -1016,21 +1016,21 @@ fn pill_edge_cases_words_lines_bidi_and_direct_text_mutation() {
     let p_chips: Vec<crate::text::PillChip> = ime_e
         .display_pills()
         .into_iter()
-        .map(|(start, end, _)| crate::text::PillChip { start, end, icon: None, bg: None, fg: None, bare: None })
+        .map(|(start, end, _)| crate::text::PillChip { start, end, icon: None, icon_color: None, bg: None, fg: None, bare: None })
         .collect();
     let ime_layout = ts.layout_blocks(&disp, &[], &[Block::Paragraph], &p_chips, style, 2.0, None, parley::Alignment::Start);
     let (mut decos, mut icons) = (Vec::new(), Vec::new());
-    crate::text::pill_chips(&ime_layout, &p_chips, 14.0, 2.0, [0.0, 0.0], Color::BLACK, &mut decos, &mut icons);
+    crate::text::pill_chips(&ime_layout, &p_chips, &[], crate::text::SPAN_RADIUS, 14.0, 2.0, [0.0, 0.0], Color::BLACK, &mut decos, &mut icons);
     let boxes = crate::text::range_boxes(&ime_layout, pa, pb, false);
     assert_eq!(boxes.len(), 1);
     assert!(boxes[0].0.x0 as f32 >= decos[0].rect[0] + decos[0].rect[2] - 0.5, "preedit box {:?} overlaps chip {:?}", boxes[0].0, decos[0].rect);
 
     // RTL pill and mixed RTL+LTR pill chips have positive width.
     for (txt, start, end) in [("דוד", 0u32, 6u32), ("שלום@maya", 8, 13), ("@e\u{0301}", 0, 4)] {
-        let pc = [crate::text::PillChip { start, end, icon: None, bg: None, fg: None, bare: None }];
+        let pc = [crate::text::PillChip { start, end, icon: None, icon_color: None, bg: None, fg: None, bare: None }];
         let l = ts.layout_blocks(txt, &[], &[Block::Paragraph], &pc, style, 2.0, None, parley::Alignment::Start);
         let (mut d, mut ic) = (Vec::new(), Vec::new());
-        crate::text::pill_chips(&l, &pc, 14.0, 2.0, [0.0, 0.0], Color::BLACK, &mut d, &mut ic);
+        crate::text::pill_chips(&l, &pc, &[], crate::text::SPAN_RADIUS, 14.0, 2.0, [0.0, 0.0], Color::BLACK, &mut d, &mut ic);
         assert_eq!(d.len(), 1, "{txt:?}");
         assert!(d[0].rect[2] > 8.0, "chip for {txt:?} has width {}", d[0].rect[2]);
     }

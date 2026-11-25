@@ -113,7 +113,7 @@ fn pill_chips_keep_room_and_never_overlap_at_wraps() {
         .enumerate()
         .map(|(k, label)| {
             let start = content.find(label).unwrap() as u32;
-            PillChip { start, end: start + label.len() as u32, icon: (k == 1).then_some(&DOT), bg: None, fg: None, bare: None }
+            PillChip { start, end: start + label.len() as u32, icon: (k == 1).then_some(&DOT), icon_color: None, bg: None, fg: None, bare: None }
         })
         .collect();
     let scale = 2.0;
@@ -142,7 +142,7 @@ fn pill_chips_keep_room_and_never_overlap_at_wraps() {
         let max = width as f32 * scale;
         let layout = text.layout_blocks(content, &[], &[], &pills, style, scale, Some(max), Alignment::Start);
         let (mut chips, mut icons) = (Vec::new(), Vec::new());
-        pill_chips(&layout, &pills, 14.0, scale, [0.0, 0.0], Color::BLACK, &mut chips, &mut icons);
+        pill_chips(&layout, &pills, &[], SPAN_RADIUS, 14.0, scale, [0.0, 0.0], Color::BLACK, &mut chips, &mut icons);
         assert_eq!(chips.len(), 3, "each pill draws one chip at width {width}");
         assert_eq!(icons.len(), 1);
         let (_, px, at, _) = icons[0];
@@ -197,13 +197,13 @@ fn a_pill_wider_than_its_line_wraps_inside_it() {
     let label = "@Migrate config loader to the new schema";
     let content = format!("as in {label} did");
     let start = content.find(label).unwrap() as u32;
-    let pills = [PillChip { start, end: start + label.len() as u32, icon: None, bg: None, fg: None, bare: None }];
+    let pills = [PillChip { start, end: start + label.len() as u32, icon: None, icon_color: None, bg: None, fg: None, bare: None }];
     let scale = 2.0;
     for width in (90..=200).step_by(7) {
         let max = width as f32 * scale;
         let layout = text.layout_blocks(&content, &[], &[], &pills, style, scale, Some(max), Alignment::Start);
         let (mut chips, mut icons) = (Vec::new(), Vec::new());
-        pill_chips(&layout, &pills, 14.0, scale, [0.0, 0.0], Color::BLACK, &mut chips, &mut icons);
+        pill_chips(&layout, &pills, &[], SPAN_RADIUS, 14.0, scale, [0.0, 0.0], Color::BLACK, &mut chips, &mut icons);
         let rows: Vec<_> = layout.lines().filter(|l| { let r = l.text_range(); r.start < pills[0].end as usize && (pills[0].start as usize) < r.end }).collect();
         assert!(rows.len() >= 2, "the label wraps at width {width}");
         assert_eq!(chips.len(), rows.len(), "one chip per line at width {width}");

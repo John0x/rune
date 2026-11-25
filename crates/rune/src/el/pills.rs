@@ -36,7 +36,7 @@ impl El {
                 continue;
             }
             let at = t.cold.pills.partition_point(|p| p.start < start);
-            t.cold.pills.insert(at, PillChip { start, end, icon: st.icon, bg: st.bg, fg: st.fg, bare: None });
+            t.cold.pills.insert(at, PillChip { start, end, icon: st.icon, icon_color: st.icon_color, bg: st.bg, fg: st.fg, bare: None });
         }
         t.spans = with_pill_colors(&t.spans, &t.cold.pills);
         self
@@ -70,7 +70,7 @@ impl El {
         let at = t.cold.pills.partition_point(|p| p.start < start);
         let InlineIcon { icon, image, size, gap, radius, color } = icon;
         let bare = Some(Box::new(BareIcon { size, gap, radius, image }));
-        t.cold.pills.insert(at, PillChip { start, end, icon, bg: None, fg: color, bare });
+        t.cold.pills.insert(at, PillChip { start, end, icon, icon_color: None, bg: None, fg: color, bare });
         self
     }
 }

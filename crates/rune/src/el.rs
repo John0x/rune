@@ -164,11 +164,12 @@ pub struct PillStyle {
     pub(crate) bg: Option<Color>,
     pub(crate) fg: Option<Color>,
     pub(crate) icon: Option<&'static crate::Icon>,
+    pub(crate) icon_color: Option<Color>,
 }
 
 impl PillStyle {
     pub const fn new() -> Self {
-        Self { bg: None, fg: None, icon: None }
+        Self { bg: None, fg: None, icon: None, icon_color: None }
     }
     /// The chip's colour.
     pub const fn bg(mut self, bg: Color) -> Self {
@@ -180,10 +181,19 @@ impl PillStyle {
         self.fg = Some(fg);
         self
     }
-    /// The leading icon, in the label's colour.
+    /// The leading icon, in [`Self::icon_color`] or the label's colour.
     pub const fn icon(mut self, icon: &'static crate::Icon) -> Self {
         self.icon = Some(icon);
         self
+    }
+    /// The leading icon's colour, overriding [`Self::fg`] for the icon alone.
+    pub const fn icon_color(mut self, color: Color) -> Self {
+        self.icon_color = Some(color);
+        self
+    }
+    /// Whether this pill draws a leading icon.
+    pub const fn has_icon(self) -> bool {
+        self.icon.is_some()
     }
 }
 pub(crate) type InputPasteFn = Rc<dyn Fn(crate::states::States<'_>, &crate::ClipboardContent, &mut Tx) -> bool>;

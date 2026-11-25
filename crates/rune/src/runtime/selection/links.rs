@@ -36,29 +36,30 @@ fn boxes(layout: &Layout<Ink>, len: usize, start: u32, end: u32) -> Vec<(parley:
     crate::text::range_boxes(layout, a, b, false)
 }
 
-/// The link paints to draw this frame, by byte range, with the resting span's `bg_pad`.
-pub(super) struct LinkFx(Vec<(u32, u32, LinkPaint, f32, bool)>);
+/// The link paints to draw this frame, by byte range, with the resting span's `bg_pad`,
+/// whether the node has resting rings, and whether the link is drawn as a pill chip.
+pub(super) struct LinkFx(Vec<(u32, u32, LinkPaint, f32, bool, bool)>);
 
 impl LinkFx {
     pub(super) fn is_empty(&self) -> bool { self.0.is_empty() }
 
     pub(super) fn glyph_color(&self, byte: u32) -> Option<Color> {
-        self.0.iter().find(|(a, b, p, _, _)| byte >= *a && byte < *b && p.color.is_some()).and_then(|(_, _, p, _, _)| p.color)
+        self.0.iter().find(|(a, b, p, ..)| byte >= *a && byte < *b && p.color.is_some()).and_then(|(_, _, p, ..)| p.color)
     }
 
     pub(super) fn decos_piece(&self, piece: &crate::text::Piece<'_>, len: usize, s: f32, origin: [f32; 2], out: &mut Vec<PaintedDeco>) {
         if self.is_empty() { return; }
         if piece.is_whole() { return self.decos(piece.layout, len, s, origin, out); }
-        let clipped: Vec<_> = self.0.iter().filter_map(|&(a, b, p, pad, rings)| {
+        let clipped: Vec<_> = self.0.iter().filter_map(|&(a, b, p, pad, rings, is_pill)| {
             let (sa, sb) = piece.clip((a as usize).min(len), (b as usize).min(len))?;
-            Some((sa as u32, sb as u32, p, pad, rings))
+            Some((sa as u32, sb as u32, p, pad, rings, is_pill))
         }).collect();
         if !clipped.is_empty() { LinkFx(clipped).decos(piece.layout, piece.shaped(piece.end), s, origin, out); }
     }
 
     /// Backgrounds and underlines (device px, layout top-left at `origin`).
     pub(super) fn decos(&self, layout: &Layout<Ink>, len: usize, s: f32, origin: [f32; 2], out: &mut Vec<PaintedDeco>) {
-        for &(a, b, p, bg_pad, has_rings) in &self.0 {
+        for &(a, b, p, bg_pad, has_rings, is_pill) in &self.0 {
             for (bb, line) in boxes(layout, len, a, b) {
                 let (x0, w) = (origin[0] + bb.x0 as f32, (bb.x1 - bb.x0) as f32);
                 if p.bg.is_some() || p.ring.is_some() {
@@ -94,12 +95,15 @@ impl LinkFx {
                         && out.iter().filter(contained).any(|d| (d.rect[0] + d.rect[2] - rect[0] - rect[2]).abs() < 1.5);
                     let mut matched = false;
                     for d in out.iter_mut().filter(|d| {
-                        d.radius > 0.0
-                            && d.rect[0] >= rect[0] - 1.5
+                        if d.radius <= 0.0 || !(d.rect[1] < y1 && y0 < d.rect[1] + d.rect[3]) {
+                            return false;
+                        }
+                        if is_pill {
+                            return d.rect[0] <= x0 + 1.5 && d.rect[0] + d.rect[2] >= x0 + w - 1.5;
+                        }
+                        d.rect[0] >= rect[0] - 1.5
                             && d.rect[0] + d.rect[2] <= rect[0] + rect[2] + 1.5
                             && (split || ((d.rect[0] - rect[0]).abs() < 1.5 && (d.rect[2] - rect[2]).abs() < 1.5))
-                            && d.rect[1] < y1
-                            && y0 < d.rect[1] + d.rect[3]
                     }) {
                         matched = true;
                         if let Some(c) = p.bg {
@@ -150,11 +154,30 @@ impl<S: 'static> Runtime<S> {
         let [ox, oy] = origin(n, spec, flow, rect, s, z);
         let px = s / z.max(1e-4);
         let len = layout_len(n, spec);
+        let pm = crate::text::PillMetrics::new(spec.style.size);
         let mut out = Vec::new();
         for (k, l) in spec.cold.links.iter().enumerate() {
             let (a, b) = drawn(n, l.start, l.end);
-            for (bb, _) in flow.range_boxes((a as usize).min(len), (b as usize).min(len), false) {
-                out.push((k, [ox + bb.x0 as f32 / px, oy + bb.y0 as f32 / px, ox + bb.x1 as f32 / px, oy + bb.y1 as f32 / px]));
+            let pill = spec.cold.pills.iter().find(|p| p.bare.is_none() && p.start == l.start && p.end == l.end);
+            let boxes = flow.range_boxes((a as usize).min(len), (b as usize).min(len), false);
+            let count = boxes.len();
+            for (bi, (bb, _)) in boxes.into_iter().enumerate() {
+                let (lead, trail) = match pill {
+                    Some(p) => (
+                        if bi == 0 { (pm.lead(p.icon.is_some()) - pm.margin) * z } else { 0.0 },
+                        if bi + 1 == count { (pm.trail() - pm.margin) * z } else { 0.0 },
+                    ),
+                    None => (0.0, 0.0),
+                };
+                out.push((
+                    k,
+                    [
+                        ox + bb.x0 as f32 / px - lead,
+                        oy + bb.y0 as f32 / px,
+                        ox + bb.x1 as f32 / px + trail,
+                        oy + bb.y1 as f32 / px,
+                    ],
+                ));
             }
         }
         out
@@ -209,7 +232,8 @@ impl<S: 'static> Runtime<S> {
             } else { continue };
             let (a, b) = drawn(&self.nodes[i], l.start, l.end);
             let pad = spec.spans.iter().find(|sp| sp.start < l.end && sp.end > l.start && sp.bg.is_some()).map_or(2.0, |sp| sp.bg_pad);
-            fx.push((a, b, paint, pad, !spec.cold.rings.is_empty()));
+            let is_pill = spec.cold.pills.iter().any(|p| p.bare.is_none() && p.start == l.start && p.end == l.end);
+            fx.push((a, b, paint, pad, !spec.cold.rings.is_empty(), is_pill));
         }
         LinkFx(fx)
     }

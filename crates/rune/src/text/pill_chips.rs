@@ -47,6 +47,8 @@ pub(crate) fn bare_icons(layout: &Layout<Ink>, pills: &[PillChip], scale: f32, o
 pub(crate) fn pill_chips(
     layout: &Layout<Ink>,
     pills: &[PillChip],
+    rings: &[(u32, u32, Color, f32)],
+    radius: f32,
     size: f32,
     scale: f32,
     origin: [f32; 2],
@@ -58,6 +60,24 @@ pub(crate) fn pill_chips(
         return;
     }
     let pm = PillMetrics::new(size);
+    let min_h = (size * 1.36 * scale).round();
+    let chip_vert = |base: f32, asc: f32, desc: f32| -> (f32, f32) {
+        let mut top = (base - asc - 1.0 * scale).round();
+        let mut bot = (base + desc + 1.0 * scale).round();
+        if bot - top < min_h {
+            let mid = (top + bot) * 0.5;
+            top = (mid - min_h * 0.5).round();
+            bot = top + min_h;
+        }
+        (top, bot)
+    };
+    let pill_ring = |pill: &PillChip| -> Option<(Color, f32)> {
+        rings
+            .iter()
+            .rev()
+            .find(|&&(ra, rb, _, rw)| rw > 0.0 && ra < pill.end && pill.start < rb)
+            .map(|&(_, _, c, rw)| (c, rw * scale))
+    };
     for line in layout.lines() {
         let m = line.metrics();
         let boxes: Vec<parley::PositionedInlineBox> = line
@@ -96,6 +116,8 @@ pub(crate) fn pill_chips(
             }
             let margin = pm.margin * scale;
             let pad = pm.pad * scale;
+            let ring = pill_ring(pill);
+            let byte = pill.end.saturating_sub(1);
             let Some(lead) = lead else {
                 // A label carried on from the line above: its chip runs from the line's start,
                 // flush with the label (no room was made before it), to its trail, or on to the
@@ -106,10 +128,11 @@ pub(crate) fn pill_chips(
                 let x1 = trail.filter(|t| (t.x - gr_x1).abs() < 1.0).map_or(gr_x1 + pad, |t| t.x + t.width - margin);
                 let x1 = if trail.is_none() { line_end } else { x1 };
                 let base = origin[1] + m.baseline;
-                let (top, bot) = ((base - asc - 1.0 * scale).round(), (base + desc + 1.0 * scale).round());
+                let (top, bot) = chip_vert(base, asc, desc);
                 let x0 = gr_x0.min(m.inline_min_coord + m.offset);
                 let rect = [(origin[0] + x0).round(), top, (x1 - x0).max(0.0).round(), bot - top];
-                out.push(PaintedDeco::new(Deco { rect, color: pill.bg.unwrap_or(bg), radius: (5.0 * scale).min(rect[3] * 0.5) }, None, 0));
+                let r = (radius * scale).min(rect[3] * 0.5);
+                out.push(PaintedDeco::new(Deco { rect, color: pill.bg.unwrap_or(bg), radius: r }, ring, byte));
                 continue;
             };
             let rtl_lead = gr_x0 <= gr_x1 && (lead.x - gr_x1).abs() < 1.0;
@@ -139,14 +162,14 @@ pub(crate) fn pill_chips(
                 (asc, desc) = (size * scale * 0.95, size * scale * 0.25);
             }
             let base = origin[1] + m.baseline;
-            let top = (base - asc - 1.0 * scale).round();
-            let bot = (base + desc + 1.0 * scale).round();
+            let (top, bot) = chip_vert(base, asc, desc);
             let rect = [(origin[0] + x0).round(), top, (x1 - x0).max(0.0).round(), bot - top];
-            out.push(PaintedDeco::new(Deco { rect, color: pill.bg.unwrap_or(bg), radius: (5.0 * scale).min(rect[3] * 0.5) }, None, 0));
+            let r = (radius * scale).min(rect[3] * 0.5);
+            out.push(PaintedDeco::new(Deco { rect, color: pill.bg.unwrap_or(bg), radius: r }, ring, byte));
             if let Some(icon) = pill.icon {
                 let px = (pm.icon * scale).round().max(1.0);
                 let ix = if rtl_lead { rect[0] + rect[2] - pm.pad * scale - px } else { rect[0] + pm.pad * scale };
-                icons.push((icon, px as u32, [ix.round(), ((top + bot - px) * 0.5).round()], pill.fg));
+                icons.push((icon, px as u32, [ix.round(), ((top + bot - px) * 0.5).round()], pill.icon_color.or(pill.fg)));
             }
         }
     }

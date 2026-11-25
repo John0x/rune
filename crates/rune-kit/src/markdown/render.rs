@@ -11,6 +11,7 @@ pub(super) struct Renderer {
     pub(super) on_link: Option<LinkWire>,
     pub(super) on_link_secondary: Option<LinkWire>,
     pub(super) link_look: Option<LinkLook>,
+    pub(super) link_pill: Option<LinkPill>,
     pub(super) link_help: Option<LinkHelp>,
     pub(super) on_task: Option<TaskWire>,
     pub(super) tasks_read_only: bool,
@@ -219,6 +220,7 @@ fn collapsed_bottom(mut b: &Block, s: &MarkdownStyle, mut i: usize, mut in_item:
 
 thread_local! {
     static PAD_SIZES: RefCell<std::collections::HashMap<u64, f32>> = RefCell::new(std::collections::HashMap::new());
+    static PAD_RUNS: RefCell<std::collections::HashMap<u64, (usize, f32)>> = RefCell::new(std::collections::HashMap::new());
 }
 
 /// The size that sets inline code's padding spaces (`PAD`, in the text's own `font`) to `pad`
@@ -235,6 +237,24 @@ fn pad_size(font: TextStyle, pad: f32) -> f32 {
     let size = first * pad / wide(first);
     PAD_SIZES.with_borrow_mut(|m| m.insert(key, size));
     size
+}
+
+/// How many narrow no-break spaces (`'\u{202f}'`) and at what font size (`<= font.size`) to
+/// span `pad` points horizontally without ever inflating a line's height above `font`'s own.
+pub(super) fn pad_run(font: TextStyle, pad: f32) -> (usize, f32) {
+    let key = hash_of((font, pad.to_bits(), rune::text::font_epoch(), 1u8));
+    if let Some(hit) = PAD_RUNS.with_borrow(|m| m.get(&key).copied()) {
+        return hit;
+    }
+    let probe_unit = "\u{202f}".repeat(64);
+    let one_at_base = (rune::text::measure(&probe_unit, &[], font, None).0 / 64.0).max(0.1);
+    let count = ((pad / one_at_base).ceil() as usize).clamp(2, 32);
+    let probe = "\u{202f}".repeat(count * 16);
+    let wide = |size: f32| (rune::text::measure(&probe, &[], TextStyle { size, ..font }, None).0 / 16.0).max(0.1);
+    let first = (font.size * pad / wide(font.size)).min(font.size);
+    let size = (first * pad / wide(first)).min(font.size);
+    PAD_RUNS.with_borrow_mut(|m| m.insert(key, (count, size)));
+    (count, size)
 }
 
 /// Code as rich text with `spans` and `highlights` (byte ranges of `code`). Text layout widens
@@ -357,12 +377,21 @@ impl Renderer {
                     continue;
                 }
                 Style::Code => {
-                    let link_base = in_link.and_then(|l| l.size).unwrap_or(base);
+                    let in_pill = inl
+                        .links
+                        .iter()
+                        .any(|(la, lb, url)| *la <= a && b <= *lb && self.is_pill_link(url));
+                    let has_chip = in_pill || in_link.is_some_and(|l| l.bg.is_some());
                     sp.mono = true;
                     sp.weight = Some(s.inline_code_weight);
-                    sp.size = Some(link_base * s.inline_code_scale);
+                    sp.size = Some(if in_pill {
+                        in_link.and_then(|l| l.size).unwrap_or(base * s.inline_code_scale)
+                    } else {
+                        let link_base = in_link.and_then(|l| l.size).unwrap_or(base);
+                        link_base * s.inline_code_scale
+                    });
                     sp.underline = no_line;
-                    if in_link.is_none_or(|l| l.bg.is_none()) {
+                    if !has_chip {
                         sp = sp.bg(s.code_bg, s.inline_code_pad);
                     }
                     code.push(sp);
@@ -384,9 +413,9 @@ impl Renderer {
 
     pub(super) fn spans_padded(&self, padded: &links::PaddedInline<'_>, font: TextStyle) -> Vec<Span> {
         let mut out = self.spans(&padded.inline, font);
-        for (range, width) in &padded.link_pads {
+        for (range, size_pt, _) in &padded.link_pads {
             let mut sp = Span::new(range.start, range.end);
-            sp.size = Some(pad_size(font, *width));
+            sp.size = Some(*size_pt);
             sp.weight = Some(font.weight);
             sp.underline = Some(Color::TRANSPARENT);
             out.push(sp);
@@ -456,7 +485,7 @@ impl Renderer {
         let e = self.select(self.wire_link(self.link_icons(e, inl), inl));
         if !self.selectable { return e; }
         let e = inl.spans.iter().filter(|s| matches!(s.2, Style::CodePad)).fold(e, |e, s| e.uncopied(s.0..s.1));
-        padded.link_pads.iter().fold(e, |e, (r, _)| e.uncopied(r.clone()))
+        padded.link_pads.iter().fold(e, |e, (r, _, _)| e.uncopied(r.clone()))
     }
 
     pub(super) fn with_reveal(&self, e: El) -> El {

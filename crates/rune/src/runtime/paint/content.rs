@@ -426,12 +426,13 @@ impl<S: 'static> Runtime<S> {
                 let d_origin = [base_d_origin[0], base_d_origin[1] + piece.y];
                 let (spans_here, pills) = (piece.spans(&spec.spans), piece.pills(&spec.cold.pills));
                 let from = self.deco_scratch.len();
-                crate::text::pill_chips(layout, &pills, spec.style.size, s, d_origin, pill_bg, &mut self.deco_scratch, &mut pill_icons);
+                let drawn_rings = n.elided.map(|e| e.rings(&spec.cold.rings));
+                let rings = drawn_rings.as_deref().unwrap_or(&spec.cold.rings);
+                crate::text::pill_chips(layout, &pills, rings, spec.cold.span_radius, spec.style.size, s, d_origin, pill_bg, &mut self.deco_scratch, &mut pill_icons);
                 // Elided text draws its decorations over the drawn string's offsets.
                 let drawn_spans = n.elided.map(|e| e.spans(&spans_here));
                 let spans = drawn_spans.as_deref().unwrap_or(&spans_here);
-                let drawn_rings = n.elided.map(|e| e.rings(&spec.cold.rings));
-                self.text.decorations_with_rings(layout, spans, drawn_rings.as_deref().unwrap_or(&spec.cold.rings), spec.cold.span_radius, s, d_origin, &mut self.deco_scratch);
+                self.text.decorations_with_rings(layout, spans, rings, spec.cold.span_radius, s, d_origin, &mut self.deco_scratch);
                 if !piece.is_whole() {
                     for d in &mut self.deco_scratch[from..] { d.byte = piece.content(d.byte as usize) as u32; }
                 }

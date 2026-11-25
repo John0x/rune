@@ -19,7 +19,7 @@ fn spans_with(src: &str, style: &MarkdownStyle, highlighter: Highlighter) -> Vec
         }
     }
     let (blocks, sources, tasks, _, _) = doc_cached(src);
-    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_help: None, link_ring: None, code_link: None, on_task: None,
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: None, link_pill: None, link_help: None, link_ring: None, code_link: None, on_task: None,
         tasks_read_only: false, selectable: false, scroll_wide: false, tentative: None, highlighter, sources: sources.clone(),
         next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
         #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None, flow: Cell::default() };
@@ -272,7 +272,7 @@ fn link_spans_come_before_inner_inline_styles_so_bold_em_and_code_keep_theirs() 
     });
     let (blocks, sources, tasks, _, _) = doc_cached("[**bold** *em* `code` plain](session:1)");
     let Block::Para(inl) = &blocks[0] else { panic!() };
-    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_help: None, link_ring: None, code_link: None, on_task: None,
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_pill: None, link_help: None, link_ring: None, code_link: None, on_task: None,
         tasks_read_only: false, selectable: false, scroll_wide: false, tentative: None, highlighter: Highlighter::builtin(), sources,
         next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
         #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None, flow: Cell::default() };
@@ -293,7 +293,7 @@ fn styled_bg_links_reserve_uncopied_horizontal_room_and_keep_highlight_ranges() 
     });
     let (blocks, sources, tasks, _, _) = doc_cached("In [a.rs](orch://file/a.rs) and [b.rs](orch://file/b.rs): [c.rs](orch://file/c.rs)[d.rs](orch://file/d.rs) ([web](https://example.com))");
     let Block::Para(inl) = &blocks[0] else { panic!() };
-    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_help: None, link_ring: None, code_link: None, on_task: None,
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_pill: None, link_help: None, link_ring: None, code_link: None, on_task: None,
         tasks_read_only: false, selectable: false, scroll_wide: false, tentative: None, highlighter: Highlighter::builtin(), sources,
         next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
         #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None, flow: Cell::default() };
@@ -314,13 +314,21 @@ fn styled_bg_links_reserve_uncopied_horizontal_room_and_keep_highlight_ranges() 
     // Adjacent links stay separated by both trailing and leading pads.
     let c_end = padded.inline.links[2].1;
     let d_start = padded.inline.links[3].0;
-    assert_eq!(d_start - c_end, 2 * PAD.len());
+    assert!(d_start > c_end, "adjacent links remain separated by pad bytes");
 
     // In rendered text layout, each padded link's bg rect (`x0 - 4 .. x1 + 4`) stays strictly
-    // clear of surrounding glyphs like `In`, `:`, and adjacent pills.
+    // clear of surrounding glyphs like `In`, `:`, and adjacent pills, AND line height never
+    // grows above a plain paragraph's own line height.
     let spans = r.spans_padded(&padded, style.body);
     let mut ts = rune::text::TextSystem::default();
+    let plain = ts.layout_rich("In a.rs and b.rs", &[], style.body, 2.0, None);
     let layout = ts.layout_rich(&padded.inline.text, &spans, style.body, 2.0, None);
+    let plain_lh = plain.lines().next().unwrap().metrics().line_height;
+    let styled_lh = layout.lines().next().unwrap().metrics().line_height;
+    assert!(
+        (styled_lh - plain_lh).abs() < 0.5,
+        "bg-styled link padding must not inflate line height: styled={styled_lh} vs plain={plain_lh}",
+    );
     let mut decos = Vec::new();
     ts.decorations(&layout, &spans, 2.0, [0.0, 0.0], &mut decos);
     let pills: Vec<[f32; 4]> = decos.iter().filter(|d| d.radius > 0.0).map(|d| d.rect).collect();
@@ -353,6 +361,37 @@ fn styled_bg_links_reserve_uncopied_horizontal_room_and_keep_highlight_ranges() 
         pills[2],
         pills[3],
     );
+}
+
+#[test]
+fn link_pills_strip_inner_code_padding_and_keep_line_height() {
+    let style = MarkdownStyle::neutral(true);
+    let bg = Color { r: 0.2, g: 0.2, b: 0.2, a: 1.0 };
+    let look: LinkLook = Rc::new(move |url| {
+        url.starts_with("orch://").then(|| (Span::new(0, 0).color(Color::WHITE).mono().size(11.0), LinkPaint::new()))
+    });
+    let pill: LinkPill = Rc::new(move |url| {
+        url.starts_with("orch://").then(|| PillStyle::new().bg(bg).fg(Color::WHITE))
+    });
+    let (blocks, sources, tasks, _, _) = doc_cached("See [`list.rs`](orch://file/list.rs) and [drag.rs](orch://file/drag.rs) today.");
+    let Block::Para(inl) = &blocks[0] else { panic!() };
+    let r = Renderer { s: style.clone(), highlights: Vec::new(), reveal: 0.0, streaming: false, on_link: None, on_link_secondary: None, link_look: Some(look), link_pill: Some(pill), link_help: None, link_ring: None, code_link: None, on_task: None,
+        tasks_read_only: false, selectable: false, scroll_wide: false, tentative: None, highlighter: Highlighter::builtin(), sources,
+        next_source: Cell::new(0), tasks, next_task: Cell::new(0), current_block_key: RefCell::new("b0".into()),
+        #[cfg(feature = "mermaid")] diagram_frame: None, code_frame: None, quote_frame: None, link_favicon: None, images: None, on_image: None, flow: Cell::default() };
+
+    let padded = r.pad_styled_links(inl, style.body);
+    assert!(padded.link_pads.is_empty(), "pill links use InlineBoxes, not PAD spaces");
+    let link_texts: Vec<&str> = padded.inline.links.iter().map(|(a, b, _)| &padded.inline.text[*a..*b]).collect();
+    assert_eq!(link_texts, vec!["list.rs", "drag.rs"], "inner CodePad spaces are stripped inside pill links");
+    let spans = r.spans_padded(&padded, style.body);
+    assert!(spans.iter().all(|s| s.bg.is_none()), "Code inside a pill link must not add an inner code_bg chip");
+    let mut ts = rune::text::TextSystem::default();
+    let plain = ts.layout_rich("See list.rs and drag.rs today.", &[], style.body, 2.0, None);
+    let layout = ts.layout_rich(&padded.inline.text, &spans, style.body, 2.0, None);
+    let plain_lh = plain.lines().next().unwrap().metrics().line_height;
+    let pill_lh = layout.lines().next().unwrap().metrics().line_height;
+    assert!((pill_lh - plain_lh).abs() < 0.5, "pill link line height {pill_lh} vs plain {plain_lh}");
 }
 
 #[test]
